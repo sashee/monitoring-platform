@@ -1,0 +1,119 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+# Read-only token: nothing here needs to write to the repo.
+permissions:
+  contents: read
+
+jobs:
+  build:
+    # x86_64. Also the only job that lints, since clippy findings are architecture
+    # independent and there is no reason to pay for them twice.
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          # Don't leave a token in .git; nothing here pushes.
+          persist-credentials: false
+
+      - name: Reclaim disk space
+        run: |
+          # Delete preinstalled toolchains this repo never uses (~25-30 GB on root).
+          # || true so a path missing on one image is not fatal.
+          sudo rm -rf \
+            /usr/local/lib/android \
+            /usr/share/dotnet \
+            /opt/ghc \
+            /usr/local/.ghcup \
+            /usr/share/swift \
+            /usr/local/share/boost \
+            /opt/hostedtoolcache \
+            || true
+          sudo docker image prune --all --force || true
+          df -h
+
+      - name: Install Nix
+        uses: cachix/install-nix-action@a49548c11d9846ad46ecc0115273879b045f001c # v31.10.7
+        with:
+          enable_kvm: true
+
+      - name: Add swap
+        run: |
+          swapon --show || true
+          sudo fallocate -l 8G /mnt/ci-swapfile
+          sudo chmod 600 /mnt/ci-swapfile
+          sudo mkswap /mnt/ci-swapfile
+          sudo swapon /mnt/ci-swapfile
+          swapon --show
+          free -h
+
+      # Uses the toolchain from nix/pkgs.nix, i.e. the same one the package is built
+      # with, so a new clippy lint cannot appear without a reviewed pin bump.
+      - name: Lint
+        run: make ci-lint
+
+      # doCheck runs the whole Rust suite inside the sandbox, so this covers the
+      # 87 unit/integration tests as well as the build itself.
+      - name: Build package
+        run: make build
+
+      # One VM per nix invocation, deliberately: see the comment on run-tests.
+      - name: Run VM tests
+        run: make run-tests
+
+  build-arm:
+    # aarch64, on the GitHub-hosted arm64 runner (free for public repos). The Rust
+    # build here is NATIVE — the runner is real aarch64 hardware, so only the NixOS
+    # VM tests are emulated. Those run under TCG because the free arm64 runner has
+    # no /dev/kvm, which is why nix/tests/default.nix drops the `kvm` requirement.
+    #
+    # This is the only job that says anything about the architecture the rpi5 host
+    # actually runs.
+    runs-on: ubuntu-24.04-arm
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Reclaim disk space
+        run: |
+          sudo rm -rf \
+            /usr/local/lib/android \
+            /usr/share/dotnet \
+            /opt/ghc \
+            /usr/local/.ghcup \
+            /usr/share/swift \
+            /usr/local/share/boost \
+            /opt/hostedtoolcache \
+            || true
+          sudo docker image prune --all --force || true
+          df -h
+
+      - name: Install Nix
+        uses: cachix/install-nix-action@a49548c11d9846ad46ecc0115273879b045f001c # v31.10.7
+        with:
+          enable_kvm: true
+
+      - name: Add swap
+        run: |
+          swapon --show || true
+          sudo fallocate -l 8G /mnt/ci-swapfile
+          sudo chmod 600 /mnt/ci-swapfile
+          sudo mkswap /mnt/ci-swapfile
+          sudo swapon /mnt/ci-swapfile
+          swapon --show
+          free -h
+
+      - name: Build package
+        run: make build
+
+      - name: Run VM tests (VMs run under tcg)
+        run: make run-tests

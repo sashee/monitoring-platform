@@ -870,24 +870,31 @@ silent channel fetch.
 
 ```
 nix/
-  default.nix        thin wrapper: the ONLY fetchTarball; `nix-build nix`
+  pkgs.nix           the ONLY fetchTarball; shared by default.nix, the Makefile and CI lint
+  default.nix        convenience entrypoint; `nix-build nix`
   package.nix        { lib, rustPlatform, stdenv }: buildRustPackage
   module.nix         the NixOS module (§9.2, §9.3)
   tests/
     default.nix      repo-specific: a minimal machine, then calls ./lib.nix
     lib.nix          generic harness: takes pkgs + machineModules (§11.1)
     cases/*.nix      one file per case
+Makefile             the entry points CI uses
 ```
 
 ```sh
-nix-build nix                    # package + all VM tests
-nix-build nix -A package         # package only
-nix-build nix -A tests.platform  # the shared-VM cases
-nix-build nix -A tests.restart   # one isolated case
+make all                         # lint, build, then every VM test one at a time
+make build                       # package only (its doCheck runs the Rust suite)
+make run-tests                   # every VM test, one nix process each
+nix-build nix -A tests.platform  # one test directly
 ```
 
-Building the top level requires every VM test to pass: `default.nix` interpolates each test
-derivation's store path in a `postBuild`, which registers it as a build input.
+Building the bare top level (`nix-build nix`) requires every VM test to pass: `default.nix`
+interpolates each test derivation's store path in a `postBuild`, which registers it as a build input.
+That is convenient locally but **wrong for CI**: it makes one nix process evaluate every NixOS machine
+at once, and each such eval costs 1–2 GiB that the Boehm-GC evaluator never returns to the OS. A
+combined eval has OOMed CI runners in sibling repos. `make run-tests` therefore lists the test names
+cheaply (`attrNames` forces no derivations) and then evaluates and runs each in its own short-lived
+process, so memory stays bounded by one eval plus one VM however many tests are added.
 
 What makes the build unproblematic:
 
@@ -900,6 +907,32 @@ What makes the build unproblematic:
   invalidate the build.
 - Because there is no flake, none of this needs the `nix-command` or `flakes` experimental features —
   worth noting since this machine's `/etc/nix/nix.conf` does not enable them.
+
+### 10.4 CI
+
+`.github/workflows/ci.yml`, following the `sashee/dotfiles` layout: two jobs, both preceded by a
+disk-reclaim step and 8 GiB of swap, both calling the Makefile.
+
+| Job | Runner | Runs |
+|---|---|---|
+| `build` | `ubuntu-latest` | `make ci-lint`, `make build`, `make run-tests` |
+| `build-arm` | `ubuntu-24.04-arm` | `make build`, `make run-tests` |
+
+Notes on the choices:
+
+- **The arm runner is real aarch64 hardware**, so the Rust build there is native and only the NixOS
+  VMs are emulated. Those run under TCG because the free arm64 runner has no `/dev/kvm` — which is
+  exactly why `nix/tests/default.nix` drops the `kvm` requirement rather than merely tolerating it.
+  This job is the only thing in the repo that says anything about the architecture the rpi5 runs.
+- **Lint runs only on x86**, since clippy findings are architecture independent.
+- **`make ci-lint` pins the lint toolchain to `nix/pkgs.nix`**, the same one the package is built with.
+  `nix-shell -p clippy` would take the *installer's* channel, so a nixpkgs bump there could introduce
+  a new lint and turn CI red with nothing in this repo having changed. Bumping `nix/pkgs.nix` can still
+  do that, but then it is a reviewed change.
+- Actions are pinned by commit SHA with the version in a trailing comment.
+- **No formatting check.** The code is not `rustfmt`-clean (137 sites with defaults, 41 even with
+  `use_small_heuristics = "Max"`), so adding one requires a one-time reformat first — a deliberate
+  decision, not an oversight.
 
 ## 11. Verification
 

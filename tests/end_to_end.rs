@@ -14,6 +14,28 @@ use std::time::{Duration, Instant};
 
 const T: i64 = 1_785_489_242_123_456_789;
 
+/// How long the process-lifecycle waits below are allowed to take, overridable with
+/// `MP_TEST_TIMEOUT_SECS`.
+///
+/// Deliberately generous, because both waits can be dominated by a single `fsync` and this is not
+/// a latency test -- the assertions are that the server *does* become ready and *does* exit
+/// cleanly. On a Raspberry Pi 5's SD card an ext4 `data=ordered` commit issued while a build's own
+/// writeback is still draining was measured blocking for over 30 seconds, with the process parked
+/// in state D on `do_get_write_access`; batches of 4 KiB O_DSYNC writes that take 25 ms on an idle
+/// card took 154 s under that load. A fixed 20 s budget therefore failed `nix build` on that host
+/// while the server was perfectly healthy and answered moments later. Failures that actually
+/// matter -- a server that exits, or one that never binds -- are still caught: the loops check for
+/// child exit on every iteration, so a real fault fails fast rather than waiting this out.
+fn budget() -> Duration {
+    const DEFAULT_SECS: u64 = 180;
+    Duration::from_secs(
+        std::env::var("MP_TEST_TIMEOUT_SECS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(DEFAULT_SECS),
+    )
+}
+
 struct Server {
     child: Child,
     socket: std::path::PathBuf,
@@ -36,22 +58,28 @@ impl Server {
             .spawn()
             .expect("spawning the server binary");
 
-        let server = Server { child, socket, db, _dir: dir };
+        let mut server = Server { child, socket, db, _dir: dir };
         server.wait_until_ready();
         server
     }
 
     /// Polls `/healthz` rather than sleeping, so the test is not timing-dependent.
-    fn wait_until_ready(&self) {
+    ///
+    /// A dead server can never become ready, so it is reported immediately with its exit status
+    /// instead of burning the whole budget and then blaming a timeout.
+    fn wait_until_ready(&mut self) {
         const PROBE: &str = "GET /healthz HTTP/1.1\r\nHost: l\r\nConnection: close\r\n\r\n";
-        let deadline = Instant::now() + Duration::from_secs(20);
+        let deadline = Instant::now() + budget();
         while Instant::now() < deadline {
+            if let Ok(Some(status)) = self.child.try_wait() {
+                panic!("server exited before becoming ready: {status}");
+            }
             if matches!(self.try_request(PROBE.as_bytes().to_vec()), Ok((200, _))) {
                 return;
             }
             std::thread::sleep(Duration::from_millis(25));
         }
-        panic!("server did not become ready within 20s");
+        panic!("server did not become ready within {:?}", budget());
     }
 
     fn try_request(&self, raw: Vec<u8>) -> std::io::Result<(u16, Vec<u8>)> {
@@ -95,7 +123,9 @@ impl Server {
     /// Sends SIGTERM and waits for exit, returning whether it exited successfully.
     fn terminate(&mut self) -> bool {
         unsafe { libc::kill(self.child.id() as i32, libc::SIGTERM) };
-        let deadline = Instant::now() + Duration::from_secs(20);
+        // Same budget as readiness, and for the same reason: the graceful path drains the storage
+        // writer and checkpoints the WAL, so it ends in an fsync too.
+        let deadline = Instant::now() + budget();
         while Instant::now() < deadline {
             if let Some(status) = self.child.try_wait().unwrap() {
                 return status.success();
@@ -103,7 +133,7 @@ impl Server {
             std::thread::sleep(Duration::from_millis(25));
         }
         let _ = self.child.kill();
-        panic!("server did not exit within 20s of SIGTERM");
+        panic!("server did not exit within {:?} of SIGTERM", budget());
     }
 }
 

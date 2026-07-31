@@ -1,0 +1,34 @@
+[package]
+name = "monitoring-platform"
+version = "0.1.0"
+edition = "2024"
+# The consuming NixOS system builds this with its OWN rustPlatform (see SPEC.md §9.3), so an
+# older host toolchain must fail with a clear message here rather than somewhere deep in a
+# dependency. 1.95 is the *verified* floor: it is what nixos-26.05 ships and what
+# `nix-build nix -A package` passes against. Edition 2024's own floor is 1.85, but nothing
+# below 1.95 has been tested, so claiming it would be unfounded. Lowering this means
+# actually building with the lower toolchain first.
+rust-version = "1.95"
+
+[dependencies]
+anyhow = "1.0.104"
+axum = "0.8.9"
+base64 = "0.23.0"
+clap = { version = "4.6.4", features = ["derive", "env"] }
+flate2 = "1.1.9"
+jiff = "0.2.35"
+opentelemetry-proto = { version = "0.32.0", default-features = false, features = ["gen-tonic-messages", "logs"] }
+prost = "0.14.4"
+rusqlite = { version = "0.40.1", features = ["bundled"] }
+sd-notify = "0.5.0"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
+tokio = { version = "1.53.1", features = ["rt-multi-thread", "net", "signal", "sync", "macros", "time"] }
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
+
+[dev-dependencies]
+http-body-util = "0.1.4"
+libc = "0.2.189"
+tempfile = "3.27.0"
+tower = { version = "0.5.3", features = ["util"] }

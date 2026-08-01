@@ -14,9 +14,10 @@
   isolate = true;
 
   testScript = ''
-    payload = sample_batch()
-    post_protobuf(payload)
-    post_protobuf(payload)
+    # Two DISTINCT batches: mp-make-sample timestamps at run time, so a second call is genuinely
+    # new data rather than a duplicate that would be suppressed (SPEC §6.6).
+    post_protobuf(sample_batch("/tmp/crash-a.pb"))
+    post_protobuf(sample_batch("/tmp/crash-b.pb"))
     committed = row_count()
     assert committed == 6, f"expected 6 acknowledged rows before the kill, got {committed}"
 
@@ -37,7 +38,7 @@
 
     # The database is not left in a state that only reads: SQLite replayed the WAL on
     # open and the service can commit again.
-    post_protobuf(payload)
+    post_protobuf(sample_batch("/tmp/crash-c.pb"))
     assert row_count() == committed + 3, "the database is not writable after recovery"
 
     # No corruption. A truncated WAL replay would surface here rather than as a wrong

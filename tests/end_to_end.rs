@@ -5,6 +5,9 @@
 
 use monitoring_platform::api::status::PROTOBUF;
 use monitoring_platform::otlp::test_support::*;
+use opentelemetry_proto::tonic::collector::logs::v1::{
+    ExportLogsPartialSuccess, ExportLogsServiceResponse,
+};
 use prost::Message;
 use std::io::{Read, Write};
 use std::os::unix::net::UnixStream;
@@ -163,7 +166,9 @@ fn parse_response(raw: &[u8]) -> (u16, Vec<u8>) {
     (status, raw[split + 4..].to_vec())
 }
 
-fn sample_batch() -> Vec<u8> {
+/// Two records, at `at` and `at + 1000`. Calling this twice with the same `at` produces a
+/// byte-identical payload, which is what makes the duplicate assertions below meaningful.
+fn sample_batch_at(at: i64) -> Vec<u8> {
     request(
         vec![kv_str("device.id", "dev-7")],
         "sensors",
@@ -172,14 +177,14 @@ fn sample_batch() -> Vec<u8> {
         vec![
             record(
                 "gps",
-                T,
+                at,
                 0,
                 Some(body_map(vec![("lat", OtlpValue::DoubleValue(47.4979))])),
                 vec![kv_str("unit", "wgs84")],
             ),
             record(
                 "cpu",
-                T + 1_000,
+                at + 1_000,
                 0,
                 Some(body_map(vec![("usage", OtlpValue::DoubleValue(0.42))])),
                 vec![kv_str("unit", "ratio")],
@@ -187,6 +192,15 @@ fn sample_batch() -> Vec<u8> {
         ],
     )
     .encode_to_vec()
+}
+
+fn sample_batch() -> Vec<u8> {
+    sample_batch_at(T)
+}
+
+/// The `partial_success` a request reported, if any.
+fn partial_success(body: &[u8]) -> Option<ExportLogsPartialSuccess> {
+    ExportLogsServiceResponse::decode(body).expect("response is not an OTLP response").partial_success
 }
 
 fn gzip(data: &[u8]) -> Vec<u8> {
@@ -210,22 +224,47 @@ fn full_lifecycle_over_a_real_socket() {
     assert_eq!(status, 200);
     assert_eq!(serde_json::from_slice::<serde_json::Value>(&body).unwrap()["status"], "ok");
 
-    // Ingest, uncompressed and gzipped.
+    // Ingest.
     let batch = sample_batch();
-    let (status, _) = server.post_protobuf("/v1/logs", &batch, None);
+    let (status, body) = server.post_protobuf("/v1/logs", &batch, None);
     assert_eq!(status, 200);
-    let (status, _) = server.post_protobuf("/v1/logs", &gzip(&batch), Some("gzip"));
-    assert_eq!(status, 200, "gzip must work over the socket too");
+    assert!(partial_success(&body).is_none(), "a clean batch reports nothing");
+    assert_eq!(count_rows(&server.db), 2);
+
+    // The same payload again, gzipped: this is exactly the retry-after-a-lost-acknowledgement case
+    // that SPEC §4.1's retryable 503 invites. It must be silently accepted and store nothing —
+    // proving both that gzip works over the socket and that identity is content-based, since the
+    // wire bytes differ completely between the two requests (SPEC §6.6).
+    let (status, body) = server.post_protobuf("/v1/logs", &gzip(&batch), Some("gzip"));
+    assert_eq!(status, 200, "a duplicate is accepted, not refused");
+    assert!(
+        partial_success(&body).is_none(),
+        "a duplicate must not be reported as rejected, or every correct retry looks like a failure"
+    );
+    assert_eq!(count_rows(&server.db), 2, "the re-upload must not have stored anything");
+
+    // A genuinely different measurement still stores: deduplication must not swallow new data.
+    let (status, _) = server.post_protobuf("/v1/logs", &sample_batch_at(T + 5_000_000), None);
+    assert_eq!(status, 200);
+    assert_eq!(count_rows(&server.db), 4, "distinct measurements must still be stored");
 
     // Read back.
     let (status, body) = server.get("/v1/measurements?type=gps&limit=5");
     assert_eq!(status, 200);
     let page: serde_json::Value = serde_json::from_slice(&body).unwrap();
     let rows = page["measurements"].as_array().unwrap();
-    assert_eq!(rows.len(), 2, "both gps records should be readable");
+    assert_eq!(rows.len(), 2, "one gps per distinct batch, not per upload");
     assert_eq!(rows[0]["type"], "gps");
     assert_eq!(rows[0]["attributes"]["resource.attributes.device.id"], "dev-7");
-    assert_eq!(rows[0]["event_time_unix_nano"], T.to_string());
+    // Newest first, so this is the second batch.
+    assert_eq!(rows[0]["event_time_unix_nano"], (T + 5_000_000).to_string());
+    assert_eq!(rows[1]["event_time_unix_nano"], T.to_string());
+
+    // Ids are the content hash: hex, fixed width, and distinct for distinct measurements.
+    let id = rows[0]["id"].as_str().expect("id must be a string");
+    assert_eq!(id.len(), 32, "128-bit id as hex");
+    assert!(id.bytes().all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase()), "{id}");
+    assert_ne!(id, rows[1]["id"].as_str().unwrap());
 
     // Attribute filtering over the wire.
     let (status, body) = server.get("/v1/measurements?attr.record.attributes.unit=ratio");

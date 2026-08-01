@@ -2,7 +2,10 @@
 
 use serde_json::{Map, Value};
 
-/// A measurement ready to be stored. `id` is assigned by SQLite, so it is absent here.
+use crate::content_id::ContentId;
+
+/// A measurement ready to be stored. The id is *derived* from these fields rather than carried
+/// here — see `crate::content_id` — so there is exactly one place that decides identity.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Measurement {
     /// Nanoseconds since the Unix epoch, from the device (SPEC §5.3).
@@ -21,7 +24,9 @@ pub struct Measurement {
 /// A measurement read back out of the database.
 #[derive(Debug, Clone, PartialEq)]
 pub struct StoredMeasurement {
-    pub id: i64,
+    /// The content hash (SPEC §6.6): intrinsic, so the same measurement has this id on every
+    /// machine, rather than one assigned by whichever server stored it first.
+    pub id: ContentId,
     pub event_time: i64,
     pub processed_time: i64,
     pub kind: String,

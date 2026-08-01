@@ -11,6 +11,7 @@ use serde::Serialize;
 use serde_json::{Value, json};
 
 use crate::AppState;
+use crate::content_id::{ContentId, from_hex, to_hex};
 use crate::model::StoredMeasurement;
 use crate::store::read::{DEFAULT_LIMIT, MAX_LIMIT, QuerySpec};
 
@@ -38,7 +39,9 @@ impl IntoResponse for ApiError {
 
 #[derive(Serialize)]
 pub struct MeasurementJson {
-    id: i64,
+    /// Lowercase hex of the content hash (SPEC §6.6). A string rather than a number, which also
+    /// puts `id` permanently outside the 2^53 concern in §5.5.
+    id: String,
     event_time: String,
     /// A string, not a number: nanosecond values exceed 2^53 and would be silently rounded by any
     /// client whose JSON parser is backed by f64 (SPEC §5.5).
@@ -78,7 +81,7 @@ pub async fn list(
 
     // A full page implies there may be more; a short one is definitively the last.
     let next_cursor = (rows.len() as i64 == limit)
-        .then(|| rows.last().map(|r| encode_cursor(r.event_time, r.id)))
+        .then(|| rows.last().map(|r| encode_cursor(r.event_time, &r.id)))
         .flatten();
 
     let page = Page {
@@ -90,7 +93,7 @@ pub async fn list(
 
 fn to_json(m: StoredMeasurement) -> MeasurementJson {
     MeasurementJson {
-        id: m.id,
+        id: to_hex(&m.id),
         event_time: format_nanos(m.event_time),
         event_time_unix_nano: m.event_time.to_string(),
         processed_time: format_nanos(m.processed_time),
@@ -122,17 +125,18 @@ pub fn format_nanos(nanos: i64) -> String {
     }
 }
 
-pub fn encode_cursor(event_time: i64, id: i64) -> String {
-    B64.encode(json!({"t": event_time, "i": id}).to_string())
+pub fn encode_cursor(event_time: i64, id: &ContentId) -> String {
+    B64.encode(json!({"t": event_time, "i": to_hex(id)}).to_string())
 }
 
-pub fn decode_cursor(s: &str) -> Result<(i64, i64), String> {
+pub fn decode_cursor(s: &str) -> Result<(i64, ContentId), String> {
     let bytes = B64.decode(s).map_err(|_| "cursor is not valid base64".to_owned())?;
     let v: Value =
         serde_json::from_slice(&bytes).map_err(|_| "cursor is not valid JSON".to_owned())?;
     let t = v.get("t").and_then(Value::as_i64).ok_or("cursor is missing 't'")?;
-    let i = v.get("i").and_then(Value::as_i64).ok_or("cursor is missing 'i'")?;
-    Ok((t, i))
+    let i = v.get("i").and_then(Value::as_str).ok_or("cursor is missing 'i'")?;
+    let id = from_hex(i).ok_or("cursor 'i' is not a measurement id")?;
+    Ok((t, id))
 }
 
 /// Accepts RFC 3339, or an integer nanosecond count. An all-digit value cannot be RFC 3339, which
@@ -202,16 +206,21 @@ mod tests {
         assert_eq!(format_nanos(0), "1970-01-01T00:00:00.000000000Z");
     }
 
+    const ID: ContentId = [
+        0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xaa, 0xbb, 0xcc, 0xdd, 0xee,
+        0xff,
+    ];
+
     #[test]
     fn cursor_round_trips() {
-        let encoded = encode_cursor(1_785_489_242_123_456_789, 41);
-        assert_eq!(decode_cursor(&encoded).unwrap(), (1_785_489_242_123_456_789, 41));
+        let encoded = encode_cursor(1_785_489_242_123_456_789, &ID);
+        assert_eq!(decode_cursor(&encoded).unwrap(), (1_785_489_242_123_456_789, ID));
     }
 
     #[test]
     fn cursor_survives_a_query_string_without_escaping() {
         // URL-safe alphabet, no padding: nothing here needs percent-encoding.
-        let encoded = encode_cursor(i64::MAX, i64::MAX);
+        let encoded = encode_cursor(i64::MAX, &[0xff; 16]);
         assert!(
             encoded.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_'),
             "cursor must be query-string safe: {encoded}"
@@ -223,6 +232,8 @@ mod tests {
         assert!(decode_cursor("!!!not base64!!!").is_err());
         assert!(decode_cursor(&B64.encode("not json")).is_err());
         assert!(decode_cursor(&B64.encode(r#"{"t":1}"#)).is_err(), "missing 'i'");
+        assert!(decode_cursor(&B64.encode(r#"{"t":1,"i":41}"#)).is_err(), "'i' must be a hex id");
+        assert!(decode_cursor(&B64.encode(r#"{"t":1,"i":"nothex"}"#)).is_err());
     }
 
     #[test]

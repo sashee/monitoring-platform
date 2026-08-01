@@ -4,6 +4,7 @@
 
 pub mod api;
 pub mod config;
+pub mod content_id;
 pub mod model;
 pub mod otlp;
 pub mod store;

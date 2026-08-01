@@ -40,7 +40,7 @@ Explicitly out of scope for the PoC (see §12 for what this defers):
 - Request compression other than `gzip` (no `zstd`, no `deflate`), and response compression of
   any kind.
 - Authentication, authorization, TLS, multi-tenancy.
-- Retention, downsampling, compaction, deduplication.
+- Retention, downsampling, compaction. (Deduplication *is* handled — see §6.6.)
 - Rate limiting, load shedding and `429` throttling with `Retry-After`. (`503` *is* returned for
   storage failure — see §4.1 — but never as a backpressure signal.)
 - The `iroh` transport.
@@ -53,7 +53,7 @@ A **measurement** is the only domain entity.
 
 | Field            | Type                        | Source                                                        |
 |------------------|-----------------------------|---------------------------------------------------------------|
-| `id`             | integer, server-assigned    | SQLite rowid                                                  |
+| `id`             | 16-byte content hash        | Derived from the four fields below except `processed_time` (§6.6) |
 | `event_time`     | nanoseconds since Unix epoch | `LogRecord.time_unix_nano`, else `observed_time_unix_nano` (§5.3) |
 | `processed_time` | nanoseconds since Unix epoch | Server clock when the request was received                    |
 | `type`           | non-empty string            | `LogRecord.event_name`                                        |
@@ -446,7 +446,7 @@ SQLite, one file, one table.
 
 ```sql
 CREATE TABLE measurement (
-  id             INTEGER PRIMARY KEY,
+  id             BLOB    PRIMARY KEY, -- content hash (§6.6); INSERT OR IGNORE makes ingest idempotent
   event_time     INTEGER NOT NULL,  -- nanoseconds since Unix epoch
   processed_time INTEGER NOT NULL,  -- nanoseconds since Unix epoch
   type           TEXT    NOT NULL,
@@ -459,6 +459,9 @@ CREATE INDEX measurement_event_time_idx      ON measurement (event_time DESC, id
 ```
 
 - `STRICT` so the column types are enforced rather than advisory.
+- A **rowid table, not `WITHOUT ROWID`**. Measured over 20 000 realistic rows, `WITHOUT ROWID` is
+  *larger* (10176 KiB vs 9956 KiB), because secondary indexes must then carry the full 16-byte
+  primary key as the row locator instead of a compact rowid.
 - Times are `INTEGER` nanoseconds. i64 nanoseconds covers years 1678–2262; no measurement in this
   system will fall outside that.
 - `body` and `attributes` are JSON text, queryable with SQLite's JSON1 functions
@@ -521,11 +524,74 @@ Three consequences worth recording now, since they constrain choices made here:
   expansion that re-parses to the identical f64. Any test asserting on exact JSON *text* would break
   after migration, which is why §11 asserts on parsed values instead.
 
+### 6.6 Content-addressed ids and duplicate handling
+
+**The id is a hash of what the device sent**, so uploading the same measurement twice is a no-op:
+`INSERT OR IGNORE` on the primary key. Ingest is idempotent.
+
+This is not decoration. The platform's own design invites retries. §4.1 returns a *retryable* `503`
+on storage failure precisely so a device does not discard its only copy, and §6.3 has the handler
+await the commit before responding — so if the connection breaks after the commit but before the
+response lands, the device retries **correctly** and would otherwise double-store. That is structural
+at-least-once delivery, and iroh will make lost acknowledgements far more likely than a local socket
+does. OTLP offers no help: there is no request id, sequence number or idempotency key anywhere in
+`LogRecord` or `ExportLogsServiceRequest`, so identity has to be derived from content.
+
+Making it the *id* rather than a separate column buys something beyond enforcement: identity becomes
+**intrinsic**. The same measurement has the same id on every machine, forever, rather than one
+assigned by whichever server happened to store it first — so merging two databases is idempotent by
+construction, which is what a device that buffers locally and syncs over iroh will need.
+
+**What is hashed**: `event_time`, `type`, `body`, `attributes` — every column except the id itself
+and `processed_time`. Excluding the arrival time is exactly what makes a retry hash identically.
+
+`type` must be included explicitly and is easy to overlook: it comes from `event_name` into its own
+column and never appears in the attributes map, so it is not recoverable from the attributes.
+Hashing the body alone would be badly wrong — it would collapse `cpu {"usage":0.5}` with
+`memory {"usage":0.5}`, collapse two devices reporting the same reading, collapse every idle-CPU
+`0.00` into one row forever, and collapse all body-less records together.
+
+**Canonicalisation is done by our own code, not by `serde_json`.** `serde_json::Map` is a `BTreeMap`
+today, so its output happens to be key-sorted — but `preserve_order` is an *additive* Cargo feature,
+so any crate anywhere in the dependency graph could enable it, turn `Map` into an insertion-ordered
+`IndexMap`, and silently change every hash. Old rows would stop matching new ones and deduplication
+would quietly stop working with no error. `src/content_id.rs` therefore:
+
+- sorts object keys explicitly, never relying on map iteration order;
+- preserves array order, which is semantic;
+- type-tags every node, so `1`, `1.0`, `"1"` and `[1]` cannot hash alike;
+- length-prefixes every field, so `type="ab", body="c"` cannot collide with `type="a", body="bc"`;
+- distinguishes an absent body from a JSON-null body, which §5.4 keeps apart;
+- normalises `-0.0` to `0.0`, because Postgres `jsonb` collapses them (§6.5) and an id must not
+  change under a backend migration;
+- uses `blake3` truncated to 16 bytes — **not** `DefaultHasher`, which is documented as unstable
+  across Rust releases and would change every id on a compiler bump.
+
+16 bytes is deliberate: with `INSERT OR IGNORE` a collision silently drops a *distinct* measurement,
+a stronger requirement than ordinary hashing. At 128 bits, 10⁹ rows give a collision probability
+around 10⁻²¹; at 64 bits, 10⁸ rows give roughly 1 in 3700.
+
+**A suppressed duplicate is silently accepted**: `200`, empty `ExportLogsServiceResponse`, and *not*
+counted in `rejected_log_records`. From the device's perspective the measurement is stored — which it
+is. Counting it as rejected would turn a correct retry after a lost acknowledgement into a permanent
+partial-failure signal.
+
+Two consequences to accept:
+
+- **The duplicate rate is visible only server-side.** A device stuck in a retry loop costs bandwidth
+  and CPU while producing no row growth and no error, so it will not show up in the disk-space
+  monitoring §12 relies on.
+- **Coarse device clocks.** Two genuinely distinct readings sharing an `event_time`, `type`, value
+  and attributes collapse into one. Only reachable when a device's clock resolution is coarser than
+  its sampling rate — a 1 kHz sensor with a 1-second clock repeating a value. Safe for any device
+  whose clock ticks faster than it samples.
+
 ## 7. Read API
 
 JSON over the same Unix socket. Times in responses are RFC 3339 UTC with nanosecond precision,
 alongside the raw nanosecond value as a string (JSON numbers cannot hold i64 nanoseconds without
-loss in most clients).
+loss in most clients). `id` is the content hash (§6.6) as lowercase hex, which also places it
+permanently outside the 2^53 concern in §5.5.
 
 ### 7.1 `GET /v1/measurements`
 
@@ -578,8 +644,10 @@ Query parameters:
   inserts spaces, so it would break silently on migration. Excluding non-scalars makes the behaviour
   defined and portable: a nested attribute is fully stored and fully returned, and simply never
   matches a filter.
-- Ordering is always `event_time DESC, id DESC` — newest first, `id` breaking ties so pagination
-  is stable when timestamps collide.
+- Ordering is always `event_time DESC, id DESC` — newest first, `id` breaking ties so pagination is
+  stable when timestamps collide. Since `id` is a content hash (§6.6), ties break in hash order
+  rather than arrival order: arbitrary, but total and deterministic, which is all keyset pagination
+  requires. SQLite compares blobs with memcmp, so that ordering matches the hex form the API exposes.
 - `cursor` is a base64 encoding of the last returned `(event_time, id)` and is applied as a
   keyset predicate. Keyset rather than `OFFSET` so pagination stays correct while data is being
   ingested.
@@ -592,7 +660,7 @@ Response:
 {
   "measurements": [
     {
-      "id": 41,
+      "id": "039041fb15b6a5539cc42c9bd709363e",
       "event_time": "2026-07-31T09:14:02.123456789Z",
       "event_time_unix_nano": "1785489242123456789",
       "processed_time": "2026-07-31T09:14:02.170000000Z",
@@ -946,6 +1014,12 @@ Unit tests (pure functions, no I/O):
   the serializer's formatting changes.
 - Non-finite doubles produce the sentinel strings, *not* `null` — the regression test for the
   `json!`/`Number::from_f64` trap in §5.4.
+- Content ids (§6.6). The one the whole scheme rests on: the same attributes inserted in **shuffled
+  order** produce an identical id, at the top level and nested. Plus: array order *does* matter;
+  `processed_time` does not; every other hashed field does, including `event_time` by 1 ns; absent
+  body ≠ JSON-null body; `1` ≠ `1.0` ≠ `"1"` ≠ `[1]`; `-0.0` = `0.0`; and
+  `type="ab", body="c"` ≠ `type="a", body="bc"` — the length-prefix regression test. A pinned hex
+  vector makes an accidental encoding change visible rather than silent.
 - Attribute merging: the structural prefix for each level, `scope.name`/`scope.version` synthesis
   and their omission when empty, absent values becoming `null`.
 - Collision-freedom: a payload carrying scope attributes literally named `name` and `version`, plus
@@ -973,6 +1047,11 @@ Integration tests:
 - Build the router over a temp-file database, `POST` an encoded `ExportLogsServiceRequest` via
   `tower::ServiceExt::oneshot`, assert the stored rows and the `ExportLogsServiceResponse`.
 - Mixed batch → `200` with the exact `rejected_log_records` count and the valid rows committed.
+- Idempotent ingest (§6.6): re-posting a batch returns `200` with **no** `partial_success` and
+  stores nothing; a partly-overlapping batch stores only its new records; the same measurements
+  re-framed across different requests still do not duplicate; a duplicate does not move the stored
+  `processed_time`, since first arrival wins. And the other direction — two records differing by a
+  single nanosecond are both stored, so deduplication cannot be swallowing real data.
 - Content-type, content-encoding, body-size and malformed-protobuf rejections.
 - Every `4xx`/`5xx` from `/v1/logs` has `Content-Type: application/x-protobuf` and a body that
   decodes as `google.rpc.Status` with a non-empty `message` — asserted for handler-generated errors

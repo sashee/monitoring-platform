@@ -37,8 +37,15 @@
     assert len(get_json("/v1/measurements?limit=10")["measurements"]) == before
 
     # And it can still accept new data, i.e. migrations were a no-op on the existing
-    # database rather than a failure.
-    post_protobuf(payload)
+    # database rather than a failure. A FRESH batch: re-posting `payload` would now be a
+    # deduplicated no-op and would prove nothing about writability (SPEC §6.6).
+    post_protobuf(sample_batch("/tmp/after-restart.pb"))
     assert row_count() == before + 3
+
+    # Re-posting the original, however, must still be suppressed — deduplication has to survive a
+    # restart, which it does only because identity is derived from content rather than held in
+    # memory.
+    post_protobuf(payload)
+    assert row_count() == before + 3, "dedup must persist across a restart"
   '';
 }

@@ -204,6 +204,101 @@ async fn fully_rejected_batch_is_a_200_with_a_full_count() {
     assert_eq!(h.row_count(), 0);
 }
 
+/// SPEC §6.6: the retry-after-a-lost-acknowledgement case. The §4.1 `503` is deliberately
+/// retryable so a device never discards its only copy, and the handler awaits the commit before
+/// responding — so a broken connection between commit and response makes a device retry
+/// *correctly*. That must be a no-op, not a second row.
+#[tokio::test]
+async fn re_uploading_a_batch_stores_nothing_and_reports_nothing() {
+    let h = harness();
+    let req = sample();
+
+    let (status, response) = h.ingest(&req).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(response.partial_success.is_none());
+    assert_eq!(h.row_count(), 1);
+
+    let (status, response) = h.ingest(&req).await;
+    assert_eq!(status, StatusCode::OK, "a duplicate is accepted, not refused");
+    assert!(
+        response.partial_success.is_none(),
+        "silently accepted: counting it as rejected would make every correct retry look like a \
+         partial failure to the device"
+    );
+    assert_eq!(h.row_count(), 1, "the retry must not have stored a second row");
+}
+
+/// Deduplication must not swallow genuinely distinct data. One nanosecond is enough to separate
+/// two measurements, and it is the narrowest case the scheme has to get right.
+#[tokio::test]
+async fn measurements_differing_by_one_nanosecond_are_both_stored() {
+    let h = harness();
+    let base = request(vec![], "", "", vec![], vec![record("cpu", T, 0, None, vec![])]);
+    let shifted = request(vec![], "", "", vec![], vec![record("cpu", T + 1, 0, None, vec![])]);
+
+    h.ingest(&base).await;
+    h.ingest(&shifted).await;
+    assert_eq!(h.row_count(), 2);
+}
+
+/// A batch that is partly new must store exactly the new part, and still report success for all
+/// of it — the device sent nothing wrong.
+#[tokio::test]
+async fn a_partly_overlapping_batch_stores_only_the_new_records() {
+    let h = harness();
+    h.ingest(&request(vec![], "", "", vec![], vec![record("a", T, 0, None, vec![])])).await;
+
+    let (status, response) = h
+        .ingest(&request(
+            vec![],
+            "",
+            "",
+            vec![],
+            vec![record("a", T, 0, None, vec![]), record("b", T, 0, None, vec![])],
+        ))
+        .await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert!(response.partial_success.is_none());
+    assert_eq!(h.row_count(), 2, "only the unseen record should have been added");
+}
+
+/// Identity is content-based, so how the batch was framed on the wire is irrelevant: the same
+/// measurements split across two requests are still the same measurements.
+#[tokio::test]
+async fn rebatching_the_same_measurements_does_not_duplicate_them() {
+    let h = harness();
+    let a = record("a", T, 0, None, vec![kv_str("unit", "x")]);
+    let b = record("b", T + 1, 0, None, vec![kv_str("unit", "y")]);
+
+    h.ingest(&request(vec![], "", "", vec![], vec![a.clone(), b.clone()])).await;
+    assert_eq!(h.row_count(), 2);
+
+    // Same two records, now one per request.
+    h.ingest(&request(vec![], "", "", vec![], vec![a])).await;
+    h.ingest(&request(vec![], "", "", vec![], vec![b])).await;
+    assert_eq!(h.row_count(), 2, "re-framing must not create rows");
+}
+
+/// The stored row keeps the arrival time of the FIRST delivery: `processed_time` is not part of
+/// identity, and `INSERT OR IGNORE` leaves the existing row alone.
+#[tokio::test]
+async fn a_duplicate_does_not_move_the_original_arrival_time() {
+    let h = harness();
+    let req = sample();
+
+    h.ingest(&req).await;
+    let first: i64 =
+        h.conn().query_row("SELECT processed_time FROM measurement", [], |r| r.get(0)).unwrap();
+
+    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    h.ingest(&req).await;
+
+    let after: i64 =
+        h.conn().query_row("SELECT processed_time FROM measurement", [], |r| r.get(0)).unwrap();
+    assert_eq!(after, first, "first arrival wins");
+}
+
 #[tokio::test]
 async fn gzip_and_identity_produce_identical_rows() {
     let payload = sample().encode_to_vec();

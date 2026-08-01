@@ -97,7 +97,12 @@ async fn lists_newest_first_with_the_documented_shape() {
     assert!(first["processed_time_unix_nano"].is_string());
     assert_eq!(first["body"], json!({"usage": 0.9}));
     assert_eq!(first["attributes"]["resource.attributes.device.id"], "dev-2");
-    assert!(first["id"].is_number());
+
+    // The id is the content hash as lowercase hex (SPEC §6.6), which also keeps it permanently
+    // clear of the 2^53 concern in §5.5.
+    let id = first["id"].as_str().expect("id must be a string");
+    assert_eq!(id.len(), 32);
+    assert!(id.bytes().all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase()), "{id}");
 }
 
 #[tokio::test]
@@ -171,16 +176,18 @@ async fn nested_attributes_are_returned_but_not_filterable() {
 
 #[tokio::test]
 async fn paginates_without_gaps_or_duplicates() {
-    // All identical timestamps, the case that breaks naive pagination.
-    let rows: Vec<Measurement> = (0..7).map(|_| m("t", 500, json!({}), json!(1))).collect();
+    // All identical timestamps, the case that breaks naive pagination. Bodies differ so the rows
+    // are distinct measurements — seven identical ones would now be one row (SPEC §6.6).
+    let rows: Vec<Measurement> =
+        (0..7).map(|i| m("t", 500, json!({}), json!({ "n": i }))).collect();
     let h = harness(rows);
 
-    let mut seen: Vec<i64> = Vec::new();
+    let mut seen: Vec<String> = Vec::new();
     let mut uri = "/v1/measurements?limit=3".to_owned();
     loop {
         let (_, body) = h.get(&uri).await;
         let page = body["measurements"].as_array().unwrap().clone();
-        seen.extend(page.iter().map(|r| r["id"].as_i64().unwrap()));
+        seen.extend(page.iter().map(|r| r["id"].as_str().unwrap().to_owned()));
 
         match body["next_cursor"].as_str() {
             Some(cursor) => uri = format!("/v1/measurements?limit=3&cursor={cursor}"),

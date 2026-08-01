@@ -5,13 +5,39 @@ use rusqlite::{Connection, OpenFlags};
 use std::path::Path;
 
 /// Schema version this binary understands. Tracked in `PRAGMA user_version`.
-pub const SCHEMA_VERSION: i64 = 1;
+pub const SCHEMA_VERSION: i64 = 2;
 
 const MIGRATIONS: &[&str] = &[
-    // → version 1
+    // → version 1: the original table, keyed by rowid.
     r#"
     CREATE TABLE measurement (
       id             INTEGER PRIMARY KEY,
+      event_time     INTEGER NOT NULL,
+      processed_time INTEGER NOT NULL,
+      type           TEXT    NOT NULL,
+      body           TEXT,
+      attributes     TEXT    NOT NULL DEFAULT '{}'
+    ) STRICT;
+
+    CREATE INDEX measurement_type_event_time_idx ON measurement (type, event_time DESC, id DESC);
+    CREATE INDEX measurement_event_time_idx      ON measurement (event_time DESC, id DESC);
+    "#,
+    // → version 2: content-addressed ids (SPEC §6.6). `id` becomes the hash of everything the
+    // device sent, so `INSERT OR IGNORE` makes re-uploading a measurement a no-op.
+    //
+    // Existing rows are dropped rather than backfilled: version 1 was never deployed, and a
+    // backfill would have to re-derive each id from stored JSON, which is exactly the kind of
+    // second, subtly-different encoding path this design exists to avoid. If v1 data ever needs
+    // preserving, re-ingest it rather than reconstructing ids here.
+    //
+    // Kept as a rowid table, NOT `WITHOUT ROWID`: measured over 20k realistic rows, WITHOUT ROWID
+    // is *larger*, because secondary indexes must then carry the full 16-byte key as the row
+    // locator instead of a compact rowid.
+    r#"
+    DROP TABLE measurement;
+
+    CREATE TABLE measurement (
+      id             BLOB    PRIMARY KEY,
       event_time     INTEGER NOT NULL,
       processed_time INTEGER NOT NULL,
       type           TEXT    NOT NULL,
@@ -123,6 +149,30 @@ mod tests {
         assert_eq!(count, 1);
     }
 
+    /// The v1 → v2 migration must run on a database that stopped at version 1, not only on an
+    /// empty one — the step-by-step path is the one a real upgrade takes.
+    #[test]
+    fn migrates_stepwise_from_version_1() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(MIGRATIONS[0]).unwrap();
+        conn.pragma_update(None, "user_version", 1i64).unwrap();
+
+        migrate(&conn).unwrap();
+
+        let v: i64 = conn.pragma_query_value(None, "user_version", |r| r.get(0)).unwrap();
+        assert_eq!(v, SCHEMA_VERSION);
+
+        // `id` must now be a BLOB primary key, which is what makes INSERT OR IGNORE deduplicate.
+        let ty: String = conn
+            .query_row(
+                "SELECT type FROM pragma_table_info('measurement') WHERE name='id'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(ty, "BLOB");
+    }
+
     #[test]
     fn refuses_a_database_from_a_newer_binary() {
         let conn = Connection::open_in_memory().unwrap();
@@ -138,8 +188,8 @@ mod tests {
         migrate(&conn).unwrap();
         let err = conn
             .execute(
-                "INSERT INTO measurement (event_time, processed_time, type, attributes) \
-                 VALUES ('not-a-number', 1, 't', '{}')",
+                "INSERT INTO measurement (id, event_time, processed_time, type, attributes) \
+                 VALUES (x'00', 'not-a-number', 1, 't', '{}')",
                 [],
             )
             .unwrap_err();

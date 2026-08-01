@@ -8,6 +8,7 @@ use anyhow::{Context, Result};
 use rusqlite::Connection;
 use tokio::sync::{mpsc, oneshot};
 
+use crate::content_id::content_id;
 use crate::model::Measurement;
 
 pub struct WriteRequest {
@@ -61,17 +62,23 @@ pub fn spawn(conn: Connection) -> (Writer, tokio::task::JoinHandle<()>) {
 }
 
 /// Inserts a whole batch in one transaction, reusing one prepared statement.
+///
+/// Returns the number of rows actually stored, which is *not* the batch length when the batch
+/// contains measurements already present: `id` is a content hash, so `INSERT OR IGNORE` makes a
+/// re-upload a no-op (SPEC §6.6).
 pub fn insert_batch(conn: &mut Connection, measurements: &[Measurement]) -> Result<usize> {
     if measurements.is_empty() {
         return Ok(0);
     }
 
+    let mut stored = 0usize;
     let tx = conn.transaction().context("beginning write transaction")?;
     {
         let mut stmt = tx
             .prepare_cached(
-                "INSERT INTO measurement (event_time, processed_time, type, body, attributes) \
-                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                "INSERT OR IGNORE INTO measurement \
+                 (id, event_time, processed_time, type, body, attributes) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
             )
             .context("preparing insert")?;
 
@@ -87,19 +94,34 @@ pub fn insert_batch(conn: &mut Connection, measurements: &[Measurement]) -> Resu
             let attributes =
                 serde_json::to_string(&m.attributes).context("serialising attributes")?;
 
-            stmt.execute(rusqlite::params![
-                m.event_time,
-                m.processed_time,
-                m.kind,
-                body,
-                attributes
-            ])
-            .context("inserting measurement")?;
+            // Derived from the measurement's own canonical encoding, not from the JSON written
+            // above — the two must never be allowed to drift apart (SPEC §6.6).
+            let id = content_id(m);
+
+            stored += stmt
+                .execute(rusqlite::params![
+                    &id[..],
+                    m.event_time,
+                    m.processed_time,
+                    m.kind,
+                    body,
+                    attributes
+                ])
+                .context("inserting measurement")?;
         }
     }
     tx.commit().context("committing write transaction")?;
 
-    Ok(measurements.len())
+    if stored != measurements.len() {
+        tracing::debug!(
+            received = measurements.len(),
+            stored,
+            duplicates = measurements.len() - stored,
+            "suppressed already-stored measurements"
+        );
+    }
+
+    Ok(stored)
 }
 
 #[cfg(test)]
@@ -124,14 +146,78 @@ mod tests {
         }
     }
 
+    fn row_count(c: &Connection) -> i64 {
+        c.query_row("SELECT count(*) FROM measurement", [], |r| r.get(0)).unwrap()
+    }
+
     #[test]
     fn inserts_a_batch_and_reports_the_count() {
         let mut c = conn();
         let n = insert_batch(&mut c, &[measurement("a", 1), measurement("b", 2)]).unwrap();
         assert_eq!(n, 2);
-        let stored: i64 =
-            c.query_row("SELECT count(*) FROM measurement", [], |r| r.get(0)).unwrap();
+        assert_eq!(row_count(&c), 2);
+    }
+
+    /// SPEC §6.6: re-uploading a measurement is a no-op, which is what makes the retryable 503 in
+    /// §4.1 safe rather than a duplicate generator.
+    #[test]
+    fn reinserting_the_same_measurement_is_a_no_op() {
+        let mut c = conn();
+        let batch = [measurement("a", 1), measurement("b", 2)];
+
+        assert_eq!(insert_batch(&mut c, &batch).unwrap(), 2);
+        assert_eq!(insert_batch(&mut c, &batch).unwrap(), 0, "a retry must store nothing");
+        assert_eq!(row_count(&c), 2);
+    }
+
+    /// A batch that is partly new must store exactly the new part.
+    #[test]
+    fn overlapping_batches_store_only_what_is_new() {
+        let mut c = conn();
+        insert_batch(&mut c, &[measurement("a", 1)]).unwrap();
+
+        let stored = insert_batch(&mut c, &[measurement("a", 1), measurement("b", 2)]).unwrap();
+        assert_eq!(stored, 1);
+        assert_eq!(row_count(&c), 2);
+    }
+
+    /// Deduplication must not swallow genuinely distinct readings. A single nanosecond of
+    /// difference is enough to make two measurements different.
+    #[test]
+    fn measurements_differing_only_by_one_nanosecond_both_store() {
+        let mut c = conn();
+        let stored = insert_batch(&mut c, &[measurement("a", 1), measurement("a", 2)]).unwrap();
         assert_eq!(stored, 2);
+        assert_eq!(row_count(&c), 2);
+    }
+
+    /// The arrival time is not part of identity, so the same measurement delivered later is still
+    /// the same measurement — and the stored row keeps its FIRST arrival time.
+    #[test]
+    fn a_later_redelivery_does_not_overwrite_the_original_arrival_time() {
+        let mut c = conn();
+        let mut first = measurement("a", 1);
+        first.processed_time = 100;
+        let mut again = measurement("a", 1);
+        again.processed_time = 999;
+
+        insert_batch(&mut c, &[first]).unwrap();
+        assert_eq!(insert_batch(&mut c, &[again]).unwrap(), 0);
+
+        let pt: i64 =
+            c.query_row("SELECT processed_time FROM measurement", [], |r| r.get(0)).unwrap();
+        assert_eq!(pt, 100, "OR IGNORE keeps the existing row, so first arrival wins");
+    }
+
+    /// The id stored must be exactly the one the pure function derives.
+    #[test]
+    fn stored_id_is_the_content_id() {
+        let mut c = conn();
+        let m = measurement("a", 1);
+        insert_batch(&mut c, std::slice::from_ref(&m)).unwrap();
+
+        let id: Vec<u8> = c.query_row("SELECT id FROM measurement", [], |r| r.get(0)).unwrap();
+        assert_eq!(id, content_id(&m).to_vec());
     }
 
     #[test]
@@ -149,8 +235,9 @@ mod tests {
         unset.body = Some(serde_json::Value::Null);
         insert_batch(&mut c, &[absent, unset]).unwrap();
 
+        // Ordered by event_time, not id: id is a content hash now, so it carries no arrival order.
         let rows: Vec<Option<String>> = c
-            .prepare("SELECT body FROM measurement ORDER BY id")
+            .prepare("SELECT body FROM measurement ORDER BY event_time")
             .unwrap()
             .query_map([], |r| r.get(0))
             .unwrap()
@@ -173,7 +260,7 @@ mod tests {
             let (from_body, from_attr): (i64, i64) = c
                 .query_row(
                     "SELECT json_extract(body,'$.n'), json_extract(attributes,'$.\"record.attributes.id\"') \
-                     FROM measurement ORDER BY id DESC LIMIT 1",
+                     FROM measurement ORDER BY event_time DESC LIMIT 1",
                     [],
                     |r| Ok((r.get(0)?, r.get(1)?)),
                 )

@@ -5,6 +5,7 @@
 use anyhow::{Context, Result};
 use rusqlite::{Connection, types::Value as SqlValue};
 
+use crate::content_id::ContentId;
 use crate::model::StoredMeasurement;
 
 pub const DEFAULT_LIMIT: i64 = 100;
@@ -23,7 +24,7 @@ pub struct QuerySpec {
     pub attrs: Vec<(String, String)>,
     pub limit: i64,
     /// Keyset position: `(event_time, id)` of the last row of the previous page.
-    pub cursor: Option<(i64, i64)>,
+    pub cursor: Option<(i64, ContentId)>,
 }
 
 /// Builds the JSON path for one attribute key.
@@ -100,11 +101,14 @@ pub fn build_query(spec: &QuerySpec) -> (String, Vec<SqlValue>) {
         ));
     }
 
-    // Keyset rather than OFFSET, so pages stay correct while rows are being ingested.
+    // Keyset rather than OFFSET, so pages stay correct while rows are being ingested. `id` is a
+    // content hash, so ties within one event_time break in hash order rather than arrival order —
+    // arbitrary, but total and deterministic, which is all keyset pagination needs. SQLite compares
+    // blobs with memcmp, so the ordering matches the hex form the API exposes.
     if let Some((event_time, id)) = spec.cursor {
         params.push(SqlValue::Integer(event_time));
         let t_idx = params.len();
-        params.push(SqlValue::Integer(id));
+        params.push(SqlValue::Blob(id.to_vec()));
         let id_idx = params.len();
         where_clauses.push(format!(
             "(event_time < ?{t_idx} OR (event_time = ?{t_idx} AND id < ?{id_idx}))"
@@ -133,7 +137,7 @@ pub fn query(conn: &Connection, spec: &QuerySpec) -> Result<Vec<StoredMeasuremen
             let body: Option<String> = row.get(4)?;
             let attributes: String = row.get(5)?;
             Ok((
-                row.get::<_, i64>(0)?,
+                row.get::<_, Vec<u8>>(0)?,
                 row.get::<_, i64>(1)?,
                 row.get::<_, i64>(2)?,
                 row.get::<_, String>(3)?,
@@ -147,7 +151,10 @@ pub fn query(conn: &Connection, spec: &QuerySpec) -> Result<Vec<StoredMeasuremen
     for row in rows {
         let (id, event_time, processed_time, kind, body, attributes) = row?;
         out.push(StoredMeasurement {
-            id,
+            // Written by this program as a fixed-width hash, so a wrong length means the database
+            // was tampered with rather than that a client sent something odd.
+            id: crate::content_id::from_bytes(&id)
+                .with_context(|| format!("stored id is not {ID_LEN} bytes", ID_LEN = crate::content_id::ID_LEN))?,
             event_time,
             processed_time,
             kind,
@@ -316,19 +323,30 @@ mod tests {
         assert_eq!(got.iter().map(|r| r.event_time).collect::<Vec<_>>(), vec![20, 10]);
     }
 
+    /// Ties now break in hash order rather than arrival order — arbitrary, but total and
+    /// deterministic, which is all keyset pagination requires. Note the rows must differ in
+    /// content: three *identical* measurements are one measurement now (SPEC §6.6).
     #[test]
     fn ordering_is_newest_first_with_id_breaking_ties() {
-        // Same event_time for all three, so only id can order them.
-        let conn = db_with(vec![m("t", 5, json!({})), m("t", 5, json!({})), m("t", 5, json!({}))]);
+        let rows: Vec<Measurement> = (0..3).map(|i| m("t", 5, json!({ "n": i }))).collect();
+        let conn = db_with(rows);
+
         let got = query(&conn, &QuerySpec { limit: DEFAULT_LIMIT, ..Default::default() }).unwrap();
-        assert_eq!(got.iter().map(|r| r.id).collect::<Vec<_>>(), vec![3, 2, 1]);
+        assert_eq!(got.len(), 3, "distinct content must not deduplicate");
+
+        let ids: Vec<_> = got.iter().map(|r| r.id).collect();
+        let mut descending = ids.clone();
+        descending.sort_unstable_by(|a, b| b.cmp(a));
+        assert_eq!(ids, descending, "ties must break on id descending");
     }
 
     #[test]
     fn keyset_pagination_covers_every_row_exactly_once() {
         // Deliberately duplicated timestamps, the case OFFSET-free pagination must still get right.
-        let rows: Vec<Measurement> =
-            (0..10).map(|i| m("t", if i < 5 { 100 } else { 200 }, json!({}))).collect();
+        // Content differs per row so nothing deduplicates.
+        let rows: Vec<Measurement> = (0..10)
+            .map(|i| m("t", if i < 5 { 100 } else { 200 }, json!({ "n": i })))
+            .collect();
         let conn = db_with(rows);
 
         let mut seen = Vec::new();

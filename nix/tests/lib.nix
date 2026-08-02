@@ -46,6 +46,17 @@ let
     {
       services.monitoring-platform.enable = true;
 
+      # A VM boots far slower than a real host — several minutes under aarch64 TCG — and the
+      # gate blocks the boot until the clock is good, so the production 300 s budget has
+      # already proved too tight there once. Raising it is close to free: the gate returns as
+      # soon as three consecutive polls are good, so a healthy boot is unaffected and only the
+      # give-up path lengthens. 120 polls x 5 s = 600 s, which keeps the derived
+      # TimeoutStartSec (720 s) inside the test driver's 900 s wait_for_unit default.
+      #
+      # mkDefault so clock-gate can still force it down: that case needs a short budget,
+      # because watching the gate give up is the point of it.
+      services.monitoring-platform.clockGate.maxPolls = lib.mkDefault 120;
+
       users.users.${clientUser} = {
         isNormalUser = true;
         extraGroups = [ config.services.monitoring-platform.group ];
@@ -113,6 +124,21 @@ let
         # The nixos pool is unreachable from a test net; without this the client would keep
         # retrying it and take much longer to settle on the one server that does answer.
         fallbackServers = lib.mkForce [ ];
+
+        # Cap the retry backoff. Two VMs booting under aarch64 TCG are slow enough that the
+        # helper's chronyd is not listening until ~2 minutes in (udev alone took 30 s in CI),
+        # so timesyncd's first attempts miss. Its poll interval then doubles from 32 s toward
+        # PollIntervalMaxSec (2048 s by default), which turned one missed attempt into first
+        # contact at t=469 s — past the clock gate's budget, failing the boot and cancelling
+        # every unit that Requires= the service. 16 s is the lowest PollIntervalMinSec systemd
+        # accepts, and the max must exceed the min, so these are the tightest legal values.
+        #
+        # Only needed on this branch: the chrony branch leaves the machine's own configuration
+        # alone, and nixpkgs' `iburst` default already makes chrony retry promptly.
+        extraConfig = ''
+          PollIntervalMinSec=16
+          PollIntervalMaxSec=32
+        '';
       };
 
       # Resolution, not configuration: chronyd still dials exactly what the host config

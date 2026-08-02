@@ -149,6 +149,20 @@ in
       description = "Monitoring platform OTLP receiver";
       wantedBy = [ "multi-user.target" ];
 
+      # A [Unit] setting, NOT serviceConfig: systemd parses the file happily and then
+      # drops it with "Unknown key 'StartLimitIntervalSec' in section [Service],
+      # ignoring", so putting it below would silently do nothing. nix/tests/cases/
+      # hardening.nix now greps the journal for exactly that warning.
+      #
+      # The start rate limiter is deliberately disabled (SPEC.md §9.2, §9.4). It used to turn a
+      # permanent startup failure — a schema newer than the binary (§6.2), an occupied socket
+      # (§8.1) — into a failed unit that reports the reason. Fail-closed clock gating trades
+      # that away: a Pi that boots without a network legitimately fails for hours, and a
+      # limiter would give up permanently during exactly the outage it must survive. The cost
+      # is that a genuinely permanent failure now loops at RestartSec intervals instead of
+      # stopping and saying so; the journal still names the reason on every attempt.
+      startLimitIntervalSec = 0;
+
       serviceConfig = {
         # Readiness is reported with sd_notify once migrations have run and the
         # socket is accepting. Under Type=simple systemd would consider the service
@@ -203,17 +217,10 @@ in
         ];
 
         # Restart= covers ExecStartPre= failures too, so the clock gate keeps retrying rather
-        # than needing an operator once the network comes back.
+        # than needing an operator once the network comes back. The rate limiter that would
+        # otherwise stop those retries is disabled at the unit level above, not here.
         Restart = "on-failure";
         RestartSec = "60s";
-        # The start rate limiter is deliberately DISABLED (SPEC.md §9.2, §9.4). It used to turn a
-        # permanent startup failure — a schema newer than the binary (§6.2), an occupied socket
-        # (§8.1) — into a failed unit that reports the reason. Fail-closed clock gating trades
-        # that away: a Pi that boots without a network legitimately fails for hours, and a
-        # limiter would give up permanently during exactly the outage it must survive. The cost
-        # is that a genuinely permanent failure now loops at 60 s intervals instead of stopping
-        # and saying so; the journal still names the reason on every attempt.
-        StartLimitIntervalSec = 0;
 
         User = cfg.user;
         Group = cfg.group;

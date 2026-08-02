@@ -777,6 +777,9 @@ startup.
 ```ini
 [Unit]
 Description=Monitoring platform OTLP receiver
+# Deliberately no start rate limit; see §9.4. This is a [Unit] key: in [Service] systemd
+# parses it and then drops it with "Unknown key ... ignoring", so the setting does nothing.
+StartLimitIntervalSec=0
 
 [Service]
 Type=notify
@@ -787,8 +790,6 @@ TimeoutStartSec=420
 ExecStart=/usr/bin/monitoring-platform serve
 Restart=on-failure
 RestartSec=60s
-# Deliberately no start rate limit; see §9.4.
-StartLimitIntervalSec=0
 
 StateDirectory=monitoring-platform
 StateDirectoryMode=0700
@@ -946,13 +947,22 @@ package output.
 - `@clock` must be named in `SystemCallFilter=`. It is not part of `@system-service`, so
   `adjtimex` would otherwise be denied even with `ProtectClock=` off.
 
-**The start rate limiter is disabled** (`StartLimitIntervalSec=0`), reversing part of §9.2. That
+**The start rate limiter is disabled** (`StartLimitIntervalSec=0`, a **`[Unit]` key** — NixOS
+exposes it as `systemd.services.<name>.startLimitIntervalSec`, not through `serviceConfig`,
+where systemd would parse it and then drop it with *"Unknown key … ignoring"*), reversing part
+of §9.2. That
 limiter existed to turn a permanent startup failure — a schema newer than the binary (§6.2), an
 occupied socket (§8.1) — into a failed unit that reports the reason instead of an endless loop.
 Fail-closed gating trades it away: a device that boots without a network legitimately fails for
 hours, and a limiter would give up permanently during exactly the outage it must survive. The cost
 is real — a genuinely permanent failure now retries every 60 s rather than stopping and saying so —
 but the journal still names the reason on every attempt.
+
+The section matters more than it looks, and is asserted rather than trusted: a directive in the
+wrong section is *accepted by the parser and dropped*, so it fails as "the setting quietly had no
+effect" rather than as an error. `nix/tests/cases/hardening.nix` therefore reads
+`StartLimitIntervalUSec` back from systemd and greps the boot journal for `Unknown key`, which
+catches the whole class.
 
 **Host-side configuration is out of scope for this repo**, and belongs to the system configuration
 that deploys it. Recorded here because the gate's behaviour depends on it: chrony is the

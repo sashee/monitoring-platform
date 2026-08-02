@@ -37,7 +37,7 @@ let
 in
 builtins.mapAttrs (_: dropKvm) (
   import ./lib.nix {
-    inherit pkgs;
+    inherit pkgs stateVersion;
     machineModules = [ testMachine ];
   }
 )

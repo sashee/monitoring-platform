@@ -7,6 +7,12 @@
 use clap::Parser;
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::time::Duration;
+
+use crate::clock::{
+    DEFAULT_CONSECUTIVE, DEFAULT_MAX_POLLS, DEFAULT_POLL_INTERVAL_SECS, DEFAULT_THRESHOLD_MICROS,
+    GateSettings,
+};
 
 pub const DEFAULT_MAX_BODY_BYTES: usize = 4 * 1024 * 1024;
 pub const DEFAULT_MAX_DECOMPRESSED_BYTES: usize = 32 * 1024 * 1024;
@@ -22,6 +28,13 @@ pub struct Cli {
 pub enum Command {
     /// Run the receiver.
     Serve(ServeArgs),
+
+    /// Block until the system clock is verifiably synchronized; exit non-zero if it is not.
+    ///
+    /// Run as the service's `ExecStartPre` so the receiver never stamps a measurement with a
+    /// `processed_time` it cannot stand behind (SPEC §9.4). Usable on its own to diagnose a host
+    /// that will not start monitoring.
+    WaitForClock(WaitForClockArgs),
 }
 
 #[derive(Debug, Parser, Default)]
@@ -45,6 +58,43 @@ pub struct ServeArgs {
     /// Log filter, e.g. `info` or `monitoring_platform=debug`.
     #[arg(long, env = "MP_LOG_LEVEL", default_value = "info")]
     pub log_level: String,
+}
+
+#[derive(Debug, Parser, Default)]
+pub struct WaitForClockArgs {
+    /// Maximum kernel clock error to accept, in microseconds. Default 5000000 (5 s).
+    #[arg(long, env = "MP_CLOCK_THRESHOLD_MICROS")]
+    pub threshold_micros: Option<i64>,
+
+    /// Seconds between polls. Default 5.
+    #[arg(long, env = "MP_CLOCK_POLL_INTERVAL_SECS")]
+    pub poll_interval_secs: Option<u64>,
+
+    /// How many polls to take before giving up. Default 60, i.e. ~5 min at the default interval.
+    #[arg(long, env = "MP_CLOCK_MAX_POLLS")]
+    pub max_polls: Option<u32>,
+
+    /// Consecutive good polls required. Default 3, as hysteresis against `maxerror`'s sawtooth.
+    #[arg(long, env = "MP_CLOCK_CONSECUTIVE")]
+    pub consecutive: Option<u32>,
+
+    /// Log filter, e.g. `info` or `monitoring_platform=debug`.
+    #[arg(long, env = "MP_LOG_LEVEL", default_value = "info")]
+    pub log_level: String,
+}
+
+impl WaitForClockArgs {
+    /// Pure: flags (with `MP_CLOCK_*` already applied by clap) to resolved settings.
+    pub fn settings(&self) -> GateSettings {
+        GateSettings {
+            threshold_micros: self.threshold_micros.unwrap_or(DEFAULT_THRESHOLD_MICROS),
+            poll_interval: Duration::from_secs(
+                self.poll_interval_secs.unwrap_or(DEFAULT_POLL_INTERVAL_SECS),
+            ),
+            max_polls: self.max_polls.unwrap_or(DEFAULT_MAX_POLLS),
+            consecutive: self.consecutive.unwrap_or(DEFAULT_CONSECUTIVE),
+        }
+    }
 }
 
 /// Immutable resolved configuration, passed down by value. No global state, and the environment is
@@ -147,5 +197,32 @@ mod tests {
     fn empty_systemd_directory_is_ignored() {
         let c = Config::resolve(&ServeArgs::default(), &env(&[("RUNTIME_DIRECTORY", "")]));
         assert_eq!(c.socket_path, PathBuf::from("./monitoring-platform.sock"));
+    }
+
+    /// An unset flag must fall back to the documented default rather than to zero, which for
+    /// `threshold_micros` would be a gate nothing can ever pass.
+    #[test]
+    fn clock_gate_defaults_are_the_documented_ones() {
+        let s = WaitForClockArgs::default().settings();
+        assert_eq!(s.threshold_micros, DEFAULT_THRESHOLD_MICROS);
+        assert_eq!(s.poll_interval, Duration::from_secs(DEFAULT_POLL_INTERVAL_SECS));
+        assert_eq!(s.max_polls, DEFAULT_MAX_POLLS);
+        assert_eq!(s.consecutive, DEFAULT_CONSECUTIVE);
+    }
+
+    #[test]
+    fn clock_gate_flags_override_the_defaults() {
+        let args = WaitForClockArgs {
+            threshold_micros: Some(1),
+            poll_interval_secs: Some(2),
+            max_polls: Some(3),
+            consecutive: Some(4),
+            ..Default::default()
+        };
+        let s = args.settings();
+        assert_eq!(s.threshold_micros, 1);
+        assert_eq!(s.poll_interval, Duration::from_secs(2));
+        assert_eq!(s.max_polls, 3);
+        assert_eq!(s.consecutive, 4);
     }
 }

@@ -33,6 +33,23 @@
     )
     assert prop("Type") == "notify"
 
+    # The one deliberate relaxation (SPEC.md §9.4). ProtectClock= cannot distinguish reading
+    # the clock from setting it, so the clock gate needs it off plus @clock allowed. Asserted
+    # here so neither silently drifts back; that the relaxation actually WORKS — adjtimex(2)
+    # surviving inside this sandbox — is the clock-gate case, which runs the gate for real.
+    # CapabilityBoundingSet= being empty above is what still makes setting the clock impossible.
+    assert prop("ProtectClock") == "no", (
+        "ProtectClock must stay off — it blocks the adjtimex(2) read the clock gate needs, "
+        "including in ExecStartPre"
+    )
+    # systemd expands the group names, so the assertion is on the syscall the gate actually
+    # makes rather than on "@clock" appearing literally — which is the stronger check anyway:
+    # it survives the group being renamed or its membership changing.
+    assert "adjtimex" in prop("SystemCallFilter").split(), (
+        f"adjtimex is not permitted; @clock is not part of @system-service, so the module "
+        f"has to name it: {prop('SystemCallFilter')!r}"
+    )
+
     # Drive the paths that a startup-only check would miss: the writer thread, a
     # transaction commit, WAL, and the read path's separate connection.
     payload = sample_batch("/tmp/hardening.pb")

@@ -19,7 +19,7 @@ rustPlatform.buildRustPackage {
     let
       # Keep the store path stable against edits to docs and nix files: only the
       # Rust sources and manifests affect the build.
-      keep = [ "Cargo.toml" "Cargo.lock" "src" "tests" "examples" ];
+      keep = [ "Cargo.toml" "Cargo.lock" "src" "tests" "examples" "crates" ];
     in
     lib.cleanSourceWith {
       src = lib.cleanSource ../.;
@@ -34,6 +34,12 @@ rustPlatform.buildRustPackage {
 
   # Committed lock file, so there is no vendor hash to keep in sync.
   cargoLock.lockFile = ../Cargo.lock;
+
+  # Explicit because the workspace has a root package: without --workspace, cargo's
+  # default member selection is that package alone, so mp-collector would silently
+  # be neither built nor tested and the derivation would still succeed.
+  cargoBuildFlags = [ "--workspace" ];
+  cargoTestFlags = [ "--workspace" ];
 
   # The end-to-end tests spawn the binary and bind unix sockets under TMPDIR; they
   # need no network and no /dev/kvm, so they run in the sandbox as-is.

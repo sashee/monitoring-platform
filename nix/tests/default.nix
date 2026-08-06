@@ -21,7 +21,7 @@ let
   testMachine =
     { ... }:
     {
-      imports = [ ../module.nix ];
+      imports = [ ../module.nix ../collector-module.nix ];
       system.stateVersion = stateVersion;
     };
 
@@ -39,5 +39,8 @@ builtins.mapAttrs (_: dropKvm) (
   import ./lib.nix {
     inherit pkgs stateVersion;
     machineModules = [ testMachine ];
+    # This repo's own machine imports both modules, so it opts in to the collector cases. A
+    # consumer importing ./lib.nix with only the receiver's module keeps the default.
+    collector = true;
   }
 )

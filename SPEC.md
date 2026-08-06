@@ -891,8 +891,17 @@ start until the clock is verifiably synchronized.**
 be, compared against a threshold. Two properties make this the right primitive:
 
 - **It is daemon-agnostic.** It reflects kernel state whichever implementation set it, so the gate
-  behaves identically under chrony, systemd-timesyncd, ntpd-rs or NTPsec and depends on none of
-  them. Referencing `chrony.service` would tie the platform to one deployment's choice.
+  works under chrony, systemd-timesyncd, ntpd-rs or NTPsec and depends on none of them.
+  Referencing `chrony.service` would tie the platform to one deployment's choice.
+
+  Daemon-agnostic is not the same as *identical*, and the distinction matters for anyone reading
+  the threshold as an accuracy claim. The three write three different quantities into the field:
+  chrony the true root distance (`root_delay/2 + root_dispersion`), ntpd-rs `root_delay`, and
+  systemd-timesyncd sets `ADJ_MAXERROR` in its modes but never assigns the field, so it writes
+  **zero** — recency, not accuracy. The magnitudes are not comparable across daemons. What the
+  test reliably distinguishes is *disciplined* from *never touched*, which is precisely the
+  question this gate needs answered. `collector-clock-correction-design.md` §4.4 depends on the
+  same field and documents the per-daemon behaviour in full.
 - **It needs no wait unit.** `time-sync.target` is not depended on either: NixOS enables no unit
   that provides it (`chrony-wait`, `systemd-time-wait-sync`) by default, so the target is reached
   early and means nothing. The poll is authoritative.
@@ -993,10 +1002,11 @@ src/
   main.rs              CLI, wiring, signal handling, shutdown ordering
   lib.rs               AppState
   bin/
-    mp-make-sample.rs  writes a sample OTLP batch; a shipped bin, not an example, so
-                       the VM tests and the §11 manual check get it from the package
+    mp-make-sample.rs  writes a sample OTLP batch, or posts one with --post; a shipped
+                       bin, not an example, so the VM tests and the §11 manual check get
+                       it from the package
   config.rs            Config value + resolution
-  clock.rs             §9.4 boot gate: adjtimex(2) read + pure poll/hysteresis rules
+  clock.rs             §9.4 boot gate: pure poll/hysteresis rules over mp-host's read
   model.rs             Measurement, StoredMeasurement, Rejections
   otlp/
     convert.rs         pure: ExportLogsServiceRequest -> (Vec<Measurement>, Rejections)
@@ -1012,13 +1022,22 @@ src/
     query.rs           GET /v1/measurements, /healthz
     status.rs          google.rpc.Status + the non-protobuf error rewrite layer
   transport/
-    uds.rs             bind, permissions, stale-socket handling, cleanup
+    uds.rs             the receiver's name for mp-host::uds
 tests/
   ingest.rs            router-level OTLP ingest
   read_api.rs          router-level read API
   end_to_end.rs        the compiled binary over a real socket, incl. SIGTERM
+crates/                see collector-clock-correction-design.md for these two
+  mp-host/             clock and socket primitives shared by both binaries
+  mp-collector/        the on-host clock-correcting OTLP collector
 nix/                   see §10.3 for this tree
 ```
+
+**This is a workspace with the receiver at its root**, not moved under `crates/`. Every path above,
+and every reference to one in this document, therefore stays valid; only the two new members are
+new paths. `crates/mp-host` exists so the receiver and the collector cannot drift onto different
+definitions of "what time is it" — one rewrites the timestamps the other stores, so they have to
+agree on `adjtimex(2)`, on `CLOCK_BOOTTIME`, and on the socket lifecycle.
 
 `transport/uds.rs` *constructs* a listener and hands it back; it does not run the server. `main.rs`
 passes that listener to the serve call. This is what keeps both iroh (§8.2) and a possible future
@@ -1408,7 +1427,16 @@ fail as soon as another case is added, which is a needlessly confusing way to fi
   `observed_time_unix_nano` — its one concession to clock disagreement — is also absolute, so it
   distinguishes two clocks but does not substitute for a missing one.
 
-  If it becomes necessary, the workable scheme needs no protocol support, because the anchor is
+  **This is now addressed device-side rather than here.** `collector-clock-correction-design.md`
+  and `crates/mp-collector` implement an on-host collector that keeps a history of
+  `realtime − boottime`, maps each arriving timestamp back into that frame at receipt, and
+  rewrites it once the clock is trustworthy. It needs no protocol support and no application
+  change, and it satisfies both constraints below: corrections are marked with
+  `record.attributes.mp.clock.*` rather than applied silently, and the device still sends its
+  best-effort wall clock so §5.3 is satisfied by construction. The scheme sketched below remains
+  the description of what it does; the collector is where it happens.
+
+  The workable scheme needs no protocol support, because the anchor is
   already server-side. The device sends monotonic clock readings as ordinary attributes — one per
   record for the event, one per batch for the moment of sending — and the platform derives:
 

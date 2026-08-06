@@ -42,31 +42,17 @@ pub enum Outcome {
 
 /// The kernel's own estimate of how wrong the clock may be, in microseconds.
 ///
-/// `adjtimex(2)` with `modes = 0` is a read. This is deliberately daemon-agnostic: it reflects
-/// kernel state whichever NTP implementation set it, so the gate works identically under chrony,
-/// systemd-timesyncd, ntpd-rs or NTPsec, and depends on none of them (SPEC §9.4).
+/// The syscall itself is `mp_host::clock::read_timex`, shared with the collector. This gate reads
+/// only `maxerror` from it and deliberately ignores `STA_UNSYNC`: that bit gets set for reasons
+/// unrelated to clock quality — notably to stop the kernel writing back to the RTC — so
+/// `maxerror` alone is the test, which is also what systemd itself uses.
 ///
-/// `STA_UNSYNC` is deliberately not consulted. That bit gets set for reasons unrelated to clock
-/// quality — notably to stop the kernel writing back to the RTC — so `maxerror` alone is the
-/// test, which is also what systemd itself uses.
+/// Note the collector reaches the opposite conclusion about `STA_UNSYNC` and consults it as one
+/// disjunct of a broader test. The difference is the consequence of being wrong: this gate
+/// refuses to start a service, so a false "synchronized" would silently admit bad rows, while the
+/// collector's worst case is flushing a little early with the reason recorded on the record.
 pub fn clock_error_micros() -> io::Result<i64> {
-    // SAFETY: `timex` is a plain C struct of integers with no padding invariants, so an all-zero
-    // value is valid and means "read only, change nothing". `adjtimex` writes through the pointer
-    // and reads `modes`; the reference is valid and exclusive for the whole call.
-    let (rc, tx) = unsafe {
-        let mut tx: libc::timex = std::mem::zeroed();
-        (libc::adjtimex(&mut tx), tx)
-    };
-    // Only a negative return is a failure. A *positive* one is the clock state — `TIME_ERROR` (5)
-    // is what an unsynchronized clock reports, and that is the case this gate exists to wait out,
-    // not an error to abort on.
-    if rc < 0 {
-        return Err(io::Error::last_os_error());
-    }
-    // `maxerror` is `__syscall_slong_t`: already i64 on the 64-bit targets this ships to, but
-    // i32 on a 32-bit one, where the widening is real. Keep the conversion so both compile.
-    #[allow(clippy::useless_conversion)]
-    Ok(i64::from(tx.maxerror))
+    mp_host::clock::read_timex().map(|tx| tx.max_error_micros)
 }
 
 pub fn is_good(error_micros: i64, threshold_micros: i64) -> bool {

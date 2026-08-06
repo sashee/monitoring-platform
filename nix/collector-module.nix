@@ -180,6 +180,23 @@ in
   config = lib.mkIf cfg.enable {
     assertions = [
       {
+        # A supplementary group that does not exist is not a warning: systemd refuses to start the
+        # unit with "Failed to determine supplementary groups", and nothing before that point
+        # notices. The realistic way in is a host that enables the collector but not the receiver,
+        # where the default below still names the receiver's group.
+        assertion = cfg.forwardToGroup == null || config.users.groups ? ${cfg.forwardToGroup};
+        message = ''
+          services.mp-collector.forwardToGroup is "${toString cfg.forwardToGroup}", which is not
+          a group on this host, so systemd would refuse to start the unit.
+
+          It defaults to "monitoring-platform" whenever forwardTo is the receiver's own socket,
+          because that socket's access control is the mode on its containing runtime directory
+          (SPEC.md §8.1) and the collector has to be in the group to reach it. If the receiver
+          runs elsewhere, set forwardToGroup to whichever group owns the socket you are
+          forwarding to, or to null if it needs no group.
+        '';
+      }
+      {
         assertion = !(lib.hasPrefix "https://" cfg.forwardTo);
         message = ''
           services.mp-collector.forwardTo is an https:// URL, which the collector

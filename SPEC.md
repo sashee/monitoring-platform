@@ -1282,6 +1282,17 @@ import "${monitoring-platform}/nix/tests/lib.nix" {
 # => { platform = <shared VM>; restart = <own VM>; ... }
 ```
 
+**The clock-correcting collector is included by default and needs nothing from the caller**:
+`lib.nix` imports `nix/collector-module.nix` into the machine itself, so a consumer picks up the
+collector cases on its next update with no change on its side. `collector = false` leaves it out
+entirely — the module is not imported, so its options do not exist either. A consumer that already
+imports the module is unaffected: NixOS keys modules by path and deduplicates, which
+`nix/tests/eval-checks.nix` covers with a `collector-preimported` shape.
+
+This defaulted-on rather than opt-in for a reason worth stating, since the opposite was tried
+first: an opt-in flag means a consumer that does not know about it gets less coverage than this
+repo does, silently — and the consumer's run is the authoritative one.
+
 Each entry is a two-node network: the machine under test plus the time source described below.
 
 `nix-build nix -A tests.platform` in this repo is the weaker run, against a synthetic machine and
@@ -1388,6 +1399,9 @@ The cases. Everything below the first two is unreachable from the Rust suite:
 | `ordering` (isolated) | a oneshot unit ordered `After=` the service curls the socket **once at boot, with no retry**. This is the only case that distinguishes `Type=notify` from `Type=simple`, and therefore the only one that justifies the `sd-notify` dependency (see below) |
 | `restart` (isolated) | a clean `Result=success` stop, WAL checkpointed to a single file, rows surviving, and migrations being a no-op on the existing database |
 | `crash-recovery` (isolated) | `SIGKILL`, then `Restart=on-failure` recovery: every *acknowledged* row survives, `pragma integrity_check` is `ok`, and the database is writable again |
+| `collector` | the collector's units, its sandbox (the three settings that differ from the receiver's and fail *silently* if regressed), a record from the sending process arriving corrected, and a relayed one passing through |
+| `collector-clock` (isolated) | with no NTP: the collector starts where the receiver refuses to, journald's backfill supplies the history, records are held, and the timeout ships them marked `mp.clock.uncertain` rather than dropping them. Then NTP arrives, a real `date -s` step is observed, and the §9 health event lands as a measurement |
+| `collector-step` (isolated) | the design's central case: a record held while the clock is untrusted is **released and corrected by a real step**, marked corrected and *not* uncertain. Also that the socket survives a service restart, which is what `RuntimeDirectoryPreserve=` exists for |
 
 Two of these need their reasoning stated, because it is not obvious from the assertions:
 

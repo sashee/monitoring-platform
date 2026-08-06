@@ -21,7 +21,7 @@ let
   testMachine =
     { ... }:
     {
-      imports = [ ../module.nix ../collector-module.nix ];
+      imports = [ ../module.nix ];
       system.stateVersion = stateVersion;
     };
 
@@ -36,11 +36,12 @@ let
     });
 in
 builtins.mapAttrs (_: dropKvm) (
+  # `collector` is deliberately not passed: the harness defaults it on and imports the collector
+  # module itself, so this repo's assembly is exactly what a consumer's looks like. Passing it here
+  # would let the default rot untested — which is how the consumer repo ended up with no collector
+  # coverage in the first place.
   import ./lib.nix {
     inherit pkgs stateVersion;
     machineModules = [ testMachine ];
-    # This repo's own machine imports both modules, so it opts in to the collector cases. A
-    # consumer importing ./lib.nix with only the receiver's module keeps the default.
-    collector = true;
   }
 )

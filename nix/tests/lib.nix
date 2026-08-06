@@ -31,6 +31,10 @@
 # escaped because the case finishes before the timer's first fire. See
 # ./cases/foreign-producer.nix, which pins the property directly.
 #
+# The clock-correcting collector is included by default and needs nothing from the caller: this
+# file imports ../collector-module.nix into the machine itself. Pass `collector = false` to leave
+# it out entirely.
+#
 # Two execution models (a case picks one):
 #   - lightweight (default): a subtest on ONE shared VM, booted once.
 #   - isolated (`isolate = true`): its own VM, with optional extra `machineModules`
@@ -50,18 +54,23 @@
   stateVersion ? pkgs.lib.trivial.release,
   # Also exercise the clock-correcting collector (nix/collector-module.nix).
   #
-  # Opt-in, and off by default, because an unknown option is an evaluation error however it is
-  # guarded: a consumer whose machineModules import only the receiver's module must keep working
-  # unchanged. Turning this on requires importing ../collector-module.nix into the machine, which
-  # is what nix/tests/default.nix does.
-  collector ? false,
+  # ON by default, and the harness imports the module itself rather than requiring the caller to.
+  # Both halves matter: a consumer whose machineModules mention only the receiver would otherwise
+  # get an attrset with no collector cases in it and nothing to say so, and this file's whole point
+  # is that the consumer's run — against its real host config — is the authoritative one
+  # (SPEC.md §11.1). Coverage that only exists in this repo is coverage in the wrong place.
+  #
+  # Importing the same store path twice is harmless: NixOS deduplicates `imports` by path, so a
+  # consumer that already imports the module is unaffected. `collector = false` opts out
+  # completely — the module is not imported, so the option does not exist and nothing is added.
+  collector ? true,
 }:
 let
   lib = pkgs.lib;
   mkCert = import ./test-cert.nix { inherit pkgs; };
 
-  # Only ever added to the module list when `collector` is set, so the options it names need not
-  # exist otherwise.
+  # Only ever added to the module list when `collector` is set, alongside the module that declares
+  # the options it sets — so with the flag off, neither exists.
   collectorClients =
     { config, ... }:
     {
@@ -462,7 +471,10 @@ let
           imports =
             machineModules
             ++ [ testClients timeClient ]
-            ++ lib.optional collector collectorClients
+            # The module first, then the configuration that uses it. A relative path out of this
+            # file resolves against the store copy, the same way ./ntp-node.nix and
+            # ./test-cert.nix already do, so the caller supplies nothing.
+            ++ lib.optionals collector [ ../collector-module.nix collectorClients ]
             ++ extraModules;
         };
         # Layered onto, never replaced: a case that needs the time source to behave

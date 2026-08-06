@@ -1250,8 +1250,8 @@ taking `pkgs` and the machine under test**, so the consuming system supplies bot
 - `nix/tests/cases/*.nix` — one file per case, `{ pkgs }: { testScript; isolate ? false;
   machineModules ? []; ntpNodeModules ? []; waitForService ? true; }`, independent of the
   machine. `ntpNodeModules` layers onto the time-source node and `waitForService` opts out of
-  the harness's readiness wait; both apply only to isolated cases, and both exist for
-  `clock-gate` (below).
+  the harness's readiness wait; both apply only to isolated cases. `ntpNodeModules` exists for
+  `clock-gate`, `waitForService` for it and `clock-gate-minsources` (both below).
 
 A target system tests the service against its **own** configuration by importing the harness directly:
 
@@ -1287,9 +1287,10 @@ that node is read off the machine rather than imposed on it, because `lib.nix` i
 other repos with their *real* host config:
 
 - **No daemon** (this repo's synthetic machine) — `timesyncd` is forced on and aimed at the node.
-- **chrony** — its configuration is left completely alone. Only two things are injected: an
-  `/etc/hosts` entry resolving `services.chrony.servers` to the helper, and, for an NTS client,
-  the helper's CA in `security.pki.certificateFiles`. The helper then serves **real NTS**
+- **chrony** — its configuration is left completely alone. Only two things are injected:
+  `/etc/hosts` entries resolving `services.chrony.servers` to the helper — **one address per
+  name**, with the helper carrying an alias per name on its vlan interface — and, for an NTS
+  client, the helper's CA in `security.pki.certificateFiles`. The helper then serves **real NTS**
   (`ntsservercert`/`ntsserverkey` from `nix/tests/test-cert.nix`, NTS-KE on 4460), with SANs read
   from that same server list so they cannot drift. The production config runs unmodified and
   performs a genuine NTS-KE handshake — pointing it at a plain local NTP server instead would
@@ -1304,16 +1305,36 @@ harness against each daemon plus chrony+NTS and forces the module system, in sec
 booting anything. `make eval-checks` gives each machine its own nix process, for the same reason
 `run-tests` gives each VM one.
 
-Two isolated cases cover the gate itself:
+**One address per server name, not one address for all of them.** chrony allocates a source slot
+per `server` line and resolves each slot's name separately; a slot whose name resolves to an
+address another slot already holds is refused (`NSR_AlreadyInUse`) and left permanently
+unresolved, which `chronyc activity` counts under "sources with unknown address". So N names on
+one address yield exactly **one** usable source. That is invisible at chrony's default
+`minsources 1` and fatal above it: the machine can never select a source, `maxerror` stays at the
+16 s ceiling, and every case fails on a readiness timeout — which is what a fleet setting
+`minsources 2` would hit. Distinct addresses on the *same* chronyd are sufficient (it binds all
+of them and the helper sets `allow all`), so this costs no extra nodes; one helper VM per name
+would be unaffordable under aarch64 TCG.
+
+Three isolated cases cover the gate itself:
 
 - **`clock-gate`** layers `chronyd.wantedBy = mkForce []` onto the time-source node, so "no
   working NTP" is the machine's genuine state — nothing simulates a bad clock — and starting
   chronyd is what flips it. Asserts both directions at the production threshold. Observed values
-  confirm the mechanism: `clock_error_us=16000000` before, `2000` after.
+  confirm the mechanism: `clock_error_us=16000000` before, `2000` after. It drives the transition
+  through whichever client the machine actually runs, resolved at runtime from systemd, and
+  observes it with `wait-for-clock` itself rather than timesyncd's marker file — otherwise the
+  case would silently only work on a machine that brings no NTP daemon of its own.
 - **`clock-gate-nts`** runs the fleet's shape, chrony with `enableNTS`. Beyond the gate opening,
   it asserts `chronyc -N authdata` reports the source as `NTS` with a non-zero cookie count —
   without that, a silent fallback to plain NTP would synchronise the clock, open the gate and
-  look identical.
+  look identical. It also asserts each server name resolved to its *own* helper address.
+- **`clock-gate-minsources`** adds `minsources 2`, the one chrony setting the harness's own
+  impersonation can break. It asserts on the source table — `0 sources with unknown address` and
+  at least `minsources` online — so a regression to one-address-for-all names fails there,
+  naming the unresolved sources, instead of as an unexplained readiness timeout. Neither
+  `clock-gate-nts` (default `minsources 1`, where one usable source suffices) nor
+  `eval-checks.nix` (evaluation only; this failure is purely at runtime) can catch it.
 
 **Why this matters more here than for a typical service.** §9.2 leans heavily on systemd sandboxing —
 `RestrictAddressFamilies=AF_UNIX`, `SystemCallFilter=@system-service`, `ProtectSystem=strict` — and

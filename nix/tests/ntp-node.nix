@@ -23,10 +23,37 @@
   stateVersion ? null,
   # null, or { certFile, keyFile } from ./test-cert.nix.
   nts ? null,
+  # Extra addresses to answer on, one per server name the machine under test dials. See
+  # aliasAddressesFor in ./lib.nix for why one address for all of them does not work.
+  extraAddresses ? [ ],
 }:
-{ lib, ... }:
+{ config, lib, ... }:
 {
   networking.hostName = hostName;
+
+  # Aliases on this node's vlan interface, not extra nodes: chronyd already binds every
+  # address and `allow all` below answers on all of them, so one daemon serves every name.
+  # The framework's own address for the node merges with these rather than being replaced —
+  # networking.interfaces is a plain definition and ipv4.addresses is a list.
+  networking.interfaces.eth1.ipv4.addresses = map (address: {
+    inherit address;
+    prefixLength = 24;
+  }) extraAddresses;
+
+  # eth1 is the vlan-1 interface the test framework assigns at the default
+  # `virtualisation.vlans = [ 1 ]`. If this node is ever put on other links the aliases
+  # would land on the wrong one and every name would resolve to an address nothing answers
+  # on, which surfaces as an opaque clock-gate timeout — so say so here instead.
+  assertions = lib.optional (extraAddresses != [ ]) {
+    assertion = config.virtualisation.vlans == [ 1 ] && config.virtualisation.interfaces == { };
+    message =
+      "monitoring-platform test harness: nix/tests/ntp-node.nix puts one alias address per "
+      + "chrony server name on eth1, which is only the vlan-1 interface while this node "
+      + "keeps the framework's default networking. It has vlans="
+      + "${builtins.toJSON config.virtualisation.vlans} and interfaces="
+      + "${builtins.toJSON (lib.attrNames config.virtualisation.interfaces)}. Point "
+      + "extraAddresses at the right interface in nix/tests/ntp-node.nix.";
+  };
   networking.firewall.allowedUDPPorts = [ 123 ];
   # NTS-KE. Only open when there is a certificate to serve — chronyd opens the port only
   # once ntsservercert/ntsserverkey are set.

@@ -6,9 +6,14 @@
 # 16 s unsynchronized ceiling with nothing faking it, which is exactly the Raspberry Pi
 # cold-boot case the gate exists for. Starting chronyd is then what flips it.
 #
-# The threshold under test is the production default (5 s), deliberately: timesyncd sets
-# `maxerror = 0` on synchronizing and it then grows at only 500 µs/s, so a freshly-synced
-# node has hours of headroom and this needs no relaxed threshold to pass.
+# The threshold under test is the production default (5 s), deliberately: a client that has
+# just synchronized drives `maxerror` far below it, and it then grows at only 500 µs/s, so a
+# freshly-synced node has hours of headroom and this needs no relaxed threshold to pass.
+#
+# Nothing here is specific to one NTP client. Which one the machine runs depends on the
+# machine under test — timesyncd for this repo's synthetic one, chrony for a consumer's real
+# host module — so the transition is driven through `time_sync_unit()` and observed through
+# the gate's own daemon-agnostic check rather than through timesyncd's marker file.
 #
 # Isolated because it must watch the unit fail and restart, which would perturb every
 # lightweight case sharing a VM.
@@ -49,7 +54,7 @@
   ];
 
   testScript = ''
-    MARKER = "/run/systemd/timesync/synchronized"
+    UNIT = time_sync_unit()
 
     ntp.wait_for_unit("multi-user.target")
 
@@ -78,9 +83,10 @@
         )
 
     with subtest("no working NTP: the unit does not start"):
-        # Nothing here fakes a bad clock — chronyd is simply not running, so the kernel's
-        # estimate sits at its unsynchronized ceiling.
-        machine.fail(f"test -e {MARKER}")
+        # Nothing here fakes a bad clock — the helper's chronyd is simply not running, so the
+        # kernel's estimate sits at its unsynchronized ceiling. Asserted with the gate's own
+        # check, which holds whichever client the machine keeps time with.
+        machine.fail(CLOCK_OK)
 
         # Wait on the gate's own verdict rather than on unit state: the boot-time start job
         # is already in flight, so polling `is-active` could catch it mid-wait and prove
@@ -128,10 +134,12 @@
         ntp.succeed("systemctl start chronyd.service")
         ntp.wait_for_unit("chronyd.service")
 
-        # RuntimeDirectory=, so a restart clears the marker and re-polls immediately: a
-        # clean edge trigger rather than waiting out timesyncd's poll interval.
-        machine.succeed("systemctl restart systemd-timesyncd.service")
-        machine.wait_for_file(MARKER, timeout=120)
+        # Restart the machine's own client rather than waiting out its backoff: a fresh start
+        # re-polls immediately — timesyncd clears its RuntimeDirectory marker, chrony bursts
+        # again — instead of drifting toward maxpoll after the attempts that missed while the
+        # helper was down. A clean edge trigger either way.
+        machine.succeed(f"systemctl restart {UNIT}")
+        machine.wait_until_succeeds(CLOCK_OK, timeout=180)
 
         # Don't wait out RestartSec=60; drive the retry directly.
         machine.succeed("systemctl restart monitoring-platform.service", timeout=120)

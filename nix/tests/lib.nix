@@ -88,13 +88,44 @@ let
   ];
   daemonsOn = machine: lib.filter (d: machine.services.${d}.enable) ntpDaemons;
 
-  # The server names a chrony machine dials over NTS. Read off `services.chrony.servers`
-  # rather than guessed, so the certificate's SANs and the /etc/hosts override below are
-  # derived from the same value chronyd itself uses and cannot drift from it.
-  ntsNamesOf =
-    machine:
-    lib.optionals (machine.services.chrony.enable && machine.services.chrony.enableNTS)
-      machine.services.chrony.servers;
+  # The server names a chrony machine dials. Read off `services.chrony.servers` rather than
+  # guessed, so the certificate's SANs, the /etc/hosts override and the helper's addresses
+  # are all derived from the same value chronyd itself uses and cannot drift from one another.
+  serversOf = machine: lib.optionals machine.services.chrony.enable machine.services.chrony.servers;
+
+  # ...those it dials over NTS specifically, which are the ones the certificate must name.
+  ntsNamesOf = machine: lib.optionals machine.services.chrony.enableNTS (serversOf machine);
+
+  # One helper address per server name, and the reason the names cannot simply all point at
+  # the helper's single address.
+  #
+  # chrony allocates a source slot per `server` line and resolves each slot's name
+  # separately. A slot whose name resolves to an address another slot already holds is
+  # REFUSED — NSR_AlreadyInUse in chrony's ntp_sources.c — and left permanently unresolved;
+  # `chronyc activity` counts it under "sources with unknown address". So N names on one
+  # address yield exactly ONE usable source. That is invisible at chrony's default
+  # `minsources 1` and fatal above it: the machine can never select a source, `maxerror`
+  # stays at the kernel's 16 s unsynchronized ceiling, the §9.4 gate never opens, and every
+  # case fails on a timeout. A fleet that sets `minsources 2` is the ordinary case, not an
+  # exotic one, so the harness has to support it.
+  #
+  # Distinct addresses on the SAME chronyd are enough — it binds every address and the
+  # helper sets `allow all` — so this needs no extra nodes. One helper VM per name would be
+  # unaffordable under aarch64 TCG.
+  aliasAddressesFor =
+    ntpNode: machine:
+    let
+      # Derived from the helper's own address rather than a hardcoded subnet. Safe to read
+      # here while also extending that same node's address list: the test framework computes
+      # primaryIPAddress from its own local binding, not from the merged
+      # networking.interfaces (nixos/lib/testing/network.nix), so this cannot recurse.
+      prefix = lib.concatStringsSep "." (
+        lib.take 3 (lib.splitString "." ntpNode.networking.primaryIPAddress)
+      );
+    in
+    # Based at .200: the framework numbers nodes from 1 upwards and this harness has two, so
+    # an alias can never collide with a node's own address.
+    lib.imap0 (i: _: "${prefix}.${toString (200 + i)}") (serversOf machine);
 
   ntsCertFor = machine: mkCert {
     name = "mp-nts";
@@ -142,10 +173,14 @@ let
       };
 
       # Resolution, not configuration: chronyd still dials exactly what the host config
-      # told it to.
-      networking.hosts = lib.mkIf config.services.chrony.enable {
-        "${nodes.ntp.networking.primaryIPAddress}" = config.services.chrony.servers;
-      };
+      # told it to. One name per address, never several on one — see aliasAddressesFor.
+      networking.hosts = lib.mkIf config.services.chrony.enable (
+        lib.listToAttrs (
+          lib.zipListsWith (address: name: lib.nameValuePair address [ name ])
+            (aliasAddressesFor nodes.ntp config)
+            (serversOf config)
+        )
+      );
 
       # A list, so this adds to whatever CAs the consumer already injects.
       security.pki.certificateFiles = lib.mkIf (ntsNames != [ ]) [ (ntsCertFor config).caFile ];
@@ -177,6 +212,9 @@ let
         (import ./ntp-node.nix {
           hostName = ntpServer;
           inherit stateVersion;
+          # The other half of timeClient's one-name-per-address mapping. Both sides call the
+          # same function on the same server list, so they cannot drift apart.
+          extraAddresses = aliasAddressesFor nodes.ntp nodes.machine;
           nts =
             if ntsNames == [ ] then
               null
@@ -248,6 +286,24 @@ let
           # by the same code the service parses — no hand-encoded protobuf in the test.
           machine.succeed(f"mp-make-sample {dest}")
           return dest
+
+      # The gate's own check, run out of band with a one-shot budget so it answers
+      # immediately instead of waiting: the same daemon-agnostic adjtimex(2) read the service
+      # gates on (SPEC.md §9.4), at the same default threshold. Lets a case assert on the
+      # clock without knowing which NTP client the machine under test runs.
+      CLOCK_OK = "monitoring-platform wait-for-clock --max-polls 1 --consecutive 1"
+
+      def time_sync_unit():
+          # Which client keeps the machine's time is the MACHINE's property, not the
+          # harness's: timeClient in ../lib.nix only enables timesyncd when the machine
+          # brings no daemon of its own, so a consumer's real host module usually means
+          # chrony instead. Asked of systemd at runtime because a case's testScript is a
+          # static string with no access to the evaluated machine configuration.
+          for unit in ["chronyd.service", "systemd-timesyncd.service"]:
+              state = machine.succeed(f"systemctl show {unit} -p LoadState --value").strip()
+              if state == "loaded":
+                  return unit
+          raise Exception("the machine under test runs no time-sync client this harness drives")
     '';
 
   # One VM test on the base machine plus any per-case modules and helper nodes.
@@ -293,6 +349,7 @@ let
     crash-recovery = import ./cases/crash-recovery.nix { inherit pkgs; };
     clock-gate = import ./cases/clock-gate.nix { inherit pkgs; };
     clock-gate-nts = import ./cases/clock-gate-nts.nix { inherit pkgs; };
+    clock-gate-minsources = import ./cases/clock-gate-minsources.nix { inherit pkgs; };
   };
 
   isolated = lib.filterAttrs (_: c: c.isolate or false) cases;

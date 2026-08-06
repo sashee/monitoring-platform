@@ -17,19 +17,25 @@
   isolate = true;
 
   machineModules = [
-    {
-      # Deliberately names that cannot resolve anywhere else: if the /etc/hosts override
-      # ever stops being applied, this fails as "never synchronized" rather than quietly
-      # reaching the real internet and passing for the wrong reason.
-      services.chrony = {
-        enable = true;
-        enableNTS = true;
-        servers = [
-          "time1.example.test"
-          "time2.example.test"
-        ];
-      };
-    }
+    (
+      { lib, ... }:
+      {
+        # Deliberately names that cannot resolve anywhere else: if the /etc/hosts override
+        # ever stops being applied, this fails as "never synchronized" rather than quietly
+        # reaching the real internet and passing for the wrong reason.
+        services.chrony = {
+          enable = true;
+          enableNTS = true;
+          # mkForce because `servers` is a list and therefore MERGES: against a consumer's
+          # real host module this case would otherwise test that machine's own servers plus
+          # these two, i.e. not the two-server shape it describes and asserts on below.
+          servers = lib.mkForce [
+            "time1.example.test"
+            "time2.example.test"
+          ];
+        };
+      }
+    )
   ];
 
   testScript = ''
@@ -45,11 +51,24 @@
         )
         assert "ntp-server" not in conf, f"helper node leaked into the machine's config:\n{conf}"
 
-    with subtest("the names resolve to the helper node"):
-        ip = ntp.succeed("ip -4 -o addr show eth1 | awk '{print $4}' | cut -d/ -f1").strip()
+    with subtest("each name resolves to its own address on the helper node"):
+        # One address per name, not every name on one: chrony refuses a source slot whose
+        # name resolves to an address another slot already holds, so a shared address would
+        # leave all but one name permanently unresolved. Harmless at chrony's default
+        # `minsources 1` and fatal above it — see the clock-gate-minsources case.
+        addrs = set(
+            ntp.succeed("ip -4 -o addr show eth1 | awk '{print $4}' | cut -d/ -f1").split()
+        )
+        resolved = {}
         for name in ["time1.example.test", "time2.example.test"]:
-            resolved = machine.succeed(f"getent hosts {name} | awk '{{print $1}}'").strip()
-            assert resolved == ip, f"{name} resolved to {resolved!r}, expected the ntp node {ip!r}"
+            resolved[name] = machine.succeed(f"getent hosts {name} | awk '{{print $1}}'").strip()
+            assert resolved[name] in addrs, (
+                f"{name} resolved to {resolved[name]!r}, which is not an address of the ntp "
+                f"node ({sorted(addrs)})"
+            )
+        assert len(set(resolved.values())) == len(resolved), (
+            f"the server names share an address, so chrony can only use one of them: {resolved}"
+        )
 
     with subtest("chrony synchronised over NTS, so the gate opened"):
         # wait_for_unit already ran in the preamble, so reaching here means the boot gate

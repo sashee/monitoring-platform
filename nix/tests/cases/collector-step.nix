@@ -54,12 +54,19 @@
         # of this case the database does not exist yet. That is "no rows", not an error — but the
         # absence has to be handled explicitly rather than by swallowing sqlite3's exit code,
         # which would also hide a genuinely broken query.
+        #
+        # Scoped on the harness's device.id too: the cutoff comparison is about WHERE in time
+        # a row landed, which says nothing about who wrote it, so a foreign producer's rows
+        # would be counted as this case's evidence either side of the line.
+        sql = (
+            f"select count(*) from measurement where type = '{kind}' "
+            f"and event_time {comparison} strftime('%s','{CUTOFF}') * 1000000000 "
+            f"and {sample_scope()};"
+        )
         out = machine.succeed(
             f"""if [ -e {DB} ]; then """
-            f"""sqlite3 'file:{DB}?mode=ro' "select count(*) from measurement """
-            f"""where type = '{kind}' """
-            f"""and event_time {comparison} strftime('%s','{CUTOFF}') * 1000000000;"; """
-            f"""else echo 0; fi"""
+            + "sqlite3 " + shlex.quote(f"file:{DB}?mode=ro") + " " + shlex.quote(sql)
+            + "; else echo 0; fi"
         )
         return int(out.strip())
 

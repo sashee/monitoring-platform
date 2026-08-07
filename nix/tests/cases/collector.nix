@@ -26,9 +26,12 @@
         assert "multi-user.target" in wanted, f"the service is not started eagerly: {wanted!r}"
 
         # Before anything that can step the clock. This is what eliminates the unknown-epoch case.
-        before = machine.succeed("systemctl show mp-collector.service -p Before --value")
-        assert "systemd-timesyncd.service" in before or "chronyd.service" in before, (
-            f"the collector is not ordered before any time daemon: {before!r}"
+        # Not plain `before`: every lightweight case is spliced into ONE function scope, so a bare
+        # name here is shared with the row counts below and with ingest.nix and restart.nix — and
+        # the driver's type check reads the union, not the nearest assignment.
+        before_units = machine.succeed("systemctl show mp-collector.service -p Before --value")
+        assert "systemd-timesyncd.service" in before_units or "chronyd.service" in before_units, (
+            f"the collector is not ordered before any time daemon: {before_units!r}"
         )
 
         # DefaultDependencies=no removes shutdown ordering, and putting it back is manual.
@@ -80,9 +83,10 @@
     with subtest("a record from the sending process is corrected"):
         before = row_count()
         post_through_collector()
-        machine.wait_until_succeeds(f"test $(sqlite3 'file:{DB}?mode=ro' "
-                                    f"'select count(*) from measurement;') -ge {before + 3}",
-                                    timeout=60)
+        # Through row_count, so both sides of the comparison are scoped to this harness's
+        # rows. An unscoped count here would be satisfied by a foreign producer's batch and
+        # the assertions below would then read whatever row happened to be newest.
+        retry(lambda _: row_count() >= before + 3, timeout_seconds=60)
 
         attrs = clock_attributes("heart_rate")
         assert attrs["corrected"] is True, f"the sender's own timestamp was not corrected: {attrs}"
@@ -100,18 +104,39 @@
         # re-emitting a timestamp it did not produce. The bound is real, not decorative, and this
         # is the case that proves the collector does not rewrite what it has no business rewriting.
         path = sample_batch("/tmp/relayed.pb")
-        machine.succeed(
-            f"su - {CLIENT} -c " + repr(
-                f"curl -sS --fail-with-body --unix-socket {COLLECTOR} "
-                f"-X POST -H 'Content-Type: application/x-protobuf' "
-                f"--data-binary @{path} http://localhost/v1/logs"
+        # The wait is the point of the case, not padding. Frame resolution admits a stamp that
+        # predates the sender by up to the epoch tolerance (DEFAULT_TOLERANCE_NANOS, 50 ms in
+        # epoch.rs — a fixed constant, with no flag or module option to read it from). Under it,
+        # curl's own frame explains the timestamp and the record resolves `exact`; over it, only
+        # passthrough is left. Relying on process-spawn latency to clear 50 ms is what made this
+        # pass at ~150 ms on a loaded VM and fail at ~20 ms on a fast one. 0.5 s is 10x the
+        # tolerance, so the classification is a property of the code rather than of the host.
+        machine.succeed("sleep 0.5")
+        machine.succeed(_as_user(CLIENT,
+            f"curl -sS --fail-with-body --unix-socket {COLLECTOR} "
+            f"-X POST -H 'Content-Type: application/x-protobuf' "
+            f"--data-binary @{path} http://localhost/v1/logs"
+        ))
+        def resolutions():
+            sql = (
+                "select json_extract(attributes, "
+                """'$."record.attributes.mp.clock.resolution"') """
+                f"from measurement where {sample_scope()};"
             )
-        )
-        machine.wait_until_succeeds(
-            f"""sqlite3 'file:{DB}?mode=ro' "select attributes from measurement;" """
-            f"""| grep -q passthrough""",
-            timeout=60,
-        )
+            out = machine.succeed(
+                "sqlite3 " + shlex.quote(f"file:{DB}?mode=ro") + " " + shlex.quote(sql)
+            )
+            return [line for line in out.split("\n") if line]
+
+        def relayed_landed(last_try):
+            seen = resolutions()
+            if last_try:
+                assert "passthrough" in seen, (
+                    f"the relayed batch was not left alone; resolutions seen: {seen}"
+                )
+            return "passthrough" in seen
+
+        retry(relayed_landed, timeout_seconds=60)
 
     with subtest("the collector accepts exactly what the receiver accepts"):
         # Or "point an application at either one unchanged" stops being true.
@@ -120,12 +145,10 @@
             ("-H 'Content-Type: application/x-protobuf' -H 'Content-Encoding: zstd'", "unknown encoding"),
         ]:
             for sock in [COLLECTOR, SOCKET]:
-                code = machine.succeed(
-                    f"su - {CLIENT} -c " + repr(
-                        f"curl -sS -o /dev/null -w '%{{http_code}}' --unix-socket {sock} "
-                        f"-X POST {bad} --data-binary @/tmp/relayed.pb http://localhost/v1/logs"
-                    )
-                ).strip()
+                code = machine.succeed(_as_user(CLIENT,
+                    f"curl -sS -o /dev/null -w '%{{http_code}}' --unix-socket {sock} "
+                    f"-X POST {bad} --data-binary @/tmp/relayed.pb http://localhost/v1/logs"
+                )).strip()
                 assert code == "415", f"{why} on {sock} gave {code}, expected 415"
   '';
 }

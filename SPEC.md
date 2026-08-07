@@ -1002,9 +1002,9 @@ src/
   main.rs              CLI, wiring, signal handling, shutdown ordering
   lib.rs               AppState
   bin/
-    mp-make-sample.rs  writes a sample OTLP batch, or posts one with --post; a shipped
-                       bin, not an example, so the VM tests and the §11 manual check get
-                       it from the package
+    mp-make-sample.rs  writes a sample OTLP batch, posts one with --post, or stamps a
+                       different --device-id; a shipped bin, not an example, so the VM
+                       tests and the §11 manual check get it from the package
   config.rs            Config value + resolution
   clock.rs             §9.4 boot gate: pure poll/hysteresis rules over mp-host's read
   model.rs             Measurement, StoredMeasurement, Rejections
@@ -1292,6 +1292,17 @@ imports the module is unaffected: NixOS keys modules by path and deduplicates, w
 This defaulted-on rather than opt-in for a reason worth stating, since the opposite was tried
 first: an opt-in flag means a consumer that does not know about it gets less coverage than this
 repo does, silently — and the consumer's run is the authoritative one.
+
+**Every assertion is scoped to the harness's own rows.** The machine under test is a consumer's
+real one, so it normally runs a producer of its own writing to the same receiver over the same
+socket, at times the harness does not control. `mp-make-sample` stamps
+`resource.attributes.device.id = dev-7`; `row_count` and `sample_rows` filter on it, and a case
+must not reach past them to a bare `select count(*)`. The collector cases hold to the same rule —
+the collector corrects a batch in place rather than rebuilding it, so `device.id` survives the
+extra hop. The one exemption is `mp.collector.health`, which the collector synthesizes itself and
+so carries no `device.id`; its type is already the narrower filter.
+`nix/tests/cases/foreign-producer.nix` pins the property by posting a second batch as
+`--device-id other-device` and asserting the scoped counts do not move.
 
 Each entry is a two-node network: the machine under test plus the time source described below.
 

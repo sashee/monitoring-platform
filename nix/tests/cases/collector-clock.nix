@@ -165,20 +165,33 @@
         # everything else and needs no second transport — and so a self-metric cannot be the one
         # thing still working when the real path is broken.
         def latest_health():
-            # Newest by processed_time, or None if none has arrived yet. Polling for *a* health
-            # row is not enough: several are emitted before the step above, and the first one to
-            # land naturally reports zero steps.
+            # Newest by ROWID, or None if none has arrived yet — not by processed_time. That
+            # column is the receiver's wall clock at ingest, and the subtest above deliberately
+            # steps that clock back to 2019, so it is not a sequence here: a row ingested during
+            # the 2019 window sorts below rows that arrived before it. `measurement` is a rowid
+            # table on purpose (src/store/schema.rs, the v2 migration), so rowid IS arrival order.
             out = machine.succeed(
                 f"""sqlite3 'file:{DB}?mode=ro' "select body from measurement """
-                f"""where type = 'mp.collector.health' order by processed_time desc limit 1;" """
+                f"""where type = 'mp.collector.health' order by rowid desc limit 1;" """
             ).strip()
             return json.loads(out) if out else None
 
-        def step_reported(_last_try):
+        def post_recovery_health(_last_try):
+            # Both halves, or this waits for the wrong thing. Polling for *a* health row is not
+            # enough — several are emitted before the step above, and the first to land naturally
+            # reports zero steps. Neither is polling for a step: emission is gated on
+            # ever_synchronized rather than on the clock being good right now, so the reading
+            # taken inside the 2019 window is a legitimate row that already carries the step
+            # count, and stopping there leaves the assertions below reading a snapshot from a
+            # moment when the clock was known-bad.
             reported = latest_health()
-            return reported is not None and reported["clock.steps"] >= 1
+            return (
+                reported is not None
+                and reported["clock.steps"] >= 1
+                and reported["clock.disciplined"] is True
+            )
 
-        retry(step_reported, timeout_seconds=120)
+        retry(post_recovery_health, timeout_seconds=120)
 
         reported = latest_health()
         assert reported["clock.disciplined"] is True, f"NTP is up by now: {reported}"

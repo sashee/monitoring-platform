@@ -86,3 +86,90 @@ pub fn body_map(pairs: Vec<(&str, OtlpValue)>) -> AnyValue {
         })),
     }
 }
+
+/// The `device.id` the sample batch is stamped with by default.
+///
+/// The NixOS VM harness scopes every assertion to this value, because the machine under
+/// test is an input and usually runs producers of its own writing to the same receiver
+/// (`nix/tests/lib.nix`). It hardcodes the literal, so the test below pins it: changing
+/// it here must fail rather than silently unscope the harness.
+pub const SAMPLE_DEVICE_ID: &str = "dev-7";
+
+/// The batch `mp-make-sample` writes: three measurements (gps, cpu, heart_rate) from one
+/// device. Pure in its inputs — the clock is the binary's business — so the shape the VM
+/// tests depend on is unit-testable.
+pub fn sample_request(device_id: &str, now_unix_nano: i64) -> ExportLogsServiceRequest {
+    request(
+        vec![kv_str("service.name", "fleet-agent"), kv_str("device.id", device_id)],
+        "sensors",
+        "0.3.1",
+        vec![],
+        vec![
+            record(
+                "gps",
+                now_unix_nano,
+                0,
+                Some(body_map(vec![
+                    ("lat", OtlpValue::DoubleValue(47.4979)),
+                    ("lon", OtlpValue::DoubleValue(19.0402)),
+                    ("alt_m", OtlpValue::DoubleValue(105.2)),
+                ])),
+                vec![kv_str("unit", "wgs84"), kv_int("sensor.index", 0)],
+            ),
+            record(
+                "cpu",
+                now_unix_nano + 1_000_000,
+                0,
+                Some(body_map(vec![
+                    ("usage", OtlpValue::DoubleValue(0.42)),
+                    ("temp_c", OtlpValue::DoubleValue(51.5)),
+                ])),
+                vec![kv_str("unit", "ratio"), kv_int("cpu.core", 0)],
+            ),
+            record(
+                "heart_rate",
+                now_unix_nano + 2_000_000,
+                0,
+                Some(AnyValue { value: Some(OtlpValue::IntValue(72)) }),
+                vec![kv_str("unit", "bpm"), kv_str("sensor.model", "polar-h10")],
+            ),
+        ],
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::otlp::to_measurements;
+    use serde_json::json;
+
+    const T: i64 = 1_785_489_242_123_456_789;
+    const P: i64 = 1_785_489_242_170_000_000;
+
+    /// The NixOS harness filters on the literal `dev-7`, both in SQL and as
+    /// `attr.resource.attributes.device.id` (`nix/tests/lib.nix`). It cannot see this
+    /// constant, so renaming the constant alone must break here — hence the literal on
+    /// the right-hand side rather than `SAMPLE_DEVICE_ID`.
+    #[test]
+    fn the_sample_batch_is_stamped_with_the_sample_device_id() {
+        let (ms, _) = to_measurements(&sample_request(SAMPLE_DEVICE_ID, T), P);
+        assert_eq!(ms.len(), 3, "the harness asserts in multiples of 3");
+        for m in &ms {
+            assert_eq!(
+                m.attributes["resource.attributes.device.id"],
+                json!("dev-7"),
+                "the harness scopes its assertions on this exact key and value"
+            );
+        }
+    }
+
+    /// `--device-id` is what lets the foreign-producer case impersonate a second writer.
+    #[test]
+    fn the_device_id_is_overridable() {
+        let (ms, _) = to_measurements(&sample_request("other-device", T), P);
+        assert_eq!(ms.len(), 3);
+        for m in &ms {
+            assert_eq!(m.attributes["resource.attributes.device.id"], json!("other-device"));
+        }
+    }
+}

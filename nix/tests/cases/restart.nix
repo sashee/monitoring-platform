@@ -34,7 +34,7 @@
     # The rows are still there, and the service is serving again on a fresh socket.
     assert row_count() == before, "committed rows must survive a restart"
     assert get_json("/healthz")["status"] == "ok"
-    assert len(get_json("/v1/measurements?limit=10")["measurements"]) == before
+    assert len(sample_rows()) == before
 
     # And it can still accept new data, i.e. migrations were a no-op on the existing
     # database rather than a failure. A FRESH batch: re-posting `payload` would now be a

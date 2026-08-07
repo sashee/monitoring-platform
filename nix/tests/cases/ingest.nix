@@ -11,7 +11,7 @@
 {
   testScript = ''
     def gps_rows():
-        return get_json("/v1/measurements?type=gps&limit=100")["measurements"]
+        return sample_rows("type=gps")
 
     payload = sample_batch()
     before = row_count()
@@ -52,7 +52,7 @@
     # An integer attribute filter: this is the case that silently matched nothing
     # before the CAST in the query builder, so a regression would show up here as
     # zero rows rather than as an error.
-    hits = get_json("/v1/measurements?attr.record.attributes.sensor.index=0")["measurements"]
+    hits = sample_rows("attr.record.attributes.sensor.index=0")
     assert len(hits) >= 1, f"integer attribute filter returned {len(hits)} rows"
 
     # A wrong content type is refused, and the error body is protobuf as OTLP

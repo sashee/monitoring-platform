@@ -16,6 +16,21 @@
 #   }
 #   # => { platform = <shared VM>; <isolated-case> = <own VM>; ... }
 #
+# Because that machine is the consumer's real one, it usually runs a PRODUCER of its
+# own — the point of the receiver is that something writes to it. Those rows arrive on
+# the same socket, into the same table, at times this file does not control. So every
+# assertion here is scoped to the batches the harness itself posted, keyed on the
+# resource attribute mp-make-sample stamps (SAMPLE_DEVICE_ID below); `row_count` and
+# `sample_rows` are the only sanctioned ways to count, and a case must not reach past
+# them to a bare `select count(*)`.
+#
+# This is not hypothetical. sashee/nixos-test runs the suite against a Raspberry Pi 5
+# config whose systemMetrics timer posts host metrics every 15 minutes; unscoped, its
+# aarch64 crash-recovery job failed with "read API returned 12 of 6 rows" when a host
+# batch landed in the 375 ms between the sqlite count and the read-API call. x86 only
+# escaped because the case finishes before the timer's first fire. See
+# ./cases/foreign-producer.nix, which pins the property directly.
+#
 # Two execution models (a case picks one):
 #   - lightweight (default): a subtest on ONE shared VM, booted once.
 #   - isolated (`isolate = true`): its own VM, with optional extra `machineModules`
@@ -235,10 +250,20 @@ let
     { waitForService }:
     ''
       import json
+      import shlex
 
       SOCKET = "/run/monitoring-platform/monitoring-platform.sock"
       DB = "/var/lib/monitoring-platform/measurements.db"
       CLIENT = "${clientUser}"
+
+      # What distinguishes this harness's rows from any producer the machine under test
+      # runs of its own (see the header). mp-make-sample stamps device.id as a resource
+      # attribute; otlp/convert.rs flattens it into the attributes column under the
+      # resource.attributes. prefix, and the read API exposes it as attr.<that key>.
+      # The literal is pinned on the Rust side by a unit test in otlp/test_support.rs,
+      # so it cannot drift out from under this file silently.
+      SAMPLE_DEVICE_ID = "dev-7"
+      SAMPLE_ATTR = "resource.attributes.device.id"
 
       # Two nodes, so the driver no longer auto-starts on first use.
       start_all()
@@ -253,22 +278,35 @@ let
     ''
     + ''
 
+      # `su -c` runs its argument through a second shell, so a command reaches a shell
+      # TWICE and has to survive both. shlex.quote rather than repr for the outer level:
+      # repr is Python quoting that merely resembles shell quoting, and switches to
+      # double quotes when the string contains one — which would start interpolating.
+      def _as_user(user, command):
+          return f"su - {user} -c " + shlex.quote(command)
+
       def curl_raw(args, user=CLIENT, succeed=True):
           # No --fail-with-body: for probes that inspect the status themselves via -w.
           # Run as a group member by default: the socket is only reachable through a
           # 0750 group-owned directory, so root-only probes would not prove access
           # works for the clients that matter.
-          cmd = f"su - {user} -c " + repr(f"curl -sS --unix-socket {SOCKET} {args}")
+          cmd = _as_user(user, f"curl -sS --unix-socket {SOCKET} {args}")
           return (machine.succeed if succeed else machine.fail)(cmd)
 
       def curl(args, user=CLIENT, succeed=True):
           # --fail-with-body, so a 4xx/5xx is a non-zero exit and therefore a test
           # failure unless succeed=False.
-          cmd = f"su - {user} -c " + repr(f"curl -sS --fail-with-body --unix-socket {SOCKET} {args}")
+          cmd = _as_user(user, f"curl -sS --fail-with-body --unix-socket {SOCKET} {args}")
           return (machine.succeed if succeed else machine.fail)(cmd)
 
       def get_json(path, user=CLIENT):
-          return json.loads(curl(f"http://localhost{path}", user=user))
+          # The URL is quoted for that inner shell, because `&` between query parameters
+          # is otherwise a background operator: it truncates the URL at the first
+          # parameter and runs the rest as a command. That failed SILENTLY for as long as
+          # the trailing fragment happened to look like a variable assignment — a
+          # `?type=gps&limit=100` was requesting type=gps with no limit at all, and still
+          # exiting 0.
+          return json.loads(curl(shlex.quote(f"http://localhost{path}"), user=user))
 
       def post_protobuf(local_file, extra=""):
           return curl(
@@ -276,15 +314,43 @@ let
               f"--data-binary @{local_file} http://localhost/v1/logs"
           )
 
-      def row_count():
+      def row_count(device_id=SAMPLE_DEVICE_ID):
           # Read-only, via a separate connection, so this is independent of the API.
-          out = machine.succeed(f"sqlite3 'file:{DB}?mode=ro' 'select count(*) from measurement;'")
+          #
+          # Scoped to one writer by default, because the machine under test may be
+          # running a producer of its own (see the header). device_id=None counts every
+          # row regardless of origin — only foreign-producer.nix has a use for that.
+          #
+          # Quoting matters more than it looks: a wrong JSON path makes json_extract
+          # return NULL rather than raise, so a typo here reads as "zero rows" instead
+          # of as an error. shlex.quote rather than hand-nested quotes for that reason.
+          if device_id is None:
+              sql = "select count(*) from measurement;"
+          else:
+              sql = (
+                  "select count(*) from measurement where "
+                  f"json_extract(attributes, '$.\"{SAMPLE_ATTR}\"') = '{device_id}';"
+              )
+          out = machine.succeed(
+              "sqlite3 " + shlex.quote(f"file:{DB}?mode=ro") + " " + shlex.quote(sql)
+          )
           return int(out.strip())
 
-      def sample_batch(dest="/tmp/sample-logs.pb"):
+      def sample_rows(extra=""):
+          # The read-API counterpart of row_count: only the rows this harness posted.
+          # limit=100 comfortably exceeds any case's batch count, so a case never has to
+          # pick one — and cannot accidentally cap itself the way an earlier limit=10
+          # compared against a growing count did.
+          q = f"limit=100&attr.{SAMPLE_ATTR}={SAMPLE_DEVICE_ID}"
+          if extra:
+              q += f"&{extra}"
+          return get_json(f"/v1/measurements?{q}")["measurements"]
+
+      def sample_batch(dest="/tmp/sample-logs.pb", device_id=SAMPLE_DEVICE_ID):
           # Generated by a binary from the package under test, so the payload is built
           # by the same code the service parses — no hand-encoded protobuf in the test.
-          machine.succeed(f"mp-make-sample {dest}")
+          # device_id is what lets a case impersonate a second, foreign writer.
+          machine.succeed(f"mp-make-sample --device-id {device_id} {dest}")
           return dest
 
       # The gate's own check, run out of band with a one-shot budget so it answers
@@ -347,6 +413,7 @@ let
     restart = import ./cases/restart.nix { inherit pkgs; };
     ordering = import ./cases/ordering.nix { inherit pkgs; };
     crash-recovery = import ./cases/crash-recovery.nix { inherit pkgs; };
+    foreign-producer = import ./cases/foreign-producer.nix { inherit pkgs; };
     clock-gate = import ./cases/clock-gate.nix { inherit pkgs; };
     clock-gate-nts = import ./cases/clock-gate-nts.nix { inherit pkgs; };
     clock-gate-minsources = import ./cases/clock-gate-minsources.nix { inherit pkgs; };

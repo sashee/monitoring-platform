@@ -7,6 +7,7 @@
 #   nix-build nix -A package             # package only (skip the VM tests)
 #   nix-build nix -A tests.platform      # the shared-VM cases
 #   nix-build nix -A tests.restart       # one isolated case
+#   nix-build nix -A evalChecks          # harness evaluates against real host configs (no VM)
 #
 # Prefer `make run-tests` over the bare top level in CI: this derivation gates the
 # package on *every* test, which means one nix process evaluates every NixOS machine
@@ -22,6 +23,7 @@
 let
   package = pkgs.callPackage ./package.nix { };
   tests = import ./tests { inherit pkgs; };
+  evalChecks = import ./tests/eval-checks.nix { inherit pkgs; };
 in
 pkgs.symlinkJoin {
   name = "monitoring-platform-checked";
@@ -29,7 +31,7 @@ pkgs.symlinkJoin {
   # Interpolating each VM-test derivation's store path registers it as a build input,
   # so building this requires every test to pass.
   postBuild = ''
-    : ${pkgs.lib.concatStringsSep " " (map (t: "${t}") (builtins.attrValues tests))}
+    : ${pkgs.lib.concatStringsSep " " (map (t: "${t}") (builtins.attrValues tests))} ${evalChecks}
   '';
-  passthru = { inherit package tests; };
+  passthru = { inherit package tests evalChecks; };
 }

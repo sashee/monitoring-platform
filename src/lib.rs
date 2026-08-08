@@ -3,6 +3,7 @@
 //! See `SPEC.md`. Section references in comments point at it.
 
 pub mod api;
+pub mod clock;
 pub mod config;
 pub mod content_id;
 pub mod model;

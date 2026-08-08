@@ -78,6 +78,63 @@ in
       example = "monitoring_platform=debug";
       description = "Value for the tracing env-filter.";
     };
+
+    clockGate = {
+      enable = lib.mkOption {
+        type = lib.types.bool;
+        default = true;
+        description = ''
+          Refuse to start until the system clock is verifiably synchronized (SPEC.md §9.4).
+
+          On by default because the failure it prevents is silent: a device with no RTC that
+          has not yet reached an NTP server stamps every measurement near the Unix epoch, and
+          nothing downstream can tell those rows from correct ones. Turning this off is
+          reasonable only where the clock is guaranteed by other means. Note that a host with
+          no reachable time source will never start the service — that is the intent, and
+          nix/tests gives its VMs a real NTP server rather than switching this off.
+        '';
+      };
+
+      thresholdMicros = lib.mkOption {
+        type = lib.types.ints.positive;
+        default = 5000000;
+        description = ''
+          Maximum kernel clock error (`maxerror` from adjtimex(2)) to accept, in microseconds.
+
+          Do not tighten this to 1 s without also setting `maxpoll 9` on the host's NTP daemon.
+          `maxerror` grows continuously between successful updates at the kernel's 500 ppm
+          tolerance — 500 µs per second of wall time — so with chrony's default `maxpoll 10`
+          (~1024 s) it routinely reaches ~0.5 s while everything is perfectly healthy.
+        '';
+      };
+
+      pollIntervalSecs = lib.mkOption {
+        type = lib.types.ints.positive;
+        default = 5;
+        description = "Seconds between clock polls.";
+      };
+
+      maxPolls = lib.mkOption {
+        type = lib.types.ints.positive;
+        default = 60;
+        description = ''
+          Polls to take before giving up and failing the unit. 60 × 5 s ≈ 5 min.
+
+          The wait is bounded by counting polls rather than by a wall-clock deadline, because
+          every wall-clock source derives from the very clock being waited on: the first
+          successful sync steps it and a deadline computed from it jumps unpredictably.
+        '';
+      };
+
+      consecutive = lib.mkOption {
+        type = lib.types.ints.positive;
+        default = 3;
+        description = ''
+          Consecutive good polls required before starting, as hysteresis against the sawtooth
+          described on `thresholdMicros`.
+        '';
+      };
+    };
   };
 
   config = lib.mkIf cfg.enable {
@@ -92,11 +149,58 @@ in
       description = "Monitoring platform OTLP receiver";
       wantedBy = [ "multi-user.target" ];
 
+      # A [Unit] setting, NOT serviceConfig: systemd parses the file happily and then
+      # drops it with "Unknown key 'StartLimitIntervalSec' in section [Service],
+      # ignoring", so putting it below would silently do nothing. nix/tests/cases/
+      # hardening.nix now greps the journal for exactly that warning.
+      #
+      # The start rate limiter is deliberately disabled (SPEC.md §9.2, §9.4). It used to turn a
+      # permanent startup failure — a schema newer than the binary (§6.2), an occupied socket
+      # (§8.1) — into a failed unit that reports the reason. Fail-closed clock gating trades
+      # that away: a Pi that boots without a network legitimately fails for hours, and a
+      # limiter would give up permanently during exactly the outage it must survive. The cost
+      # is that a genuinely permanent failure now loops at RestartSec intervals instead of
+      # stopping and saying so; the journal still names the reason on every attempt.
+      startLimitIntervalSec = 0;
+
       serviceConfig = {
         # Readiness is reported with sd_notify once migrations have run and the
         # socket is accepting. Under Type=simple systemd would consider the service
         # started at fork, letting a dependent unit race the bind().
         Type = "notify";
+
+        # Fail-closed: no `-` prefix, so the gate's exit 1 fails the unit rather than being
+        # ignored. This re-runs on every restart, so the clock is rechecked on each retry and
+        # on crash-loop recovery — intended, not an accident of ExecStartPre semantics.
+        #
+        # Note `systemctl start monitoring-platform` will block for up to the wait budget on a
+        # cold boot, and `systemctl is-system-running` reports `starting` meanwhile. Harmless
+        # unless something downstream polls for `running`.
+        ExecStartPre = lib.mkIf cfg.clockGate.enable (lib.escapeShellArgs [
+          (lib.getExe cfg.package)
+          "wait-for-clock"
+          "--threshold-micros"
+          (toString cfg.clockGate.thresholdMicros)
+          "--poll-interval-secs"
+          (toString cfg.clockGate.pollIntervalSecs)
+          "--max-polls"
+          (toString cfg.clockGate.maxPolls)
+          "--consecutive"
+          (toString cfg.clockGate.consecutive)
+          "--log-level"
+          cfg.logLevel
+        ]);
+
+        # Derived, not a round number: it must exceed the gate's OWN bound, or systemd kills the
+        # wait mid-flight and produces an accidental failure instead of the deliberate one. The
+        # default 90 s would do exactly that. Deriving it means raising maxPolls cannot silently
+        # reintroduce the bug.
+        TimeoutStartSec =
+          if cfg.clockGate.enable then
+            cfg.clockGate.maxPolls * cfg.clockGate.pollIntervalSecs + 120
+          else
+            90;
+
         ExecStart = lib.escapeShellArgs [
           (lib.getExe cfg.package)
           "serve"
@@ -112,13 +216,11 @@ in
           cfg.logLevel
         ];
 
+        # Restart= covers ExecStartPre= failures too, so the clock gate keeps retrying rather
+        # than needing an operator once the network comes back. The rate limiter that would
+        # otherwise stop those retries is disabled at the unit level above, not here.
         Restart = "on-failure";
-        RestartSec = "1s";
-        # A too-new schema version and an occupied socket path are both permanent
-        # startup failures. The rate limit is what turns an endless restart loop
-        # into a failed unit that reports the reason.
-        StartLimitBurst = 5;
-        StartLimitIntervalSec = 10;
+        RestartSec = "60s";
 
         User = cfg.user;
         Group = cfg.group;
@@ -144,7 +246,18 @@ in
         ProtectKernelTunables = true;
         ProtectKernelModules = true;
         ProtectControlGroups = true;
-        ProtectClock = true;
+        # NOT ProtectClock: the clock gate must *read* the kernel's error estimate with
+        # adjtimex(2), and systemd.exec(5) is explicit that this option cannot allow that —
+        # "the system calls are blocked altogether, the filter does not take into account that
+        # some of the calls can be used to read the clock state with some parameter
+        # combinations". It kills with SIGSYS, including in ExecStartPre, which shares this
+        # sandbox.
+        #
+        # Dropping it costs nothing the service actually relied on: CapabilityBoundingSet=[""]
+        # plus NoNewPrivileges means CAP_SYS_TIME is unavailable, so the service still cannot
+        # set the clock — only read the estimate — and PrivateDevices=true already withholds
+        # /dev/rtc*, which is the other half of what ProtectClock provided.
+        ProtectClock = false;
         ProtectHostname = true;
         ProtectProc = "invisible";
         RestrictNamespaces = true;
@@ -153,7 +266,10 @@ in
         LockPersonality = true;
         MemoryDenyWriteExecute = true;
         CapabilityBoundingSet = [ "" ];
-        SystemCallFilter = [ "@system-service" ];
+        # @clock is not part of @system-service, so adjtimex(2) needs naming explicitly for the
+        # gate above. It grants reading the clock, not setting it: the capability set is empty,
+        # so clock_settime/settimeofday still fail with EPERM.
+        SystemCallFilter = [ "@system-service" "@clock" ];
         SystemCallArchitectures = "native";
         # Enforces the local-only property in the kernel rather than by convention.
         # THIS is the line to change when the iroh transport lands (it needs AF_INET

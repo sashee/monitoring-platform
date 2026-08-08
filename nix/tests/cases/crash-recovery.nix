@@ -33,7 +33,7 @@
     # Nothing acknowledged was lost. Read through the API, not just sqlite3, so this
     # also proves the reopened database is queryable rather than merely present.
     assert row_count() == committed, "an acknowledged row was lost across the crash"
-    rows = get_json("/v1/measurements?limit=100")["measurements"]
+    rows = sample_rows()
     assert len(rows) == committed, f"read API returned {len(rows)} of {committed} rows"
 
     # The database is not left in a state that only reads: SQLite replayed the WAL on

@@ -3,7 +3,7 @@
 use anyhow::{Context, Result};
 use clap::Parser;
 use monitoring_platform::config::{Cli, Command, ServeArgs};
-use monitoring_platform::{AppState, Config, api, store, transport};
+use monitoring_platform::{AppState, Config, api, clock, store, transport};
 use tracing_subscriber::EnvFilter;
 
 fn main() -> Result<()> {
@@ -16,6 +16,12 @@ fn main() -> Result<()> {
                 .build()
                 .context("building tokio runtime")?
                 .block_on(serve(args))
+        }
+        // No tokio runtime: the gate is a synchronous poll loop with nothing to overlap, and it
+        // runs as ExecStartPre in a separate process from the server.
+        Command::WaitForClock(args) => {
+            init_tracing(&args.log_level);
+            clock::wait_until_synchronized(&args.settings())
         }
     }
 }

@@ -718,7 +718,7 @@ listener; `axum::serve` accepts `tokio::net::UnixListener` directly. Adding iroh
 
 ### 9.1 CLI
 
-Single binary, `serve` subcommand (room for future subcommands):
+Single binary, two subcommands:
 
 ```
 monitoring-platform serve
@@ -730,7 +730,18 @@ monitoring-platform serve
   --max-decompressed-bytes <bytes>
                              [MP_MAX_DECOMPRESSED_BYTES]  default 33554432  (32 MiB)
   --log-level <level>        [MP_LOG_LEVEL]       default info
+
+monitoring-platform wait-for-clock       # the §9.4 boot gate; exit 1 if the clock stays bad
+  --threshold-micros <us>    [MP_CLOCK_THRESHOLD_MICROS]     default 5000000  (5 s)
+  --poll-interval-secs <s>   [MP_CLOCK_POLL_INTERVAL_SECS]   default 5
+  --max-polls <n>            [MP_CLOCK_MAX_POLLS]            default 60       (~5 min)
+  --consecutive <n>          [MP_CLOCK_CONSECUTIVE]          default 3
+  --log-level <level>        [MP_LOG_LEVEL]       default info
 ```
+
+`wait-for-clock` is run as the service's `ExecStartPre`, and is useful on its own to diagnose a
+host that will not start monitoring: it logs the measured error on both the success and the
+refusal path.
 
 Resolution order: CLI flag → environment variable → systemd directory (`$RUNTIME_DIRECTORY`,
 `$STATE_DIRECTORY`, set by the unit in §9.2) → relative-path default for development. Parsing
@@ -766,12 +777,19 @@ startup.
 ```ini
 [Unit]
 Description=Monitoring platform OTLP receiver
+# Deliberately no start rate limit; see §9.4. This is a [Unit] key: in [Service] systemd
+# parses it and then drops it with "Unknown key ... ignoring", so the setting does nothing.
+StartLimitIntervalSec=0
 
 [Service]
 Type=notify
+# Fail-closed clock gate (§9.4). No "-" prefix: its failure must fail the unit.
+ExecStartPre=/usr/bin/monitoring-platform wait-for-clock
+# Must exceed the gate's own poll budget, or the wait is killed mid-flight.
+TimeoutStartSec=420
 ExecStart=/usr/bin/monitoring-platform serve
 Restart=on-failure
-RestartSec=1s
+RestartSec=60s
 
 StateDirectory=monitoring-platform
 StateDirectoryMode=0700
@@ -793,7 +811,9 @@ RestrictAddressFamilies=AF_UNIX
 RestrictNamespaces=yes
 MemoryDenyWriteExecute=yes
 CapabilityBoundingSet=
-SystemCallFilter=@system-service
+# NOT ProtectClock=yes, and @clock named explicitly: the gate must read adjtimex(2). See §9.4.
+ProtectClock=no
+SystemCallFilter=@system-service @clock
 SystemCallArchitectures=native
 
 [Install]
@@ -809,11 +829,13 @@ Notes on specific lines:
 - `Group=` is what local clients need membership of to reach the socket. A `DynamicUser=yes` setup
   is tempting for a service holding no long-lived identity, but it makes the owning group transient
   and therefore awkward to grant clients access to; a static system user is simpler here.
-- `Restart=on-failure` plus systemd's default rate limit (5 starts / 10 s) matters more than it
-  looks: §6.2 makes a database whose `user_version` exceeds the binary's a *fatal* startup error, and
-  §8.1 fails startup when the socket path is occupied by a live listener or a non-socket file. Those
-  are permanent conditions, and the rate limiter is what turns an infinite restart loop into a
-  failed unit that reports the reason.
+- `Restart=on-failure` matters more than it looks: §6.2 makes a database whose `user_version`
+  exceeds the binary's a *fatal* startup error, and §8.1 fails startup when the socket path is
+  occupied by a live listener or a non-socket file. Those are permanent conditions, and a start
+  rate limiter (5 starts / 10 s) is what would turn an infinite restart loop into a failed unit
+  that reports the reason. **§9.4 disables that limiter and explains the trade** — fail-closed
+  clock gating means a device that boots without a network must be allowed to keep retrying for
+  hours, so the unit above is superseded on this point by what the module generates.
 - Graceful shutdown (drain the writer, checkpoint WAL, unlink) runs on `SIGTERM`, which is systemd's
   default stop signal, so no `KillSignal=` override is needed. The default `TimeoutStopSec` is
   ample for a WAL checkpoint.
@@ -858,6 +880,110 @@ convenience, and it has one obligation attached: this crate must state an MSRV a
 clearly when the consumer's Rust is older. The tempting fix for such a failure is to pin our own
 `rustc`, which would defeat the whole arrangement.
 
+### 9.4 Clock synchronization gating
+
+`processed_time` (§5.1) is read from the system clock on every request, so a host whose clock is
+wrong writes rows that look exactly like correct ones. §5.3 already refuses to invent an
+`event_time`; this is the same refusal applied to the server's own clock. **The service does not
+start until the clock is verifiably synchronized.**
+
+**The check.** `maxerror` from `adjtimex(2)`, the kernel's own estimate of how wrong the clock may
+be, compared against a threshold. Two properties make this the right primitive:
+
+- **It is daemon-agnostic.** It reflects kernel state whichever implementation set it, so the gate
+  behaves identically under chrony, systemd-timesyncd, ntpd-rs or NTPsec and depends on none of
+  them. Referencing `chrony.service` would tie the platform to one deployment's choice.
+- **It needs no wait unit.** `time-sync.target` is not depended on either: NixOS enables no unit
+  that provides it (`chrony-wait`, `systemd-time-wait-sync`) by default, so the target is reached
+  early and means nothing. The poll is authoritative.
+
+`STA_UNSYNC` is deliberately ignored. That bit is set for reasons unrelated to clock quality —
+notably to stop the kernel writing back to the RTC — so `maxerror` alone is the test, which is
+also what systemd itself uses (it treats `<16 s` as synchronized).
+
+**The threshold** defaults to 5 s and is generous on purpose. `maxerror` grows continuously
+between successful NTP updates at the kernel's 500 ppm tolerance — 500 µs per second of wall time
+— so with chrony's default `maxpoll 10` (~1024 s between updates) it routinely reaches ~0.5 s in
+entirely healthy operation. Tightening to 1 s without also setting `maxpoll 9` on the host would
+make the gate flap against that sawtooth rather than detect anything. Three consecutive good polls
+are required as further hysteresis against it.
+
+**Gate at start, not continuously.** Stopping and restarting the service whenever the clock
+degrades was rejected: it loses in-memory state and creates gaps in telemetry precisely when
+something is wrong. The service is a normal unit — `systemctl start`/`stop` behave conventionally —
+and once running it is never stopped for clock reasons. Runtime clock handling (tagging records
+with a quality field, exporting the error as a metric) belongs in application code and is not in
+this PoC.
+
+**Fail-closed.** Implemented as `ExecStartPre` with no `-` prefix, so its non-zero exit fails the
+unit. It re-runs on every restart, so the clock is rechecked on each retry and on crash-loop
+recovery. `systemctl start` therefore blocks for up to the wait budget on a cold boot, and
+`systemctl is-system-running` reports `starting` meanwhile — harmless unless something downstream
+polls for `running`.
+
+**The wait is bounded by counting polls, never by a wall-clock deadline.** `SystemTime`, `date` and
+the shell's `$SECONDS` all derive from the very clock being waited on: the first successful sync
+steps it, and a deadline computed from it jumps unpredictably at exactly the wrong moment. An
+iteration counter plus a `CLOCK_MONOTONIC` sleep cannot be moved by a clock step. `TimeoutStartSec`
+is derived from `maxPolls × pollIntervalSecs` rather than hard-coded, because it must exceed the
+gate's own bound — the systemd default of 90 s would kill the wait mid-flight and turn a
+deliberate failure into an accidental one.
+
+**It is a subcommand, not a script.** `monitoring-platform wait-for-clock` makes the syscall
+directly rather than shelling out to `adjtimex --print`, which also sidesteps the fact that
+`pkgs.adjtimex` does not exist in current nixpkgs (it is not in `util-linux` either). It keeps the
+hysteresis and give-up rules as pure functions with ordinary unit tests, and it needs no second
+package output.
+
+**Two sandbox consequences**, both in `nix/module.nix`:
+
+- `ProtectClock=` must be **off**. `systemd.exec(5)` is explicit that it cannot allow a read:
+  *"the system calls are blocked altogether, the filter does not take into account that some of
+  the calls can be used to read the clock state with some parameter combinations."* It kills with
+  SIGSYS, and `ExecStartPre` shares the unit's sandbox. Nothing is actually given up:
+  `CapabilityBoundingSet=` is empty and `NoNewPrivileges=` is set, so `CAP_SYS_TIME` is
+  unavailable and the service still cannot *set* the clock; `PrivateDevices=` already withholds
+  `/dev/rtc*`.
+- `@clock` must be named in `SystemCallFilter=`. It is not part of `@system-service`, so
+  `adjtimex` would otherwise be denied even with `ProtectClock=` off.
+
+**The start rate limiter is disabled** (`StartLimitIntervalSec=0`, a **`[Unit]` key** — NixOS
+exposes it as `systemd.services.<name>.startLimitIntervalSec`, not through `serviceConfig`,
+where systemd would parse it and then drop it with *"Unknown key … ignoring"*), reversing part
+of §9.2. That
+limiter existed to turn a permanent startup failure — a schema newer than the binary (§6.2), an
+occupied socket (§8.1) — into a failed unit that reports the reason instead of an endless loop.
+Fail-closed gating trades it away: a device that boots without a network legitimately fails for
+hours, and a limiter would give up permanently during exactly the outage it must survive. The cost
+is real — a genuinely permanent failure now retries every 60 s rather than stopping and saying so —
+but the journal still names the reason on every attempt.
+
+The section matters more than it looks, and is asserted rather than trusted: a directive in the
+wrong section is *accepted by the parser and dropped*, so it fails as "the setting quietly had no
+effect" rather than as an error. `nix/tests/cases/hardening.nix` therefore reads
+`StartLimitIntervalUSec` back from systemd and greps the boot journal for `Unknown key`, which
+catches the whole class.
+
+**Host-side configuration is out of scope for this repo**, and belongs to the system configuration
+that deploys it. Recorded here because the gate's behaviour depends on it: chrony is the
+recommended daemon for a fleet of laptops that suspend and intermittently-powered Pis; `rtcsync` so
+the kernel synchronized state is maintained; `makestep 1.0 3` to limit stepping to the first three
+updates, since a clock jumping backwards during operation corrupts time series; `maxpoll 9` if a
+tighter gate threshold is wanted; `nocerttimecheck 1` on an RTC-less Pi using NTS, to break the
+bootstrap deadlock where TLS certificate validation needs a roughly correct clock; and at least
+four time sources.
+
+Approaches considered and rejected, recorded so they are not reinvented:
+
+| Approach | Why rejected |
+|----------|--------------|
+| `Condition*=` / `Assert*=` | Evaluated once at start, never re-checked; no clock condition exists anyway |
+| A separate `clock-good.service` with `Upholds=` + `BindsTo=` | Works, but `Upholds=` makes a manual `systemctl stop` impossible (the unit is revived within seconds); too much machinery for boot-only gating |
+| `After=time-sync.target` alone | Pure ordering; vacuous when nothing provides the target |
+| `Requires=` on a gate unit | Does not propagate when the dependency exits on its own |
+| `WantedBy=` as a persistent intent bit | Evaluated once at target activation; not a standing invariant |
+| Stopping the service on clock drift | Loses telemetry during exactly the incidents worth observing |
+
 ## 10. Implementation notes
 
 ### 10.1 Layout
@@ -870,6 +996,7 @@ src/
     mp-make-sample.rs  writes a sample OTLP batch; a shipped bin, not an example, so
                        the VM tests and the §11 manual check get it from the package
   config.rs            Config value + resolution
+  clock.rs             §9.4 boot gate: adjtimex(2) read + pure poll/hysteresis rules
   model.rs             Measurement, StoredMeasurement, Rejections
   otlp/
     convert.rs         pure: ExportLogsServiceRequest -> (Vec<Measurement>, Rejections)
@@ -1114,8 +1241,17 @@ taking `pkgs` and the machine under test**, so the consuming system supplies bot
   the package) and runs the cases via `pkgs.testers.runNixOSTest`.
 - `nix/tests/default.nix` — this repo's assembly: a minimal machine that just imports the module,
   then calls `lib.nix`. Also applies `dropKvm` so tests schedule on KVM-less builders.
+- `nix/tests/ntp-node.nix` — the time source every test network needs, so the §9.4 clock gate is
+  satisfied the way a real host satisfies it. See below.
+- `nix/tests/test-cert.nix` — mints a throwaway CA + leaf for a set of SANs, used to impersonate
+  the fleet's NTS servers. A copy of the equivalent helper in the consuming repo rather than a
+  shared input, since this repo takes none.
+- `nix/tests/eval-checks.nix` — does the harness *evaluate* against a real host config? No VM.
 - `nix/tests/cases/*.nix` — one file per case, `{ pkgs }: { testScript; isolate ? false;
-  machineModules ? []; }`, independent of the machine.
+  machineModules ? []; ntpNodeModules ? []; waitForService ? true; }`, independent of the
+  machine. `ntpNodeModules` layers onto the time-source node and `waitForService` opts out of
+  the harness's readiness wait; both apply only to isolated cases. `ntpNodeModules` exists for
+  `clock-gate`, `waitForService` for it and `clock-gate-minsources` (both below).
 
 A target system tests the service against its **own** configuration by importing the harness directly:
 
@@ -1124,8 +1260,10 @@ import "${monitoring-platform}/nix/tests/lib.nix" {
   inherit pkgs;
   machineModules = [ self.nixosModules.common-desktop ];  # the real host config
 }
-# => { platform = <shared VM>; restart = <own VM>; }
+# => { platform = <shared VM>; restart = <own VM>; ... }
 ```
+
+Each entry is a two-node network: the machine under test plus the time source described below.
 
 `nix-build nix -A tests.platform` in this repo is the weaker run, against a synthetic machine and
 whatever channel `nix/default.nix` pins. The authoritative run is the consumer's.
@@ -1133,6 +1271,70 @@ whatever channel `nix/default.nix` pins. The authoritative run is the consumer's
 Lightweight cases run as subtests on one shared VM booted once; a case marking `isolate = true` gets
 its own VM, for cases that must stop and start the unit. `node.pkgsReadOnly = false` is set so a
 consumer's `machineModules` may set `nixpkgs.config` or overlays without a `types.unique` collision.
+
+**Every test network has a real time source.** A VM with no NTP server sits at the kernel's 16 s
+unsynchronized `maxerror` ceiling forever, so the §9.4 gate would refuse to start the service in
+every case. The harness does not switch the gate off to work around that — that would leave the
+production configuration unexercised in exactly the tests meant to validate it. Instead
+`nix/tests/ntp-node.nix` adds a second node running chrony as an island (`local stratum 10`,
+`allow all`, no upstream). Every case therefore boots through the real gate, and `wait_for_unit`
+waits it out. That node does **not** import `machineModules`: it is a helper, not a thing under
+test, and importing the consumer's host config would double the closure and drag in whatever
+else that config enables.
+
+**The machine's own timekeeping is impersonated, not overridden.** How the machine is pointed at
+that node is read off the machine rather than imposed on it, because `lib.nix` is imported by
+other repos with their *real* host config:
+
+- **No daemon** (this repo's synthetic machine) — `timesyncd` is forced on and aimed at the node.
+- **chrony** — its configuration is left completely alone. Only two things are injected:
+  `/etc/hosts` entries resolving `services.chrony.servers` to the helper — **one address per
+  name**, with the helper carrying an alias per name on its vlan interface — and, for an NTS
+  client, the helper's CA in `security.pki.certificateFiles`. The helper then serves **real NTS**
+  (`ntsservercert`/`ntsserverkey` from `nix/tests/test-cert.nix`, NTS-KE on 4460), with SANs read
+  from that same server list so they cannot drift. The production config runs unmodified and
+  performs a genuine NTS-KE handshake — pointing it at a plain local NTP server instead would
+  test a configuration nobody deploys.
+- **ntpd / openntpd / ntpd-rs** — an assertion naming the daemon. These cannot be aimed at the
+  helper, and the alternative is a five-minute gate timeout with no explanation.
+
+The distinction matters more than it looks: writing `services.timesyncd.enable = mkForce true`
+next to a daemon that sets `mkForce false` is not a merge but an **evaluation error**, so no VM
+is ever built and no VM test can catch it. `nix/tests/eval-checks.nix` is the guard — it runs the
+harness against each daemon plus chrony+NTS and forces the module system, in seconds and without
+booting anything. `make eval-checks` gives each machine its own nix process, for the same reason
+`run-tests` gives each VM one.
+
+**One address per server name, not one address for all of them.** chrony allocates a source slot
+per `server` line and resolves each slot's name separately; a slot whose name resolves to an
+address another slot already holds is refused (`NSR_AlreadyInUse`) and left permanently
+unresolved, which `chronyc activity` counts under "sources with unknown address". So N names on
+one address yield exactly **one** usable source. That is invisible at chrony's default
+`minsources 1` and fatal above it: the machine can never select a source, `maxerror` stays at the
+16 s ceiling, and every case fails on a readiness timeout — which is what a fleet setting
+`minsources 2` would hit. Distinct addresses on the *same* chronyd are sufficient (it binds all
+of them and the helper sets `allow all`), so this costs no extra nodes; one helper VM per name
+would be unaffordable under aarch64 TCG.
+
+Three isolated cases cover the gate itself:
+
+- **`clock-gate`** layers `chronyd.wantedBy = mkForce []` onto the time-source node, so "no
+  working NTP" is the machine's genuine state — nothing simulates a bad clock — and starting
+  chronyd is what flips it. Asserts both directions at the production threshold. Observed values
+  confirm the mechanism: `clock_error_us=16000000` before, `2000` after. It drives the transition
+  through whichever client the machine actually runs, resolved at runtime from systemd, and
+  observes it with `wait-for-clock` itself rather than timesyncd's marker file — otherwise the
+  case would silently only work on a machine that brings no NTP daemon of its own.
+- **`clock-gate-nts`** runs the fleet's shape, chrony with `enableNTS`. Beyond the gate opening,
+  it asserts `chronyc -N authdata` reports the source as `NTS` with a non-zero cookie count —
+  without that, a silent fallback to plain NTP would synchronise the clock, open the gate and
+  look identical. It also asserts each server name resolved to its *own* helper address.
+- **`clock-gate-minsources`** adds `minsources 2`, the one chrony setting the harness's own
+  impersonation can break. It asserts on the source table — `0 sources with unknown address` and
+  at least `minsources` online — so a regression to one-address-for-all names fails there,
+  naming the unresolved sources, instead of as an unexplained readiness timeout. Neither
+  `clock-gate-nts` (default `minsources 1`, where one usable source suffices) nor
+  `eval-checks.nix` (evaluation only; this failure is purely at runtime) can catch it.
 
 **Why this matters more here than for a typical service.** §9.2 leans heavily on systemd sandboxing —
 `RestrictAddressFamilies=AF_UNIX`, `SystemCallFilter=@system-service`, `ProtectSystem=strict` — and

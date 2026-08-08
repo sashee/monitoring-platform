@@ -33,6 +33,35 @@
     )
     assert prop("Type") == "notify"
 
+    # The one deliberate relaxation (SPEC.md §9.4). ProtectClock= cannot distinguish reading
+    # the clock from setting it, so the clock gate needs it off plus @clock allowed. Asserted
+    # here so neither silently drifts back; that the relaxation actually WORKS — adjtimex(2)
+    # surviving inside this sandbox — is the clock-gate case, which runs the gate for real.
+    # CapabilityBoundingSet= being empty above is what still makes setting the clock impossible.
+    assert prop("ProtectClock") == "no", (
+        "ProtectClock must stay off — it blocks the adjtimex(2) read the clock gate needs, "
+        "including in ExecStartPre"
+    )
+    # systemd expands the group names, so the assertion is on the syscall the gate actually
+    # makes rather than on "@clock" appearing literally — which is the stronger check anyway:
+    # it survives the group being renamed or its membership changing.
+    assert "adjtimex" in prop("SystemCallFilter").split(), (
+        f"adjtimex is not permitted; @clock is not part of @system-service, so the module "
+        f"has to name it: {prop('SystemCallFilter')!r}"
+    )
+
+    # StartLimitIntervalSec is a [Unit] key. Put in [Service] it parses fine and is then
+    # dropped, so the "keep retrying forever" behaviour §9.4 depends on silently would not
+    # apply — which is exactly what shipped once. Non-empty is checked first because
+    # `systemctl show` returns "" for a property it does not know, which would make the
+    # comparison pass for the wrong reason if this name were ever wrong.
+    start_limit = prop("StartLimitIntervalUSec")
+    assert start_limit != "", "StartLimitIntervalUSec is not a property systemd reports"
+    assert start_limit == "0", (
+        f"the start rate limiter is active (StartLimitIntervalUSec={start_limit!r}); a device "
+        "that boots without a network must be allowed to keep retrying (SPEC.md §9.4)"
+    )
+
     # Drive the paths that a startup-only check would miss: the writer thread, a
     # transaction commit, WAL, and the read path's separate connection.
     payload = sample_batch("/tmp/hardening.pb")
@@ -51,6 +80,21 @@
             f"found {marker!r} in the service journal — the sandbox is denying "
             f"something the service needs:\n{journal}"
         )
+
+    # A directive in the wrong unit section is accepted by the parser and dropped with a
+    # warning, so it fails as "the setting had no effect" rather than as an error. Catching
+    # the warning catches the whole class, not just the StartLimitIntervalSec case above.
+    #
+    # Searched across the whole boot rather than `-u monitoring-platform.service`: the warning
+    # is emitted by PID 1 while loading the unit file, and is not reliably attributed to the
+    # unit it concerns. grep exits 1 when there is no match, which is the passing case.
+    ignored = machine.succeed(
+        "journalctl -b --no-pager | grep -F 'Unknown key' || true"
+    ).strip()
+    assert "monitoring-platform" not in ignored, (
+        f"systemd ignored a directive in monitoring-platform.service — it is probably in the "
+        f"wrong section ([Unit] vs [Service]):\n{ignored}"
+    )
 
     # And it is still running, rather than having been killed and restarted quietly.
     assert prop("NRestarts") == "0", f"the service restarted {prop('NRestarts')} times"

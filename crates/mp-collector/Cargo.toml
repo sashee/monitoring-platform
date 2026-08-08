@@ -1,0 +1,39 @@
+[package]
+name = "mp-collector"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.95"
+description = "On-host OTLP collector that retroactively corrects timestamps from an unsynchronized clock"
+
+[[bin]]
+name = "mp-collector"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = { workspace = true }
+axum = { workspace = true }
+clap = { workspace = true }
+# Same gzip support the receiver offers, so an SDK configured for it works against either.
+flate2 = "1.1.9"
+# The forwarder speaks HTTP/1.1 directly over an already-connected stream (unix or tcp) rather
+# than through a connector stack: one connection per flush, no pool, no connector Service to
+# write. `TokioIo` from hyper-util is the only glue that needs.
+http-body-util = "0.1.4"
+hyper = { version = "1.8.1", features = ["client", "http1"] }
+hyper-util = { version = "0.1.19", features = ["tokio"] }
+libc = { workspace = true }
+mp-host = { path = "../mp-host" }
+opentelemetry-proto = { workspace = true }
+prost = { workspace = true }
+sd-notify = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+# `io-util` is only wanted by the hand-rolled HTTP peers in the tests; the collector itself never
+# touches a stream directly, so it stays out of the production feature set.
+tokio = { workspace = true, features = ["io-util"] }

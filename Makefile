@@ -21,13 +21,14 @@ all: ci-lint build run-tests
 build:
 	$(NIX_BUILD) nix -A package --no-out-link
 
-# The Rust suite outside nix, for a fast local loop.
+# The Rust suite outside nix, for a fast local loop. --workspace because the root is
+# also a package, so cargo's default member selection would cover only the receiver.
 test:
-	cargo test
+	cargo test --workspace
 
 # Uses whatever toolchain is on PATH — fine locally.
 lint:
-	cargo clippy --all-targets -- -D warnings
+	cargo clippy --workspace --all-targets -- -D warnings
 
 # Lint with the SAME toolchain the package is built with. CI uses this rather than
 # `nix-shell -p clippy`, which would take the installer's channel: a nixpkgs bump

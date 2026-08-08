@@ -31,6 +31,10 @@
 # escaped because the case finishes before the timer's first fire. See
 # ./cases/foreign-producer.nix, which pins the property directly.
 #
+# The clock-correcting collector is included by default and needs nothing from the caller: this
+# file imports ../collector-module.nix into the machine itself. Pass `collector = false` to leave
+# it out entirely.
+#
 # Two execution models (a case picks one):
 #   - lightweight (default): a subtest on ONE shared VM, booted once.
 #   - isolated (`isolate = true`): its own VM, with optional extra `machineModules`
@@ -48,10 +52,38 @@
   clientUser ? "mp-client",
   # Applied to the helper node too, so the two cannot drift.
   stateVersion ? pkgs.lib.trivial.release,
+  # Also exercise the clock-correcting collector (nix/collector-module.nix).
+  #
+  # ON by default, and the harness imports the module itself rather than requiring the caller to.
+  # Both halves matter: a consumer whose machineModules mention only the receiver would otherwise
+  # get an attrset with no collector cases in it and nothing to say so, and this file's whole point
+  # is that the consumer's run — against its real host config — is the authoritative one
+  # (SPEC.md §11.1). Coverage that only exists in this repo is coverage in the wrong place.
+  #
+  # Importing the same store path twice is harmless: NixOS deduplicates `imports` by path, so a
+  # consumer that already imports the module is unaffected. `collector = false` opts out
+  # completely — the module is not imported, so the option does not exist and nothing is added.
+  collector ? true,
 }:
 let
   lib = pkgs.lib;
   mkCert = import ./test-cert.nix { inherit pkgs; };
+
+  # Only ever added to the module list when `collector` is set, alongside the module that declares
+  # the options it sets — so with the flag off, neither exists.
+  collectorClients =
+    { config, ... }:
+    {
+      services.mp-collector.enable = true;
+      # OFF by default across the harness. The health event is a real measurement and lands in
+      # the same table as everything else, so leaving it on would inject a row into every case
+      # on a sixty-second timer — which broke `crash-recovery`'s exact count the first time this
+      # module was wired in. A case that wants to test §9 turns it back on for its own VM.
+      services.mp-collector.healthIntervalSecs = lib.mkDefault 0;
+      # The client posts through the collector, so it needs to reach that socket too.
+      users.users.${clientUser}.extraGroups = [ config.services.mp-collector.group ];
+      environment.systemPackages = [ config.services.mp-collector.package ];
+    };
 
   # Layered onto the machine under test. The service module creates its own user
   # and group; this adds an unprivileged account IN that group plus one outside it,
@@ -255,6 +287,8 @@ let
       SOCKET = "/run/monitoring-platform/monitoring-platform.sock"
       DB = "/var/lib/monitoring-platform/measurements.db"
       CLIENT = "${clientUser}"
+      COLLECTOR = "/run/mp-collector/mp-collector.sock"
+      COLLECTOR_STATE = "/var/lib/mp-collector"
 
       # What distinguishes this harness's rows from any producer the machine under test
       # runs of its own (see the header). mp-make-sample stamps device.id as a resource
@@ -346,6 +380,52 @@ let
               q += f"&{extra}"
           return get_json(f"/v1/measurements?{q}")["measurements"]
 
+      def sample_scope(device_id=SAMPLE_DEVICE_ID):
+          # The SQL predicate row_count scopes on, for the collector cases that need a
+          # `where` of their own and would otherwise reach past the helpers to a bare
+          # count (see the header). Returns a bare condition, to be `and`-ed in.
+          return f"""json_extract(attributes, '$.\"{SAMPLE_ATTR}\"') = '{device_id}'"""
+
+      def collector_health():
+          # The collector answers JSON on its own socket: clock state, epoch count, buffer depth.
+          out = machine.succeed(
+              f"curl -sS --fail-with-body --unix-socket {COLLECTOR} http://localhost/healthz"
+          )
+          return json.loads(out)
+
+      def post_through_collector(user=CLIENT, succeed=True, device_id=SAMPLE_DEVICE_ID):
+          # ONE process both stamps and sends, which is the whole point. Frame resolution bounds
+          # an event by [sender_started, received], so a batch written to a file and posted later
+          # by curl is correctly classified `passthrough` — curl started after those timestamps
+          # were taken. Testing the correction path needs a sender that produced them.
+          #
+          # The collector corrects the batch in place (correct.rs) rather than rebuilding it, so
+          # device.id survives the hop and these rows stay scoped like every other.
+          cmd = _as_user(user, f"mp-make-sample --device-id {device_id} --post {COLLECTOR}")
+          return (machine.succeed if succeed else machine.fail)(cmd)
+
+      def clock_attributes(kind):
+          # The mp.clock.* attributes as they landed in the receiver's database. Read straight
+          # out of SQLite rather than through the read API, so this is independent of both.
+          #
+          # Scoped like row_count: `limit 1` over an unscoped table hands back whichever writer
+          # was most recent, so a foreign producer would not just add noise here — it would make
+          # every assertion below read the wrong row.
+          sql = (
+              f"select attributes from measurement where type = '{kind}' "
+              f"and {sample_scope()} order by processed_time desc limit 1;"
+          )
+          out = machine.succeed(
+              "sqlite3 " + shlex.quote(f"file:{DB}?mode=ro") + " " + shlex.quote(sql)
+          ).strip()
+          if not out:
+              raise Exception(f"no {kind} measurement was stored")
+          return {
+              k.removeprefix("record.attributes.mp.clock."): v
+              for k, v in json.loads(out).items()
+              if k.startswith("record.attributes.mp.clock.")
+          }
+
       def sample_batch(dest="/tmp/sample-logs.pb", device_id=SAMPLE_DEVICE_ID):
           # Generated by a binary from the package under test, so the payload is built
           # by the same code the service parses — no hand-encoded protobuf in the test.
@@ -388,7 +468,14 @@ let
       node.pkgsReadOnly = false;
       nodes = {
         machine = {
-          imports = machineModules ++ [ testClients timeClient ] ++ extraModules;
+          imports =
+            machineModules
+            ++ [ testClients timeClient ]
+            # The module first, then the configuration that uses it. A relative path out of this
+            # file resolves against the store copy, the same way ./ntp-node.nix and
+            # ./test-cert.nix already do, so the caller supplies nothing.
+            ++ lib.optionals collector [ ../collector-module.nix collectorClients ]
+            ++ extraModules;
         };
         # Layered onto, never replaced: a case that needs the time source to behave
         # differently (clock-gate holds chronyd down) still gets the same node otherwise.
@@ -417,6 +504,11 @@ let
     clock-gate = import ./cases/clock-gate.nix { inherit pkgs; };
     clock-gate-nts = import ./cases/clock-gate-nts.nix { inherit pkgs; };
     clock-gate-minsources = import ./cases/clock-gate-minsources.nix { inherit pkgs; };
+  }
+  // lib.optionalAttrs collector {
+    collector = import ./cases/collector.nix { inherit pkgs; };
+    collector-clock = import ./cases/collector-clock.nix { inherit pkgs; };
+    collector-step = import ./cases/collector-step.nix { inherit pkgs; };
   };
 
   isolated = lib.filterAttrs (_: c: c.isolate or false) cases;

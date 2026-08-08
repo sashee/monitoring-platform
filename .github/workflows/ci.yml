@@ -58,8 +58,9 @@ jobs:
       - name: Lint
         run: make ci-lint
 
-      # doCheck runs the whole Rust suite inside the sandbox, so this covers the
-      # 87 unit/integration tests as well as the build itself.
+      # doCheck runs the whole Rust suite inside the sandbox, so this covers every
+      # unit and integration test as well as the build itself. Deliberately not a
+      # count: one here went stale the moment a crate was added.
       - name: Build package
         run: make build
 

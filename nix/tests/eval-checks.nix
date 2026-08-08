@@ -55,14 +55,33 @@ let
     ntpd-rs = {
       services.ntpd-rs.enable = true;
     };
+
+    # A consumer that imports the collector module ITSELF, on top of the harness's own import.
+    #
+    # Every other shape here is already the opposite case — `harnessFor` gives them only
+    # ../module.nix, so they prove the harness's import is sufficient. This one covers the risk
+    # that flipping `collector` on by default introduced: a consumer that was already importing
+    # the module now gets it twice. NixOS keys modules by path and deduplicates, so this must
+    # evaluate; if it ever stops, the option declarations are colliding and every such consumer
+    # breaks at once.
+    collector-preimported = {
+      imports = [ ../collector-module.nix ];
+    };
   };
 
   wirable = [
     "no-daemon"
     "chrony"
     "chrony-nts"
+    "collector-preimported"
   ];
 
+  # `collector` is deliberately NOT passed: the harness defaults it on and imports the collector
+  # module itself, and that default is exactly what a consumer gets. Passing it here would test a
+  # configuration nobody deploys and leave the real one unevaluated.
+  #
+  # Note what that makes every shape below: a consumer whose own modules mention only the
+  # receiver, which is the shape the consumer repo actually has.
   harnessFor =
     machine:
     import ./lib.nix {
@@ -70,9 +89,12 @@ let
       machineModules = [
         (
           { ... }:
-          machine
+          # `imports` is merged rather than overwritten, so a shape can bring its own modules —
+          # `//` alone would silently drop them, which for a shape whose entire point is an extra
+          # import would make the check vacuous.
+          (builtins.removeAttrs machine [ "imports" ])
           // {
-            imports = [ ../module.nix ];
+            imports = [ ../module.nix ] ++ (machine.imports or [ ]);
             system.stateVersion = stateVersion;
           }
         )

@@ -23,6 +23,7 @@ use std::io::{Read, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -43,22 +44,31 @@ fn budget() -> Duration {
 struct Sink {
     path: PathBuf,
     received: Arc<Mutex<Vec<ExportLogsServiceRequest>>>,
+    /// Connections accepted. The collector keeps one open, so this must not grow with the number of
+    /// batches — and it is the only thing here that would notice if the receiving side ever started
+    /// closing after each response.
+    accepts: Arc<AtomicUsize>,
 }
 
 impl Sink {
     fn start(path: PathBuf) -> Sink {
         let listener = UnixListener::bind(&path).expect("binding the sink socket");
         let received = Arc::new(Mutex::new(Vec::new()));
+        let accepts = Arc::new(AtomicUsize::new(0));
         let sink = Arc::clone(&received);
+        let counter = Arc::clone(&accepts);
 
+        // A thread per connection rather than one accept loop handling them in turn: the collector
+        // keeps its connection open now, so serving them serially would park the loop on the first
+        // one and never notice a second.
         std::thread::spawn(move || {
             for stream in listener.incoming().flatten() {
-                if let Some(request) = read_one_post(stream) {
-                    sink.lock().unwrap().push(request);
-                }
+                counter.fetch_add(1, Ordering::SeqCst);
+                let sink = Arc::clone(&sink);
+                std::thread::spawn(move || serve_posts(stream, &sink));
             }
         });
-        Sink { path, received }
+        Sink { path, received, accepts }
     }
 
     /// Waits for a batch containing a record of this type, so the health events the collector
@@ -86,6 +96,10 @@ impl Sink {
             .cloned()
     }
 
+    fn accepts(&self) -> usize {
+        self.accepts.load(Ordering::SeqCst)
+    }
+
     fn count(&self, event_name: &str) -> usize {
         self.received
             .lock()
@@ -99,7 +113,47 @@ impl Sink {
     }
 }
 
-fn read_one_post(mut stream: UnixStream) -> Option<ExportLogsServiceRequest> {
+/// A sink whose *first* connection is accepted and then never answered, and whose later ones behave
+/// normally.
+///
+/// This is the failure a bare `connect` cannot see, and the one the iroh tunnel will make ordinary:
+/// put a proxy between the collector and the receiver and its local socket accepts whether or not
+/// the far end is reachable, so an unreachable receiver arrives as silence rather than
+/// `ECONNREFUSED`. Dropping the connection instead would test the refusal path, which already
+/// worked.
+fn start_sink_silent_once(path: &Path) -> Arc<Mutex<Vec<ExportLogsServiceRequest>>> {
+    let listener = UnixListener::bind(path).expect("binding the sink socket");
+    let received = Arc::new(Mutex::new(Vec::new()));
+    let sink = Arc::clone(&received);
+
+    std::thread::spawn(move || {
+        for (n, stream) in listener.incoming().flatten().enumerate() {
+            if n == 0 {
+                // Parked on its own thread so the accept loop keeps serving the retry.
+                std::thread::spawn(move || {
+                    std::thread::sleep(Duration::from_secs(3600));
+                    drop(stream);
+                });
+                continue;
+            }
+            serve_posts(stream, &sink);
+        }
+    });
+    received
+}
+
+/// Answers every POST on one connection, keeping it open until the peer closes it.
+///
+/// Keep-alive here is load-bearing rather than incidental: the collector reuses its connection, so a
+/// fake that closed after one request would put every test through the reconnect path instead of the
+/// one written for it, and would make a reuse regression invisible from here.
+fn serve_posts(mut stream: UnixStream, sink: &Mutex<Vec<ExportLogsServiceRequest>>) {
+    while let Some(request) = read_one_post(&mut stream) {
+        sink.lock().unwrap().push(request);
+    }
+}
+
+fn read_one_post(stream: &mut UnixStream) -> Option<ExportLogsServiceRequest> {
     stream.set_read_timeout(Some(Duration::from_secs(10))).ok()?;
 
     let mut raw = Vec::new();
@@ -108,8 +162,9 @@ fn read_one_post(mut stream: UnixStream) -> Option<ExportLogsServiceRequest> {
     let mut content_length = 0usize;
 
     loop {
-        // Header first, then exactly `Content-Length` bytes: the collector sends one request per
-        // connection, so there is no pipelining to worry about.
+        // Header first, then exactly `Content-Length` bytes. No pipelining to worry about: the
+        // collector sends one batch at a time and waits for each response, so a read can never run
+        // past the end of the request in hand.
         if body_starts_at.is_none()
             && let Some(i) = raw.windows(4).position(|w| w == b"\r\n\r\n")
         {
@@ -125,8 +180,8 @@ fn read_one_post(mut stream: UnixStream) -> Option<ExportLogsServiceRequest> {
             && raw.len() >= start + content_length
         {
             let request = ExportLogsServiceRequest::decode(&raw[start..start + content_length]);
-            let _ = stream
-                .write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 0\r\nconnection: close\r\n\r\n");
+            // No `connection: close`: the connection goes back for the next batch.
+            let _ = stream.write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 0\r\n\r\n");
             let _ = stream.flush();
             return request.ok();
         }
@@ -522,6 +577,78 @@ fn a_batch_survives_an_unreachable_receiver() {
 
     let sink = Sink::start(sink_path);
     sink.wait_for("late");
+}
+
+/// Batches delivered in separate flushes must share one connection.
+///
+/// Asserted end to end rather than only against the unit fake because the thing that would break it
+/// is at the far end: a receiver answering `Connection: close` would silently put every batch back on
+/// its own connection, and the collector would go on working — just paying a connect per batch, which
+/// is free over a local socket and is not over a tunnel.
+#[test]
+fn separate_flushes_share_one_connection() {
+    let (collector, sink, _) = Collector::start(None);
+
+    // Separate flushes, not one batch: the grace period is 100 ms, so waiting for each to arrive
+    // guarantees these are two delivery cycles rather than one coalesced write.
+    for name in ["first", "second", "third"] {
+        assert_eq!(collector.post(&batch(name, now_realtime(), vec![])).0, 200);
+        sink.wait_for(name);
+    }
+
+    assert_eq!(sink.accepts(), 1, "each flush opened its own connection");
+}
+
+/// A delivery attempt that gets no answer must be abandoned and retried, not waited on forever.
+///
+/// Without the send timeout the flush task blocks inside the first attempt for as long as the peer
+/// holds the connection open — it never returns to its inbox, and the batch never arrives even
+/// though the receiver started answering seconds later. The retry is safe to make unconditionally
+/// because the correction is frozen, so a batch that did land and lost its acknowledgement
+/// deduplicates at the receiver rather than arriving twice.
+#[test]
+fn a_silent_receiver_is_abandoned_and_the_batch_arrives_on_the_retry() {
+    let dir = tempfile::tempdir().unwrap();
+    let socket = dir.path().join("c.sock");
+    let sink_path = dir.path().join("sink.sock");
+    let received = start_sink_silent_once(&sink_path);
+
+    let child = Command::new(env!("CARGO_BIN_EXE_mp-collector"))
+        .arg("--socket")
+        .arg(&socket)
+        .arg("--forward-to")
+        .arg(&sink_path)
+        .arg("--state-dir")
+        .arg(dir.path().join("state"))
+        // Short everything: the point is the transition, not production timings.
+        .args(["--grace-millis", "100"])
+        .args(["--forward-timeout-secs", "1"])
+        .args(["--retry-max-secs", "1"])
+        .args(["--journal-backfill", "false", "--log-level", "warn"])
+        .spawn()
+        .expect("spawning mp-collector");
+
+    let mut collector = Collector { child, socket, _dir: dir };
+    collector.wait_until_ready();
+
+    assert_eq!(collector.post(&batch("after-silence", now_realtime(), vec![])).0, 200);
+
+    let deadline = Instant::now() + budget();
+    while Instant::now() < deadline {
+        let arrived = received
+            .lock()
+            .unwrap()
+            .iter()
+            .flat_map(|r| &r.resource_logs)
+            .flat_map(|r| &r.scope_logs)
+            .flat_map(|s| &s.log_records)
+            .any(|r| r.event_name == "after-silence");
+        if arrived {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    panic!("the batch never arrived after the silent attempt should have timed out");
 }
 
 /// A placeholder `Child` so `Collector`'s `Drop` has something to own after the real one moves.

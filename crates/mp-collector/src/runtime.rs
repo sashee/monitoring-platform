@@ -21,6 +21,7 @@ use crate::correct::{Correction, Flush, Tally, apply_correction};
 use crate::epoch::{Epoch, EpochTable, Source};
 use crate::forward::Forwarder;
 use crate::metrics::{self, Health};
+use crate::retry::backoff;
 use crate::spool::Spool;
 use crate::state;
 use crate::stepwatch::StepWatch;
@@ -261,10 +262,14 @@ struct InFlight {
     totals: Stats,
     /// When the current hold began, for the timeout. `None` when nothing is held.
     holding_since: Option<i64>,
-    /// Whether delivery is currently failing, so the log records the *transitions* rather than
-    /// one line per retry. A receiver down for an hour would otherwise produce thousands of
-    /// identical warnings and bury whatever else went wrong.
-    failing: bool,
+    /// Consecutive failed delivery attempts. Drives the backoff, and doubles as the "are we
+    /// currently failing" flag so the log records *transitions* rather than one line per retry — a
+    /// receiver down for an hour would otherwise bury whatever else went wrong under thousands of
+    /// identical warnings.
+    failures: u32,
+    /// `CLOCK_BOOTTIME` before which there is no point attempting delivery again. `None` when
+    /// delivery is healthy.
+    retry_at: Option<i64>,
     /// Whether the spool might hold anything.
     ///
     /// Without this the steady state costs two `read_dir` calls per flush cycle — twice a second,
@@ -421,7 +426,7 @@ impl FlushTask {
             max_records: self.config.buffer_max_records,
             max_bytes: self.config.buffer_max_bytes,
         };
-        let forwarder = Forwarder::new(self.config.target.clone());
+        let mut forwarder = Forwarder::new(self.config.target.clone(), self.config.forward_timeout);
         let mut state = InFlight {
             buffer: Buffer::new(limits),
             spool: Spool::open(&self.config.spool_dir(), &self.boot_id)
@@ -429,7 +434,8 @@ impl FlushTask {
             outbox: VecDeque::new(),
             totals: Stats::default(),
             holding_since: None,
-            failing: false,
+            failures: 0,
+            retry_at: None,
             spool_dirty: true,
         };
 
@@ -472,11 +478,14 @@ impl FlushTask {
                 }
             }
 
-            self.cycle(&mut state, &forwarder).await;
+            self.cycle(&mut state, &mut forwarder).await;
         }
 
-        // Drain on shutdown, so a stop does not strand whatever is in hand.
-        self.cycle(&mut state, &forwarder).await;
+        // Drain on shutdown, so a stop does not strand whatever is in hand. The backoff is cleared
+        // first: there is no next cycle to wait for, so a pending retry deadline would skip the one
+        // remaining attempt and strand exactly the batches this drain exists to deliver.
+        state.retry_at = None;
+        self.cycle(&mut state, &mut forwarder).await;
         Ok(())
     }
 
@@ -515,7 +524,7 @@ impl FlushTask {
         ));
     }
 
-    async fn cycle(&self, state: &mut InFlight, forwarder: &Forwarder) {
+    async fn cycle(&self, state: &mut InFlight, forwarder: &mut Forwarder) {
         let now = mp_host::clock::now_boottime().unwrap_or(0);
         let clock = self.clock.borrow().clone();
         let waited = state
@@ -537,7 +546,7 @@ impl FlushTask {
             state.holding_since = None;
         }
 
-        self.deliver(forwarder, state).await;
+        self.deliver(forwarder, state, now).await;
 
         let _ = self.stats.send(Stats {
             buffered_records: state.buffer.depth(),
@@ -615,13 +624,23 @@ impl FlushTask {
         }
     }
 
-    async fn deliver(&self, forwarder: &Forwarder, state: &mut InFlight) {
+    async fn deliver(&self, forwarder: &mut Forwarder, state: &mut InFlight, now: i64) {
+        // A failing target is retried on a backoff rather than on every cycle, and this early
+        // return is what makes the send timeout worth having. `cycle` runs once per *received*
+        // batch, so without it every arrival would pay the full timeout before the task got back to
+        // reading its inbox; the inbox would fill, and the HTTP layer would answer 503 — an
+        // application stalling on its own telemetry, which is what the buffer exists to prevent.
+        if state.retry_at.is_some_and(|at| now < at) {
+            return;
+        }
+
         while let Some(request) = state.outbox.front() {
             match forwarder.send(request).await {
                 Ok(()) => {
                     state.outbox.pop_front();
                     state.totals.forwarded_batches += 1;
-                    if std::mem::take(&mut state.failing) {
+                    state.retry_at = None;
+                    if std::mem::take(&mut state.failures) > 0 {
                         tracing::info!(
                             delivered = state.totals.forwarded_batches,
                             "forwarding recovered"
@@ -632,11 +651,19 @@ impl FlushTask {
                     // Left at the front, unmodified. Retrying it verbatim is safe because the
                     // correction is already baked in and frozen, so the receiver sees the same
                     // content hash and deduplicates (SPEC.md §6.6).
-                    if state.failing {
-                        tracing::debug!(error = %e, queued = state.outbox.len(), "forwarding still failing");
+                    let first = state.failures == 0;
+                    state.failures = state.failures.saturating_add(1);
+
+                    let wait = backoff(state.failures, self.config.grace, self.config.retry_max);
+                    // `try_from` rather than `as`: a `retry_max` of absurd size would otherwise
+                    // wrap into the past and defeat the backoff entirely.
+                    let wait_nanos = i64::try_from(wait.as_nanos()).unwrap_or(i64::MAX);
+                    state.retry_at = Some(now.saturating_add(wait_nanos));
+
+                    if first {
+                        tracing::warn!(error = %e, queued = state.outbox.len(), retry_in = ?wait, "forwarding failed; will retry");
                     } else {
-                        state.failing = true;
-                        tracing::warn!(error = %e, queued = state.outbox.len(), "forwarding failed; will retry");
+                        tracing::debug!(error = %e, queued = state.outbox.len(), retry_in = ?wait, failures = state.failures, "forwarding still failing");
                     }
                     return;
                 }

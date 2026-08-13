@@ -25,6 +25,7 @@ pub mod journal;
 pub mod metrics;
 pub mod peer;
 pub mod receive;
+pub mod retry;
 pub mod runtime;
 pub mod spool;
 pub mod state;

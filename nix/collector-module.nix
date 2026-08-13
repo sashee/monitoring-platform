@@ -94,6 +94,39 @@ in
       '';
     };
 
+    forwardTimeoutSecs = lib.mkOption {
+      type = lib.types.ints.positive;
+      default = 30;
+      description = ''
+        How long one delivery attempt may take before it is abandoned and retried.
+
+        Deliberately generous: this bounds a *hung* transport, not a slow one, and
+        `retryMaxSecs` rather than this option is what keeps an unreachable receiver from
+        stalling the collector. A timeout short enough to fire on a receiver that is
+        merely slow to write would make the collector re-send batches that already
+        landed, forever.
+
+        It matters most when something stands between the collector and the receiver — a
+        tunnel or a proxy — because such a socket accepts whether or not its far end is
+        reachable, so an unreachable receiver arrives as silence rather than as a
+        refused connection, and silence has no other detector.
+      '';
+    };
+
+    retryMaxSecs = lib.mkOption {
+      type = lib.types.ints.unsigned;
+      default = 10;
+      description = ''
+        Ceiling for the exponential backoff between failed delivery attempts, whose floor
+        is the grace period. This is the longest a batch can wait *after* the receiver
+        comes back, so it bounds what an ordinary restart of the receiver costs.
+
+        0 retries on every flush cycle, which is the behaviour from before the backoff
+        existed. Reasonable for a purely local hop; on anything slower it means a dead
+        target is retried as fast as batches arrive.
+      '';
+    };
+
     clockThresholdMicros = lib.mkOption {
       type = lib.types.ints.positive;
       default = 5000000;
@@ -290,6 +323,10 @@ in
             cfg.forwardTo
             "--buffer-timeout-secs"
             (toString cfg.bufferTimeoutSecs)
+            "--forward-timeout-secs"
+            (toString cfg.forwardTimeoutSecs)
+            "--retry-max-secs"
+            (toString cfg.retryMaxSecs)
             "--health-interval-secs"
             (toString cfg.healthIntervalSecs)
             "--clock-threshold-micros"

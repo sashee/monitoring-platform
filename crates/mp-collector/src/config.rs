@@ -2,10 +2,10 @@
 //! variable → systemd directory → relative default, resolved by a pure function over an
 //! environment map so it is testable without touching the process environment.
 
-use anyhow::{Result, anyhow, bail};
+use anyhow::{Context, Result, anyhow, bail};
 use clap::Parser;
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use crate::epoch::{DEFAULT_RESYNC_THRESHOLD_NANOS, DEFAULT_TOLERANCE_NANOS};
@@ -25,6 +25,68 @@ pub enum Target {
 pub const DEFAULT_FORWARD_TO: &str = "/run/monitoring-platform/monitoring-platform.sock";
 /// The OTLP/HTTP logs endpoint, appended when a URL names no path of its own.
 pub const LOGS_PATH: &str = "/v1/logs";
+
+/// The credential the collector asks the service manager for, and therefore the file name it looks
+/// for inside `$CREDENTIALS_DIRECTORY`.
+pub const API_KEY_CREDENTIAL: &str = "mp-api-key";
+
+/// The API key, as the receiver will be given it.
+///
+/// A newtype rather than a `String` for one reason: [`Config`] derives `Debug` and gets logged, and a
+/// credential must not be printable by accident.
+#[derive(Clone, PartialEq, Eq)]
+pub struct ApiKey(String);
+
+impl ApiKey {
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Debug for ApiKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("ApiKey(<redacted>)")
+    }
+}
+
+/// Reads the API key, if one is configured.
+///
+/// A **file**, not an environment variable, because that is the shape systemd credentials come in:
+/// `LoadCredential=mp-api-key:/path/to/key` places the value under `$CREDENTIALS_DIRECTORY` at mode
+/// 0400 on a tmpfs only this unit can see. The same value in the environment would be readable by
+/// anything that can open `/proc/<pid>/environ`, and would be echoed by `systemctl show`.
+///
+/// The asymmetry between the two sources is deliberate. A file named explicitly and then not readable
+/// is a startup failure: it was asked for. A credentials directory that simply has no key in it is
+/// not — that is every collector until it is issued one, and it must keep running unauthenticated.
+fn resolve_api_key(
+    explicit: Option<&Path>,
+    env: &HashMap<String, String>,
+) -> Result<Option<ApiKey>> {
+    if let Some(path) = explicit {
+        return read_api_key(path).map(Some);
+    }
+
+    // A single directory, not a colon-separated list: unlike RUNTIME_DIRECTORY, systemd sets exactly
+    // one credentials directory per unit.
+    let Some(dir) = env.get("CREDENTIALS_DIRECTORY").filter(|d| !d.is_empty()) else {
+        return Ok(None);
+    };
+    let path = Path::new(dir).join(API_KEY_CREDENTIAL);
+    if !path.exists() {
+        return Ok(None);
+    }
+    read_api_key(&path).map(Some)
+}
+
+/// Surrounding whitespace is trimmed, because a credential written with `echo` or an editor carries a
+/// trailing newline and that is not part of the key. Nothing *inside* is touched, so a key with stray
+/// whitespace in the middle fails validation rather than being silently repaired into a different key.
+fn read_api_key(path: &Path) -> Result<ApiKey> {
+    let raw = std::fs::read_to_string(path)
+        .with_context(|| format!("reading the API key from {}", path.display()))?;
+    Ok(ApiKey(raw.trim().to_owned()))
+}
 
 /// A leading `http://` means TCP; anything else is a filesystem path.
 ///
@@ -105,6 +167,11 @@ pub struct Cli {
     #[arg(long, env = "MPC_RETRY_MAX_SECS")]
     pub retry_max_secs: Option<u64>,
 
+    /// File holding the API key to present with each batch. Defaults to
+    /// $CREDENTIALS_DIRECTORY/mp-api-key when the service manager passes one.
+    #[arg(long, env = "MPC_API_KEY_FILE")]
+    pub api_key_file: Option<PathBuf>,
+
     /// Seconds between §9 self-metric events. 0 disables them.
     #[arg(long, env = "MPC_HEALTH_INTERVAL_SECS")]
     pub health_interval_secs: Option<u64>,
@@ -146,6 +213,7 @@ impl Default for Cli {
             grace_millis: None,
             forward_timeout_secs: None,
             retry_max_secs: None,
+            api_key_file: None,
             health_interval_secs: None,
             clock_threshold_micros: None,
             clock_consecutive: None,
@@ -204,6 +272,9 @@ pub struct Config {
     pub forward_timeout: Duration,
     /// Ceiling for the exponential retry backoff, whose floor is `grace`.
     pub retry_max: Duration,
+    /// Presented to the receiver as `Authorization: Bearer …`. `None` sends no header at all, which
+    /// is what every collector does until it is issued a key.
+    pub api_key: Option<ApiKey>,
     /// `None` when self-metrics are switched off.
     pub health_interval: Option<Duration>,
     pub clock_threshold_micros: i64,
@@ -253,6 +324,7 @@ impl Config {
             retry_max: Duration::from_secs(
                 args.retry_max_secs.unwrap_or(DEFAULT_RETRY_MAX_SECS),
             ),
+            api_key: resolve_api_key(args.api_key_file.as_deref(), env)?,
             health_interval: match args.health_interval_secs.unwrap_or(DEFAULT_HEALTH_INTERVAL_SECS)
             {
                 0 => None,
@@ -303,6 +375,22 @@ pub fn validate(config: &Config) -> Result<()> {
         return Err(anyhow!(
             "--forward-timeout-secs 0 would abandon every batch before the receiver could answer"
         ));
+    }
+    // What the collector can check is whether the key can be *sent*. Whether it is a key the receiver
+    // recognises is the receiver's business — and during the first phase of the rollout the receiver
+    // says so in its log for every batch, which is a better place to learn it than here.
+    if let Some(key) = &config.api_key {
+        if key.as_str().is_empty() {
+            return Err(anyhow!(
+                "the API key file is empty; either remove --api-key-file or put a key in it"
+            ));
+        }
+        if !key.as_str().bytes().all(|b| b.is_ascii_graphic()) {
+            return Err(anyhow!(
+                "the API key contains whitespace or non-ASCII, so it cannot be sent as an HTTP \
+                 header value"
+            ));
+        }
     }
     Ok(())
 }
@@ -437,6 +525,113 @@ mod tests {
         assert_eq!(c.clock_threshold_micros, 5_000_000);
         assert_eq!(c.clock_consecutive, 3);
         assert_eq!(c.buffer_timeout, Duration::from_secs(300));
+    }
+
+    // ------------------------------------------------------------------------------- the API key
+
+    fn write_key(dir: &std::path::Path, name: &str, contents: &str) -> PathBuf {
+        let path = dir.join(name);
+        std::fs::write(&path, contents).unwrap();
+        path
+    }
+
+    /// The deployed arrangement: systemd puts the credential in its own directory and the collector
+    /// finds it there without being told where it is.
+    #[test]
+    fn the_key_is_picked_up_from_the_credentials_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        write_key(dir.path(), API_KEY_CREDENTIAL, "mpk_0001020304050607.abcd");
+
+        let c = Config::resolve(
+            &Cli::default(),
+            &env(&[("CREDENTIALS_DIRECTORY", dir.path().to_str().unwrap())]),
+        )
+        .unwrap();
+        assert_eq!(c.api_key.as_ref().map(ApiKey::as_str), Some("mpk_0001020304050607.abcd"));
+    }
+
+    #[test]
+    fn an_explicit_file_beats_the_credentials_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        write_key(dir.path(), API_KEY_CREDENTIAL, "from-credentials");
+        let explicit = write_key(dir.path(), "explicit-key", "from-the-flag");
+
+        let args = Cli { api_key_file: Some(explicit), ..Cli::default() };
+        let c = Config::resolve(
+            &args,
+            &env(&[("CREDENTIALS_DIRECTORY", dir.path().to_str().unwrap())]),
+        )
+        .unwrap();
+        assert_eq!(c.api_key.as_ref().map(ApiKey::as_str), Some("from-the-flag"));
+    }
+
+    /// The state every collector is in before it is issued a key, and the one that must keep working.
+    #[test]
+    fn no_key_configured_is_not_an_error() {
+        let dir = tempfile::tempdir().unwrap();
+
+        assert_eq!(Config::resolve(&Cli::default(), &env(&[])).unwrap().api_key, None);
+        assert_eq!(
+            Config::resolve(
+                &Cli::default(),
+                &env(&[("CREDENTIALS_DIRECTORY", dir.path().to_str().unwrap())]),
+            )
+            .unwrap()
+            .api_key,
+            None,
+            "an empty credentials directory means no key, not a failure"
+        );
+    }
+
+    /// But a file asked for by name and then missing is a startup failure: something is misconfigured
+    /// and sending unauthenticated instead would hide it.
+    #[test]
+    fn an_explicitly_named_file_that_is_missing_is_an_error() {
+        let args = Cli { api_key_file: Some("/nonexistent/key".into()), ..Cli::default() };
+        let err = Config::resolve(&args, &env(&[])).unwrap_err().to_string();
+        assert!(err.contains("reading the API key"), "unexpected error: {err}");
+    }
+
+    /// A credential written with `echo` has a trailing newline, and it is not part of the key.
+    #[test]
+    fn surrounding_whitespace_is_not_part_of_the_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_key(dir.path(), "key", "  mpk_0001020304050607.abcd\n\n");
+
+        let args = Cli { api_key_file: Some(path), ..Cli::default() };
+        let c = Config::resolve(&args, &env(&[])).unwrap();
+        assert_eq!(c.api_key.as_ref().map(ApiKey::as_str), Some("mpk_0001020304050607.abcd"));
+    }
+
+    /// `Config` is logged, so this is the assertion that keeps a credential out of the journal.
+    #[test]
+    fn the_key_is_redacted_in_debug_output() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_key(dir.path(), "key", "mpk_0001020304050607.sup3rs3cr3t");
+
+        let args = Cli { api_key_file: Some(path), ..Cli::default() };
+        let rendered = format!("{:?}", Config::resolve(&args, &env(&[])).unwrap());
+
+        assert!(rendered.contains("redacted"), "{rendered}");
+        assert!(!rendered.contains("sup3rs3cr3t"), "the key reached a Debug rendering: {rendered}");
+    }
+
+    /// Whether the receiver *knows* this key is the receiver's business; whether it can be sent at all
+    /// is the collector's, and is checked at startup rather than discovered at the first flush.
+    #[test]
+    fn a_key_that_cannot_be_an_http_header_is_refused_at_startup() {
+        let good = Config::resolve(&Cli::default(), &env(&[])).unwrap();
+
+        for bad in ["", "has space", "nonascii-é", "with\ttab", "trailing\u{7f}"] {
+            let config = Config { api_key: Some(ApiKey(bad.to_owned())), ..good.clone() };
+            assert!(validate(&config).is_err(), "{bad:?} should have been refused");
+        }
+
+        let fine = Config {
+            api_key: Some(ApiKey("mpk_0001020304050607.abcd".to_owned())),
+            ..good
+        };
+        assert!(validate(&fine).is_ok());
     }
 
     #[test]

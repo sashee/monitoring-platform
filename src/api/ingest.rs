@@ -17,8 +17,8 @@ use prost::Message;
 use std::io::Read;
 
 use super::status::{IngestError, PROTOBUF};
-use crate::AppState;
 use crate::otlp::to_measurements;
+use crate::{AppState, now_unix_nanos};
 
 pub async fn handler(
     State(state): State<AppState>,
@@ -128,14 +128,6 @@ fn decompress_gzip(input: &[u8], limit: usize) -> Result<Vec<u8>, IngestError> {
         )));
     }
     Ok(out)
-}
-
-fn now_unix_nanos() -> i64 {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_nanos() as i64)
-        .unwrap_or(0)
 }
 
 #[cfg(test)]

@@ -6,7 +6,7 @@
 
 use clap::Parser;
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use crate::clock::{
@@ -35,6 +35,18 @@ pub enum Command {
     /// `processed_time` it cannot stand behind (SPEC §9.4). Usable on its own to diagnose a host
     /// that will not start monitoring.
     WaitForClock(WaitForClockArgs),
+
+    /// Issue an API key, printing the token to stdout once (SPEC §13).
+    ///
+    /// The token cannot be recovered afterwards: only a hash of its secret half is stored. Losing it
+    /// means issuing another and deleting this one.
+    CreateApiKey(CreateApiKeyArgs),
+
+    /// List the API keys that exist, by id and label.
+    ///
+    /// Never prints a secret, because none is stored — this answers "which keys exist" and "was mine
+    /// created", not "what was the token".
+    ListApiKeys(ApiKeyArgs),
 }
 
 #[derive(Debug, Parser, Default)]
@@ -58,6 +70,28 @@ pub struct ServeArgs {
     /// Log filter, e.g. `info` or `monitoring_platform=debug`.
     #[arg(long, env = "MP_LOG_LEVEL", default_value = "info")]
     pub log_level: String,
+}
+
+/// Enough to reach the database, for the commands that only read or write keys.
+#[derive(Debug, Parser, Default)]
+pub struct ApiKeyArgs {
+    /// SQLite database. Defaults to $STATE_DIRECTORY/measurements.db, else ./measurements.db
+    #[arg(long = "db", env = "MP_DB")]
+    pub database: Option<PathBuf>,
+
+    /// Log filter, e.g. `info` or `monitoring_platform=debug`.
+    #[arg(long, env = "MP_LOG_LEVEL", default_value = "info")]
+    pub log_level: String,
+}
+
+#[derive(Debug, Parser, Default)]
+pub struct CreateApiKeyArgs {
+    #[command(flatten)]
+    pub common: ApiKeyArgs,
+
+    /// Who or what this key is for. Operator-facing only; it is never checked against anything.
+    #[arg(long)]
+    pub label: String,
 }
 
 #[derive(Debug, Parser, Default)]
@@ -97,6 +131,27 @@ impl WaitForClockArgs {
     }
 }
 
+/// Where the database is, from an explicit flag or the environment.
+///
+/// Shared by `serve` and the key commands, so a key can never be written to a different file from the
+/// one the receiver reads. With `--db` unset and `STATE_DIRECTORY` exported for the service but not
+/// for an operator's shell, that is exactly the mistake available to make.
+pub fn database_path(explicit: Option<&Path>, env: &HashMap<String, String>) -> PathBuf {
+    if let Some(path) = explicit {
+        return path.to_owned();
+    }
+    match env.get("STATE_DIRECTORY").and_then(|d| d.split(':').next()) {
+        Some(dir) if !dir.is_empty() => PathBuf::from(dir).join("measurements.db"),
+        _ => PathBuf::from("./measurements.db"),
+    }
+}
+
+impl ApiKeyArgs {
+    pub fn database_path(&self) -> PathBuf {
+        database_path(self.database.as_deref(), &std::env::vars().collect())
+    }
+}
+
 /// Immutable resolved configuration, passed down by value. No global state, and the environment is
 /// never re-read after startup.
 #[derive(Debug, Clone, PartialEq)]
@@ -119,12 +174,7 @@ impl Config {
                     _ => PathBuf::from("./monitoring-platform.sock"),
                 }
             }),
-            database_path: args.database.clone().unwrap_or_else(|| {
-                match env.get("STATE_DIRECTORY").and_then(|d| d.split(':').next()) {
-                    Some(dir) if !dir.is_empty() => PathBuf::from(dir).join("measurements.db"),
-                    _ => PathBuf::from("./measurements.db"),
-                }
-            }),
+            database_path: database_path(args.database.as_deref(), env),
             max_body_bytes: args.max_body_bytes.unwrap_or(DEFAULT_MAX_BODY_BYTES),
             max_decompressed_bytes: args
                 .max_decompressed_bytes

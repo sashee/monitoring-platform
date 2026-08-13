@@ -19,7 +19,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use http_body_util::{BodyExt, Full};
 use hyper::body::Bytes;
 use hyper::client::conn::http1::SendRequest;
-use hyper::header::{CONTENT_TYPE, HOST};
+use hyper::header::{AUTHORIZATION, CONTENT_TYPE, HOST, HeaderValue};
 use hyper::{Request, StatusCode};
 use hyper_util::rt::TokioIo;
 use opentelemetry_proto::tonic::collector::logs::v1::ExportLogsServiceRequest;
@@ -53,14 +53,35 @@ impl Drop for Conn {
 pub struct Forwarder {
     target: Target,
     timeout: Duration,
+    /// The `Authorization` header, built once. `None` sends none at all, which is what an
+    /// unconfigured collector does — and what the receiver tolerates until enforcement (SPEC §13).
+    authorization: Option<HeaderValue>,
     /// Kept from the last successful send. `None` when there is nothing worth reusing, which is
     /// also the state after any failure — a failed connection is never cached.
     live: Option<Conn>,
 }
 
 impl Forwarder {
-    pub fn new(target: Target, timeout: Duration) -> Self {
-        Self { target, timeout, live: None }
+    pub fn new(target: Target, timeout: Duration, api_key: Option<&str>) -> Self {
+        let authorization = api_key.and_then(|key| {
+            match HeaderValue::from_str(&format!("Bearer {key}")) {
+                Ok(mut value) => {
+                    // So the `http` crate prints it as `Sensitive` rather than verbatim if a
+                    // `HeaderMap` ever reaches a `{:?}`.
+                    value.set_sensitive(true);
+                    Some(value)
+                }
+                // Unreachable: `config::validate` has already refused anything that is not a legal
+                // header value. It must still not be a panic in the delivery path, and it must not be
+                // silent either — sending unauthenticated is a thing an operator needs told.
+                Err(e) => {
+                    tracing::error!(error = %e, "the API key is not a legal header value; forwarding unauthenticated");
+                    None
+                }
+            }
+        });
+
+        Self { target, timeout, authorization, live: None }
     }
 
     /// Encodes and POSTs one batch, giving up after the configured timeout.
@@ -134,11 +155,12 @@ impl Forwarder {
             Target::Http { authority, path } => (authority.as_str(), path.as_str()),
         };
 
-        Request::post(path)
-            .header(HOST, authority)
-            .header(CONTENT_TYPE, PROTOBUF)
-            .body(Full::new(body))
-            .context("building the forward request")
+        let mut request = Request::post(path).header(HOST, authority).header(CONTENT_TYPE, PROTOBUF);
+        if let Some(value) = &self.authorization {
+            request = request.header(AUTHORIZATION, value.clone());
+        }
+
+        request.body(Full::new(body)).context("building the forward request")
     }
 
     async fn connect(&self) -> Result<Conn> {
@@ -351,13 +373,72 @@ mod tests {
         let path = dir.path().join("recv.sock");
         let seen = serve(path.clone(), OK).await;
 
-        Forwarder::new(Target::Unix(path), PATIENT).send(&batch("cpu")).await.unwrap();
+        Forwarder::new(Target::Unix(path), PATIENT, None).send(&batch("cpu")).await.unwrap();
 
         let raw = seen.text().await;
         assert!(raw.starts_with("POST /v1/logs HTTP/1.1"), "unexpected request line: {raw:?}");
         assert!(raw.contains("content-type: application/x-protobuf"), "{raw:?}");
         assert!(raw.contains("host: localhost"), "HTTP/1.1 requires a Host header: {raw:?}");
         assert!(raw.contains("cpu"), "the encoded batch should be in the body: {raw:?}");
+    }
+
+    /// The key is presented as an RFC 6750 bearer token, on every batch (SPEC §13).
+    #[tokio::test]
+    async fn a_configured_key_is_sent_as_a_bearer_token() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("recv.sock");
+        let seen = serve(path.clone(), OK).await;
+
+        let key = "mpk_0001020304050607.\
+                   808182838485868788898a8b8c8d8e8f909192939495969798999a9b9c9d9e9fa0";
+        Forwarder::new(Target::Unix(path), PATIENT, Some(key))
+            .send(&batch("cpu"))
+            .await
+            .unwrap();
+
+        let raw = seen.text().await;
+        assert!(
+            raw.to_lowercase().contains(&format!("authorization: bearer {key}")),
+            "the key must reach the receiver: {raw:?}"
+        );
+    }
+
+    /// And a collector with no key sends no header at all, rather than an empty or placeholder one —
+    /// which the receiver would have to tell apart from a real attempt.
+    #[tokio::test]
+    async fn no_key_means_no_authorization_header() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("recv.sock");
+        let seen = serve(path.clone(), OK).await;
+
+        Forwarder::new(Target::Unix(path), PATIENT, None).send(&batch("cpu")).await.unwrap();
+
+        assert!(
+            !seen.text().await.to_lowercase().contains("authorization"),
+            "an unconfigured collector must not mention authorization at all"
+        );
+    }
+
+    /// The header is built once and reused, so it has to survive onto the second batch on a kept
+    /// connection — the case where the request is constructed again but the forwarder is not.
+    #[tokio::test]
+    async fn the_key_is_sent_on_every_batch_over_a_kept_connection() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("recv.sock");
+        let seen = serve(path.clone(), OK).await;
+
+        let key = "mpk_0001020304050607.\
+                   808182838485868788898a8b8c8d8e8f909192939495969798999a9b9c9d9e9fa0";
+        let mut forwarder = Forwarder::new(Target::Unix(path), PATIENT, Some(key));
+        forwarder.send(&batch("cpu")).await.unwrap();
+        forwarder.send(&batch("mem")).await.unwrap();
+
+        assert_eq!(seen.accepts(), 1, "the point is that this is one connection");
+        assert_eq!(
+            seen.text().await.to_lowercase().matches("authorization: bearer").count(),
+            2,
+            "both batches must carry the key"
+        );
     }
 
     /// The point of workstream B: batch count and connection count are now decoupled.
@@ -367,7 +448,7 @@ mod tests {
         let path = dir.path().join("recv.sock");
         let seen = serve(path.clone(), OK).await;
 
-        let mut forwarder = Forwarder::new(Target::Unix(path), PATIENT);
+        let mut forwarder = Forwarder::new(Target::Unix(path), PATIENT, None);
         for name in ["cpu", "mem", "disk"] {
             forwarder.send(&batch(name)).await.unwrap();
         }
@@ -388,7 +469,7 @@ mod tests {
         let path = dir.path().join("recv.sock");
         let seen = serve(path.clone(), OK_THEN_CLOSE).await;
 
-        let mut forwarder = Forwarder::new(Target::Unix(path), PATIENT);
+        let mut forwarder = Forwarder::new(Target::Unix(path), PATIENT, None);
         forwarder.send(&batch("cpu")).await.expect("the first batch");
         forwarder.send(&batch("mem")).await.expect("the second batch, after the peer closed");
 
@@ -409,7 +490,7 @@ mod tests {
         )
         .await;
 
-        let err = Forwarder::new(Target::Unix(path.clone()), PATIENT)
+        let err = Forwarder::new(Target::Unix(path.clone()), PATIENT, None)
             .send(&batch("cpu"))
             .await
             .unwrap_err()
@@ -431,7 +512,7 @@ mod tests {
         )
         .await;
 
-        let mut forwarder = Forwarder::new(Target::Unix(path), PATIENT);
+        let mut forwarder = Forwarder::new(Target::Unix(path), PATIENT, None);
         assert!(forwarder.send(&batch("cpu")).await.is_err());
 
         assert_eq!(seen.accepts(), 1, "a rejection is not a stale connection; do not reconnect");
@@ -447,7 +528,7 @@ mod tests {
     #[tokio::test]
     async fn an_unreachable_target_is_an_error_not_a_panic() {
         let dir = tempfile::tempdir().unwrap();
-        let err = Forwarder::new(Target::Unix(dir.path().join("nothing-here.sock")), PATIENT)
+        let err = Forwarder::new(Target::Unix(dir.path().join("nothing-here.sock")), PATIENT, None)
             .send(&batch("cpu"))
             .await
             .unwrap_err()
@@ -458,7 +539,7 @@ mod tests {
     #[tokio::test]
     async fn an_unresolvable_tcp_target_is_an_error() {
         let target = Target::Http { authority: "127.0.0.1:1".into(), path: LOGS_PATH.into() };
-        assert!(Forwarder::new(target, PATIENT).send(&batch("cpu")).await.is_err());
+        assert!(Forwarder::new(target, PATIENT, None).send(&batch("cpu")).await.is_err());
     }
 
     /// A target that accepts and then says nothing. This is the failure a bare `connect` cannot
@@ -477,7 +558,7 @@ mod tests {
             drop(stream);
         });
 
-        let err = Forwarder::new(Target::Unix(path.clone()), Duration::from_millis(200))
+        let err = Forwarder::new(Target::Unix(path.clone()), Duration::from_millis(200), None)
             .send(&batch("cpu"))
             .await
             .unwrap_err()
@@ -496,7 +577,7 @@ mod tests {
         let path = dir.path().join("recv.sock");
         serve(path.clone(), OK).await;
 
-        Forwarder::new(Target::Unix(path), Duration::from_millis(500))
+        Forwarder::new(Target::Unix(path), Duration::from_millis(500), None)
             .send(&batch("cpu"))
             .await
             .unwrap();

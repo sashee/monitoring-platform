@@ -97,6 +97,14 @@ pub struct Cli {
     #[arg(long, env = "MPC_GRACE_MILLIS")]
     pub grace_millis: Option<u64>,
 
+    /// Seconds to wait for the receiver to answer before abandoning the attempt and retrying.
+    #[arg(long, env = "MPC_FORWARD_TIMEOUT_SECS")]
+    pub forward_timeout_secs: Option<u64>,
+
+    /// Seconds to cap the retry backoff at while delivery is failing. 0 retries every cycle.
+    #[arg(long, env = "MPC_RETRY_MAX_SECS")]
+    pub retry_max_secs: Option<u64>,
+
     /// Seconds between §9 self-metric events. 0 disables them.
     #[arg(long, env = "MPC_HEALTH_INTERVAL_SECS")]
     pub health_interval_secs: Option<u64>,
@@ -136,6 +144,8 @@ impl Default for Cli {
             buffer_max_bytes: None,
             buffer_timeout_secs: None,
             grace_millis: None,
+            forward_timeout_secs: None,
+            retry_max_secs: None,
             health_interval_secs: None,
             clock_threshold_micros: None,
             clock_consecutive: None,
@@ -160,6 +170,20 @@ pub const DEFAULT_GRACE_MILLIS: u64 = 500;
 /// count needs — these are ordinary measurements and they land in the same table as everything
 /// else, which is the point of them and also a thing that can surprise an assertion.
 pub const DEFAULT_HEALTH_INTERVAL_SECS: u64 = 60;
+/// Generous on purpose. This bounds a *hung* transport, and the retry backoff — not this value — is
+/// what keeps an unreachable receiver from starving the receive path, so there is nothing to buy by
+/// making it tight. A timeout short enough to fire on a receiver that is merely slow would be the
+/// worse failure: the batch lands, the acknowledgement arrives too late to be believed, and the
+/// collector re-sends work the receiver has already done, indefinitely.
+///
+/// It exists at all because "the receiver is down" stops being a connect error the moment anything
+/// stands between the collector and the receiver. A local proxy socket accepts whether or not its
+/// far end is reachable, so the failure arrives as silence, and silence has no other detector.
+pub const DEFAULT_FORWARD_TIMEOUT_SECS: u64 = 30;
+/// The backoff ceiling: the longest a batch can wait *after* the receiver comes back. Sized so an
+/// ordinary `systemctl restart monitoring-platform` costs a few seconds of delay rather than a
+/// minute.
+pub const DEFAULT_RETRY_MAX_SECS: u64 = 10;
 pub const DEFAULT_BUFFER_MAX_RECORDS: usize = 100_000;
 pub const DEFAULT_BUFFER_MAX_BYTES: usize = 64 * 1024 * 1024;
 pub const DEFAULT_MAX_BODY_BYTES: usize = 4 * 1024 * 1024;
@@ -176,6 +200,10 @@ pub struct Config {
     pub buffer_max_bytes: usize,
     pub buffer_timeout: Duration,
     pub grace: Duration,
+    /// How long one delivery attempt may take before it is abandoned and retried.
+    pub forward_timeout: Duration,
+    /// Ceiling for the exponential retry backoff, whose floor is `grace`.
+    pub retry_max: Duration,
     /// `None` when self-metrics are switched off.
     pub health_interval: Option<Duration>,
     pub clock_threshold_micros: i64,
@@ -219,6 +247,12 @@ impl Config {
                 args.buffer_timeout_secs.unwrap_or(DEFAULT_BUFFER_TIMEOUT_SECS),
             ),
             grace: Duration::from_millis(args.grace_millis.unwrap_or(DEFAULT_GRACE_MILLIS)),
+            forward_timeout: Duration::from_secs(
+                args.forward_timeout_secs.unwrap_or(DEFAULT_FORWARD_TIMEOUT_SECS),
+            ),
+            retry_max: Duration::from_secs(
+                args.retry_max_secs.unwrap_or(DEFAULT_RETRY_MAX_SECS),
+            ),
             health_interval: match args.health_interval_secs.unwrap_or(DEFAULT_HEALTH_INTERVAL_SECS)
             {
                 0 => None,
@@ -261,6 +295,14 @@ pub fn validate(config: &Config) -> Result<()> {
     }
     if config.clock_consecutive == 0 {
         return Err(anyhow!("--clock-consecutive 0 would release the buffer without ever reading the clock"));
+    }
+    // A zero `retry_max` is deliberately allowed — it means "retry on every cycle", which is the
+    // behaviour from before the backoff existed and a legitimate choice for a purely local hop.
+    // A zero timeout is not: it abandons every attempt before it can finish.
+    if config.forward_timeout.is_zero() {
+        return Err(anyhow!(
+            "--forward-timeout-secs 0 would abandon every batch before the receiver could answer"
+        ));
     }
     Ok(())
 }
@@ -404,6 +446,30 @@ mod tests {
 
         assert!(validate(&Config { buffer_max_records: 0, ..good.clone() }).is_err());
         assert!(validate(&Config { buffer_max_bytes: 0, ..good.clone() }).is_err());
-        assert!(validate(&Config { clock_consecutive: 0, ..good }).is_err());
+        assert!(validate(&Config { clock_consecutive: 0, ..good.clone() }).is_err());
+        assert!(validate(&Config { forward_timeout: Duration::ZERO, ..good.clone() }).is_err());
+
+        // Not a mistake: zero is how a purely local deployment opts out of backing off.
+        assert!(validate(&Config { retry_max: Duration::ZERO, ..good }).is_ok());
+    }
+
+    /// The delivery timeout must be far longer than any healthy receiver takes, because a timeout
+    /// that fires on a slow-but-working write makes the collector re-send work that already landed.
+    /// The backoff cap must be short, because it is the delay a recovered receiver pays.
+    #[test]
+    fn the_delivery_defaults_are_a_long_timeout_and_a_short_backoff() {
+        let c = Config::resolve(&Cli::default(), &env(&[])).unwrap();
+        assert_eq!(c.forward_timeout, Duration::from_secs(30));
+        assert_eq!(c.retry_max, Duration::from_secs(10));
+        assert!(c.retry_max >= c.grace, "the backoff floor is the grace period");
+    }
+
+    #[test]
+    fn the_delivery_timings_are_configurable() {
+        let args =
+            Cli { forward_timeout_secs: Some(3), retry_max_secs: Some(2), ..Cli::default() };
+        let c = Config::resolve(&args, &env(&[])).unwrap();
+        assert_eq!(c.forward_timeout, Duration::from_secs(3));
+        assert_eq!(c.retry_max, Duration::from_secs(2));
     }
 }

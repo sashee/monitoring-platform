@@ -94,6 +94,26 @@ in
       '';
     };
 
+    apiKeyFile = lib.mkOption {
+      type = lib.types.nullOr lib.types.path;
+      default = null;
+      example = "/var/lib/secrets/mp-api-key";
+      description = ''
+        Path to a file holding the API key this collector presents to the receiver,
+        as issued by `monitoring-platform create-api-key` (SPEC.md §13).
+
+        A path rather than the key itself, so the key never enters the Nix store —
+        anything in the store is world-readable and kept forever. It is loaded with
+        systemd's `LoadCredential=`, which reads it as root before the sandbox exists
+        and re-exposes it to the service alone at mode 0400 on a private tmpfs. So the
+        file may live somewhere the service user cannot read.
+
+        `null` sends no credential at all, which is the state every collector is in
+        until one is issued. The receiver accepts unauthenticated requests for now and
+        logs that it did; see SPEC.md §13 for the two-step rollout.
+      '';
+    };
+
     forwardTimeoutSecs = lib.mkOption {
       type = lib.types.ints.positive;
       default = 30;
@@ -337,6 +357,15 @@ in
             cfg.logLevel
           ]
         );
+
+        # The API key, passed as a systemd credential rather than an environment variable or a
+        # world-readable path (SPEC.md §13). systemd copies it to a 0400 file on a private tmpfs and
+        # exports $CREDENTIALS_DIRECTORY; the collector looks for `mp-api-key` there on its own, so
+        # no ExecStart flag is needed and the key never appears in `systemctl show` or /proc.
+        #
+        # `LoadCredential=` also means the source path is read by PID 1, as root, before the sandbox
+        # is set up — so the key can live somewhere the service user cannot reach at all.
+        LoadCredential = lib.optional (cfg.apiKeyFile != null) "mp-api-key:${cfg.apiKeyFile}";
 
         # No ExecStartPre clock gate, deliberately. The receiver's unit has one (SPEC.md §9.4) and
         # this must not: a collector that waits for the clock is a collector that is not running

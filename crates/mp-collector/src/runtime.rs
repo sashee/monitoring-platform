@@ -16,7 +16,7 @@ use std::time::Duration;
 use tokio::sync::{mpsc, watch};
 
 use crate::buffer::{Buffer, Decision, Limits, Pending, decide};
-use crate::config::Config;
+use crate::config::{ApiKey, Config};
 use crate::correct::{Correction, Flush, Tally, apply_correction};
 use crate::epoch::{Epoch, EpochTable, Source};
 use crate::forward::Forwarder;
@@ -426,7 +426,11 @@ impl FlushTask {
             max_records: self.config.buffer_max_records,
             max_bytes: self.config.buffer_max_bytes,
         };
-        let mut forwarder = Forwarder::new(self.config.target.clone(), self.config.forward_timeout);
+        let mut forwarder = Forwarder::new(
+            self.config.target.clone(),
+            self.config.forward_timeout,
+            self.config.api_key.as_ref().map(ApiKey::as_str),
+        );
         let mut state = InFlight {
             buffer: Buffer::new(limits),
             spool: Spool::open(&self.config.spool_dir(), &self.boot_id)

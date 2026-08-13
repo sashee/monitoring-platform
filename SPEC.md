@@ -39,7 +39,8 @@ Explicitly out of scope for the PoC (see §12 for what this defers):
 - OTLP/gRPC and OTLP/JSON encodings.
 - Request compression other than `gzip` (no `zstd`, no `deflate`), and response compression of
   any kind.
-- Authentication, authorization, TLS, multi-tenancy.
+- Authorization, TLS, multi-tenancy. (Authentication *is* handled — see §13. A key is either valid or
+  not; there are no scopes, and no key is tied to a device or a tenant.)
 - Retention, downsampling, compaction. (Deduplication *is* handled — see §6.6.)
 - Rate limiting, load shedding and `429` throttling with `Retry-After`. (`503` *is* returned for
   storage failure — see §4.1 — but never as a backpressure signal.)
@@ -1508,3 +1509,91 @@ fail as soon as another case is added, which is a needlessly confusing way to fi
   measurement column or a `resource.attributes.*` entry is a decision for that step. Note the
   namespacing in §5.2 leaves a third option open: a synthetic `transport.node_id` alongside
   `scope.name`, provably free of collision with anything a device can send.
+
+## 13. API keys
+
+Every HTTP endpoint except `/healthz` is authenticated with an API key. `/healthz` is not, and must
+not be: it has to answer during a deploy, from an `ExecStartPre`, and from a probe that holds no
+credential, and it discloses nothing but liveness.
+
+**This is being introduced in two steps, and step one is the one implemented here.** The receiver
+verifies the key and records what it concluded, but serves the request either way. Enforcement comes
+after every client has been issued a key and the journal has gone quiet. Shipping verification and
+enforcement together would mean discovering a misconfigured device by losing its telemetry, which for
+a device holding the only copy of a measurement is not a recoverable mistake.
+
+So during step one the log levels carry the whole signal:
+
+| Outcome | Level | Meaning |
+|---|---|---|
+| valid key | `debug` | nothing to see; quiet by design, since one line per request would drown the handler's own |
+| no key, malformed key, unknown id, wrong secret | `warn` | says *this request would be rejected once enforcement is enabled* |
+| key could not be checked | `error` | the database was unreadable; under enforcement this must become a `503`, never a refusal |
+
+A journal with no such `warn` lines is the precondition for step two.
+
+### 13.1 The token
+
+A token has two halves, `mpk_<id>.<secret>`:
+
+- **id** — 8 bytes, 16 lowercase hex digits. Public. It is what a request is looked up by, so a token
+  bearing an id nobody issued is refused after one index probe, with no hashing at all.
+- **secret** — 32 bytes, 64 lowercase hex digits, from `/dev/urandom`. Never stored.
+
+The `mpk_` prefix exists so a leaked key is greppable and recognisable on sight. Hex is lowercase and
+parsed strictly: uppercase is refused rather than normalised, because one secret with two spellings
+would be one secret with two hashes, only one of which is in the database.
+
+The two halves come from disjoint randomness. The public id therefore says nothing about the secret.
+
+### 13.2 What is stored, and why the hash is a fast one
+
+`api_key` holds the id, a label, a creation time, and `blake3(domain || secret)` — never the secret.
+A stolen database yields no credential.
+
+**The hash is deliberately not argon2, scrypt or bcrypt.** Those exist to make guessing *low-entropy
+human* passwords expensive. A secret here is 32 bytes of CSPRNG output: an attacker holding the hash
+faces 2^256 candidates, which no hash speed makes searchable. A slow KDF would buy nothing and would
+tax the receiver, which runs on the same class of hardware as the devices. What a fast hash still
+needs is domain separation, and it has it — the same `blake3` also produces measurement content ids
+(§6.6), and the two must never be confusable.
+
+Verification compares `blake3::Hash` values, whose `PartialEq` is constant-time. That is cheap
+insurance rather than the thing holding the scheme up: leaking hash bytes by timing would still leave
+an attacker needing a preimage.
+
+Revocation is deleting the row.
+
+### 13.3 Issuing a key
+
+    monitoring-platform create-api-key --label pi-7
+
+Prints the token to stdout, once, and nothing else on stdout — so `TOKEN=$(… create-api-key …)`
+captures the token alone. It cannot be recovered afterwards; losing it means issuing another and
+deleting the old row. `monitoring-platform list-api-keys` shows ids and labels, never secrets, because
+none are stored.
+
+The command opens the database for writing, which also migrates it — so it works on a receiver that
+has been upgraded but not yet restarted. It warns when the database file did not already exist: a
+mistyped `--db` would otherwise cheerfully store a key in a second database that the receiver never
+reads.
+
+### 13.4 How a collector presents one
+
+`Authorization: Bearer mpk_<id>.<secret>`, on every batch.
+
+The collector reads the key from a **file**, not an environment variable, because that is the shape
+systemd credentials come in: `LoadCredential=mp-api-key:/path` is read by PID 1 as root before the
+sandbox exists, then re-exposed to the service alone at mode 0400 on a private tmpfs. The same value
+in the environment would be readable through `/proc/<pid>/environ` and echoed by `systemctl show`. The
+collector looks for `mp-api-key` under `$CREDENTIALS_DIRECTORY` without being told where that is, so
+setting `services.mp-collector.apiKeyFile` is the whole configuration.
+
+A collector with no key configured sends no `Authorization` header at all — not an empty one, which
+the receiver would have to tell apart from a real attempt. That is the state of every collector until
+it is issued one.
+
+The collector validates only that the key *can be sent*: non-empty, and legal in an HTTP header value.
+Whether the receiver recognises it is the receiver's business, and during step one the receiver says
+so in its log for every batch — a better place to learn it than a startup check that would duplicate
+the token format across two crates.

@@ -1,29 +1,35 @@
 //! API key verification for every endpoint except `/healthz` (SPEC §13).
 //!
-//! **Nothing is rejected here yet.** This is the first half of a two-step rollout: the receiver
-//! learns to verify a key and says what it concluded, while still serving every request. Only once
-//! the journal is quiet — every client presenting a key that verifies — does refusing become safe.
-//! Shipping verification and enforcement together would mean discovering a misconfigured device by
-//! losing its telemetry.
+//! Requests without a valid key are refused. There is no switch: a flag that could turn
+//! authentication off would be one more thing that has to be right, and the rollout it would have
+//! served is already over — the previous release verified without enforcing, which is what made this
+//! one safe to ship.
 //!
-//! So the log levels carry the whole signal, and are the thing to read during the rollout:
+//! [`evaluate`] and [`refuse`] stay separate all the same, because they answer different questions:
+//! what a request *is*, and what to tell it. Only the second is route-shaped.
 //!
-//! - anything that **would be rejected** under enforcement is a `warn`, saying so in those words
+//! The log remains the operational signal, at the levels the rollout established:
+//!
+//! - a refusal, or what would have been one, is a `warn` naming which way the key failed
 //! - a key that verifies is `debug`, because one line per request at `info` would drown the
 //!   handler's own
-//! - a database failure is an `error`: under enforcement it must become a 503, never a refusal, and
-//!   never a silent pass
+//! - a key that could not be *checked* is an `error`, and answers `503` rather than `401`
 //!
-//! Enforcement is then this file and nothing else: turn [`Outcome`] into a response for everything
-//! but [`Outcome::Valid`], choosing the shape per route — protobuf `Status` on the ingest side, JSON
-//! on the read side — which is why the layer is applied to each router separately rather than once
-//! around both.
+//! Two asymmetries in [`refuse`] are load-bearing, and both are about what a client does next:
+//!
+//! - **An unverifiable key is not a wrong key.** A database that cannot be read answers `503`,
+//!   which is retryable; `401` is not, and would tell a device holding the only copy of a
+//!   measurement to give up on it because *our* storage was broken.
+//! - **Every wrong key gets the same message.** The log distinguishes an unissued id from a bad
+//!   secret; the response does not, so it cannot be used to discover which ids exist.
 
 use axum::extract::{Request, State};
-use axum::http::header;
+use axum::http::{HeaderValue, StatusCode, header};
 use axum::middleware::Next;
-use axum::response::Response;
+use axum::response::{IntoResponse, Response};
+use serde_json::json;
 
+use super::status::IngestError;
 use crate::AppState;
 use crate::auth::{self, Malformed};
 
@@ -46,34 +52,89 @@ pub enum Outcome {
 }
 
 impl Outcome {
-    /// Whether enforcement would let this request through. Nothing reads it yet; it is the seam
-    /// phase 2 turns into a response, and it is asserted in the tests so the two halves cannot
-    /// disagree later.
+    /// The one thing that lets a request through. Everything else — including a key that could not be
+    /// checked — does not.
     pub fn is_authorized(&self) -> bool {
         matches!(self, Self::Valid { .. })
     }
 }
 
-/// Verifies the key, records what it found, and serves the request either way.
-pub async fn observe(State(state): State<AppState>, request: Request, next: Next) -> Response {
-    let presented = request
-        .headers()
-        .get(header::AUTHORIZATION)
-        .and_then(|value| value.to_str().ok())
-        .map(str::to_owned);
+/// Which error shape a route speaks. Authentication is identical on both; only the body differs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Shape {
+    /// OTLP: a protobuf `google.rpc.Status`, as §4.1.1 requires of every 4xx and 5xx.
+    Otlp,
+    /// The read API: JSON, matching its own errors.
+    Json,
+}
 
-    let outcome = evaluate(&state, presented).await;
+/// The guard for the OTLP ingest route.
+pub async fn guard_otlp(State(state): State<AppState>, request: Request, next: Next) -> Response {
+    guard(state, request, next, Shape::Otlp).await
+}
+
+/// The guard for the JSON read route.
+pub async fn guard_json(State(state): State<AppState>, request: Request, next: Next) -> Response {
+    guard(state, request, next, Shape::Json).await
+}
+
+async fn guard(state: AppState, request: Request, next: Next, shape: Shape) -> Response {
+    let outcome = evaluate(&state, request.headers().get(header::AUTHORIZATION)).await;
     report(&outcome, request.method().as_str(), request.uri().path());
 
+    if !outcome.is_authorized() {
+        return refuse(&outcome, shape);
+    }
     next.run(request).await
 }
 
+/// Turns a failed [`Outcome`] into a response.
+///
+/// Refuses before the handler runs, so a rejected batch is never parsed, never decompressed and never
+/// stored — the body is dropped with the request.
+pub fn refuse(outcome: &Outcome, shape: Shape) -> Response {
+    let (status, message) = match outcome {
+        // Not a wrong key: a key we could not check. `503` is retryable and `401` is not, so
+        // answering `401` here would tell a device to discard the only copy of a measurement because
+        // *our* database was unreadable.
+        Outcome::Unavailable => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "the API key could not be verified; try again",
+        ),
+        // One message for every way a key can be wrong. The log tells them apart; the response must
+        // not, or it becomes an oracle for which ids exist.
+        _ => (StatusCode::UNAUTHORIZED, "a valid API key is required"),
+    };
+
+    let mut response = match shape {
+        Shape::Otlp => IngestError::new(status, message).into_response(),
+        Shape::Json => (status, axum::Json(json!({"error": message}))).into_response(),
+    };
+
+    // RFC 7235 requires a challenge on a 401, and RFC 6750 gives the scheme's form. A 401 without it
+    // is a client's cue to retry the same way forever.
+    if status == StatusCode::UNAUTHORIZED {
+        response
+            .headers_mut()
+            .insert(header::WWW_AUTHENTICATE, HeaderValue::from_static("Bearer"));
+    }
+    response
+}
+
 /// The verification itself: parse, look the id up, compare hashes.
-pub async fn evaluate(state: &AppState, presented: Option<String>) -> Outcome {
+///
+/// Takes the header value rather than a `String` deliberately. The bytes of a header are not
+/// guaranteed to be text, and a signature that could only accept a `String` had no way to express
+/// that case — so it used to collapse into [`Outcome::Absent`], and the log said "no API key
+/// presented" about a request that presented one.
+pub async fn evaluate(state: &AppState, presented: Option<&HeaderValue>) -> Outcome {
     let Some(raw) = presented else {
         return Outcome::Absent;
     };
-    let token = match auth::from_authorization(&raw) {
+    let Ok(raw) = raw.to_str() else {
+        return Outcome::Malformed(Malformed::NotText);
+    };
+    let token = match auth::from_authorization(raw) {
         Ok(token) => token,
         Err(reason) => return Outcome::Malformed(reason),
     };
@@ -116,25 +177,22 @@ pub async fn evaluate(state: &AppState, presented: Option<String>) -> Outcome {
 fn report(outcome: &Outcome, method: &str, path: &str) {
     match outcome {
         Outcome::Valid { id } => tracing::debug!(key = %id, %method, %path, "request authenticated"),
-        Outcome::Unavailable => {
-            tracing::error!(%method, %path, "serving a request whose key could not be checked")
+        Outcome::Unavailable => tracing::error!(
+            %method, %path,
+            "could not verify an API key; answering 503 so the client retries rather than discards"
+        ),
+        Outcome::Absent => {
+            tracing::warn!(%method, %path, "rejected: no API key presented")
         }
-        Outcome::Absent => tracing::warn!(
-            %method, %path,
-            "no API key presented; this request would be rejected once enforcement is enabled"
-        ),
-        Outcome::Malformed(reason) => tracing::warn!(
-            %method, %path, reason = reason.reason(),
-            "unusable API key; this request would be rejected once enforcement is enabled"
-        ),
-        Outcome::UnknownId => tracing::warn!(
-            %method, %path,
-            "API key id was never issued; this request would be rejected once enforcement is enabled"
-        ),
-        Outcome::WrongSecret => tracing::warn!(
-            %method, %path,
-            "API key secret does not match; this request would be rejected once enforcement is enabled"
-        ),
+        Outcome::Malformed(reason) => {
+            tracing::warn!(%method, %path, reason = reason.reason(), "rejected: unusable API key")
+        }
+        Outcome::UnknownId => {
+            tracing::warn!(%method, %path, "rejected: API key id was never issued")
+        }
+        Outcome::WrongSecret => {
+            tracing::warn!(%method, %path, "rejected: API key secret does not match")
+        }
     }
 }
 

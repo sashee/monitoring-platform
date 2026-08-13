@@ -144,6 +144,21 @@ async fn serve(args: ServeArgs) -> Result<()> {
     // Migrations run before the socket is bound, so a schema failure is a clean startup failure
     // rather than a service that accepts requests it cannot store.
     let conn = store::open_write(&config.database_path)?;
+
+    // Loud, but not fatal. Refusing to start would take `/healthz` down with it — the one endpoint
+    // that needs no key and that a readiness probe depends on — and turn a recoverable state into a
+    // restart loop with nothing to read. An error line names the fix instead.
+    match store::keys::count(&conn) {
+        Ok(0) => tracing::error!(
+            "no API keys exist, and every endpoint except /healthz requires one: this receiver will \
+             refuse everything. Issue one with `monitoring-platform create-api-key --db {} --label \
+             <name>`",
+            config.database_path.display()
+        ),
+        Ok(keys) => tracing::info!(keys, "API keys loaded"),
+        Err(e) => tracing::warn!(error = %e, "could not count the API keys"),
+    }
+
     let (writer, writer_done) = store::write::spawn(conn);
 
     let listener = transport::uds::bind(&config.socket_path)?;

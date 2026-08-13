@@ -83,6 +83,10 @@ impl Token {
 /// point of never storing one.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Malformed {
+    /// The header is there but its bytes are not text, so nothing can be parsed out of it. Distinct
+    /// from an absent header: a client that sent something unreadable has a different problem from
+    /// one that sent nothing, and the log has to be able to say which.
+    NotText,
     /// Not an `Authorization: Bearer …` header.
     NotBearer,
     MissingPrefix,
@@ -96,6 +100,7 @@ impl Malformed {
     /// Safe to log and safe to return to the client: it describes the shape, never the value.
     pub fn reason(self) -> &'static str {
         match self {
+            Self::NotText => "the Authorization header is not valid text",
             Self::NotBearer => "expected an `Authorization: Bearer <token>` header",
             Self::MissingPrefix => "an API key starts with `mpk_`",
             Self::NotTwoParts => "an API key is an id and a secret separated by `.`",

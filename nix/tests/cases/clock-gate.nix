@@ -145,6 +145,10 @@
         machine.succeed("systemctl restart monitoring-platform.service", timeout=120)
         machine.wait_for_unit("monitoring-platform.service")
 
+        # The receiver refuses unauthenticated requests, and this case skipped the preamble's
+        # readiness wait, so the key is issued here instead (SPEC.md §13).
+        authenticate()
+
         journal = machine.succeed("journalctl -u monitoring-platform.service --no-pager")
         assert "clock synchronized" in journal, f"the gate did not report opening:\n{journal}"
 

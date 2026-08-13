@@ -145,8 +145,13 @@
             ("-H 'Content-Type: application/x-protobuf' -H 'Content-Encoding: zstd'", "unknown encoding"),
         ]:
             for sock in [COLLECTOR, SOCKET]:
+                # The receiver requires an API key (SPEC.md §13); the collector's own socket is local
+                # and gated by group permissions instead. Without the key the receiver answers 401
+                # before it ever looks at the content type, and the parity asserted here — that an
+                # application can be pointed at either one unchanged — would go untested.
+                auth = "" if sock == COLLECTOR else _auth()
                 code = machine.succeed(_as_user(CLIENT,
-                    f"curl -sS -o /dev/null -w '%{{http_code}}' --unix-socket {sock} "
+                    f"curl -sS -o /dev/null -w '%{{http_code}}' {auth}--unix-socket {sock} "
                     f"-X POST {bad} --data-binary @/tmp/relayed.pb http://localhost/v1/logs"
                 )).strip()
                 assert code == "415", f"{why} on {sock} gave {code}, expected 415"

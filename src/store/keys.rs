@@ -50,6 +50,16 @@ pub fn secret_hash(conn: &Connection, id: &str) -> Result<Option<Hash>> {
         .map(Hash::from))
 }
 
+/// How many keys exist.
+///
+/// For the startup check: with authentication unconditional, a receiver holding no keys can serve
+/// nothing but `/healthz`, and that is worth saying out loud before it is discovered as a wall of
+/// 401s.
+pub fn count(conn: &Connection) -> Result<i64> {
+    conn.query_row("SELECT count(*) FROM api_key", [], |row| row.get(0))
+        .context("counting api keys")
+}
+
 /// Every key, newest first. For the operator-facing listing, so it carries no hashes either.
 pub fn list(conn: &Connection) -> Result<Vec<StoredKey>> {
     let mut statement = conn
@@ -147,6 +157,16 @@ mod tests {
     #[test]
     fn an_empty_table_lists_as_nothing() {
         assert!(list(&db()).unwrap().is_empty());
+        assert_eq!(count(&db()).unwrap(), 0);
+    }
+
+    #[test]
+    fn keys_are_counted() {
+        let conn = db();
+        let (first, second) = (token(9), token(10));
+        insert(&conn, first.id(), &first.secret_hash(), "a", 1).unwrap();
+        insert(&conn, second.id(), &second.secret_hash(), "b", 2).unwrap();
+        assert_eq!(count(&conn).unwrap(), 2);
     }
 
     /// A `secret_hash` of the wrong width can only come from something other than `insert`. It must

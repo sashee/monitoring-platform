@@ -10,8 +10,13 @@ use serde_json::{Value, json};
 use std::collections::HashMap;
 use tower::ServiceExt as _;
 
+mod common;
+
 struct Harness {
     app: axum::Router,
+    /// Presented on every request: authentication is unconditional (SPEC §13), so a harness without
+    /// a key would only ever exercise the 401 path.
+    authorization: String,
     _dir: tempfile::TempDir,
 }
 
@@ -23,13 +28,14 @@ fn harness(measurements: Vec<Measurement>) -> Harness {
         ..Default::default()
     };
     let config = Config::resolve(&args, &HashMap::new());
+    let authorization = common::issue_key(&config.database_path);
 
     let mut conn = store::open_write(&config.database_path).unwrap();
     store::write::insert_batch(&mut conn, &measurements).unwrap();
     let (writer, done) = store::write::spawn(conn);
     std::mem::forget(done);
 
-    Harness { app: api::app(AppState::new(config, writer)), _dir: dir }
+    Harness { app: api::app(AppState::new(config, writer)), authorization, _dir: dir }
 }
 
 impl Harness {
@@ -37,7 +43,13 @@ impl Harness {
         let response = self
             .app
             .clone()
-            .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+            .oneshot(
+                Request::builder()
+                    .uri(uri)
+                    .header(axum::http::header::AUTHORIZATION, &self.authorization)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
             .await
             .unwrap();
         let status = response.status();

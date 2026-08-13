@@ -97,20 +97,49 @@ in
     apiKeyFile = lib.mkOption {
       type = lib.types.nullOr lib.types.path;
       default = null;
-      example = "/var/lib/secrets/mp-api-key";
+      example = "/var/lib/secrets/mp-api-key.cred";
       description = ''
         Path to a file holding the API key this collector presents to the receiver,
-        as issued by `monitoring-platform create-api-key` (SPEC.md §13).
+        as issued by `monitoring-platform create-api-key` (SPEC.md §13). By default the
+        file is expected to be an *encrypted* systemd credential — see
+        {option}`apiKeyEncrypted`.
 
         A path rather than the key itself, so the key never enters the Nix store —
-        anything in the store is world-readable and kept forever. It is loaded with
-        systemd's `LoadCredential=`, which reads it as root before the sandbox exists
-        and re-exposes it to the service alone at mode 0400 on a private tmpfs. So the
-        file may live somewhere the service user cannot read.
+        anything in the store is world-readable and kept forever. It is loaded by PID 1,
+        as root, before the service's sandbox exists, then re-exposed to the service
+        alone at mode 0400 on a private tmpfs. So the file may live somewhere the
+        service user cannot read at all.
 
-        `null` sends no credential at all, which is the state every collector is in
-        until one is issued. The receiver accepts unauthenticated requests for now and
-        logs that it did; see SPEC.md §13 for the two-step rollout.
+        `null` sends no credential, which is the state a collector is in until one is
+        issued — and the receiver now refuses such requests, so leaving it unset means
+        no telemetry reaches the receiver.
+      '';
+    };
+
+    apiKeyEncrypted = lib.mkOption {
+      type = lib.types.bool;
+      default = true;
+      description = ''
+        Whether {option}`apiKeyFile` holds an encrypted systemd credential, as produced
+        by `systemd-creds encrypt` — loaded with `LoadCredentialEncrypted=` rather than
+        `LoadCredential=`, so systemd decrypts and authenticates it before the collector
+        ever sees it.
+
+        Encrypted is the default because it is what systemd recommends for a secret at
+        rest, and because the two settings must not be confused: pointing
+        `LoadCredential=` at an encrypted file would hand the collector the *ciphertext*
+        to send as its key. Getting it wrong is loud in both directions — a mismatch
+        either fails to decrypt at unit start, or is refused by the collector's own
+        startup check, which rejects a key that is not printable ASCII.
+
+        Set to `false` for a plaintext file, which is the simpler thing to set up by hand
+        and what the VM tests use.
+
+        Note the interaction with {option}`orderBeforeTimeDaemons`: this unit starts very
+        early, so a credential encrypted against the TPM may be loaded before the TPM is
+        ready, leaving `Restart=on-failure` to retry it. Encrypting with the host key in
+        /var/lib/systemd/credential.secret has no such race, since the unit already
+        orders itself after /var/lib is mounted.
       '';
     };
 
@@ -359,13 +388,20 @@ in
         );
 
         # The API key, passed as a systemd credential rather than an environment variable or a
-        # world-readable path (SPEC.md §13). systemd copies it to a 0400 file on a private tmpfs and
+        # world-readable path (SPEC.md §13). systemd places it in a 0400 file on a private tmpfs and
         # exports $CREDENTIALS_DIRECTORY; the collector looks for `mp-api-key` there on its own, so
         # no ExecStart flag is needed and the key never appears in `systemctl show` or /proc.
         #
-        # `LoadCredential=` also means the source path is read by PID 1, as root, before the sandbox
-        # is set up — so the key can live somewhere the service user cannot reach at all.
-        LoadCredential = lib.optional (cfg.apiKeyFile != null) "mp-api-key:${cfg.apiKeyFile}";
+        # Either directive reads the source path as root in PID 1, before the sandbox exists, so the
+        # key can live somewhere the service user cannot reach. The encrypted form additionally
+        # decrypts and authenticates it there, so the plaintext exists only in that tmpfs.
+        LoadCredentialEncrypted = lib.optional (
+          cfg.apiKeyFile != null && cfg.apiKeyEncrypted
+        ) "mp-api-key:${cfg.apiKeyFile}";
+
+        LoadCredential = lib.optional (
+          cfg.apiKeyFile != null && !cfg.apiKeyEncrypted
+        ) "mp-api-key:${cfg.apiKeyFile}";
 
         # No ExecStartPre clock gate, deliberately. The receiver's unit has one (SPEC.md §9.4) and
         # this must not: a collector that waits for the clock is a collector that is not running

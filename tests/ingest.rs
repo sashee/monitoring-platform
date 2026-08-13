@@ -18,11 +18,16 @@ use std::io::Write as _;
 use std::path::PathBuf;
 use tower::ServiceExt as _;
 
+mod common;
+
 const T: i64 = 1_785_489_242_123_456_789;
 
 struct Harness {
     app: axum::Router,
     db: PathBuf,
+    /// Presented on every request: authentication is unconditional (SPEC §13), so a harness without
+    /// a key would only ever exercise the 401 path.
+    authorization: String,
     _dir: tempfile::TempDir,
 }
 
@@ -33,13 +38,14 @@ fn harness_with(mut args: ServeArgs) -> Harness {
     args.socket = Some(dir.path().join("unused.sock"));
 
     let config = Config::resolve(&args, &HashMap::new());
+    let authorization = common::issue_key(&config.database_path);
     let conn = store::open_write(&config.database_path).unwrap();
     let (writer, _done) = store::write::spawn(conn);
     // The writer handle is deliberately leaked for the test's lifetime; each test gets its own DB.
     std::mem::forget(_done);
 
     let app = api::app(AppState::new(config, writer));
-    Harness { app, db, _dir: dir }
+    Harness { app, db, authorization, _dir: dir }
 }
 
 fn harness() -> Harness {
@@ -48,7 +54,10 @@ fn harness() -> Harness {
 
 impl Harness {
     async fn post(&self, headers: Vec<(&str, &str)>, body: Vec<u8>) -> (StatusCode, Vec<u8>, Option<String>) {
-        let mut req = Request::builder().method("POST").uri("/v1/logs");
+        let mut req = Request::builder()
+            .method("POST")
+            .uri("/v1/logs")
+            .header(header::AUTHORIZATION, &self.authorization);
         for (k, v) in headers {
             req = req.header(k, v);
         }
@@ -425,10 +434,20 @@ async fn every_error_response_is_a_protobuf_status() {
 #[tokio::test]
 async fn method_not_allowed_is_also_a_protobuf_status() {
     let h = harness();
+    // Authenticated, deliberately. The API key layer sits *outside* method routing, so without a key
+    // this is a 401 — which is the right answer (an unauthenticated caller learns nothing about which
+    // methods a route accepts) but not what this test is about.
     let response = h
         .app
         .clone()
-        .oneshot(Request::builder().method("GET").uri("/v1/logs").body(Body::empty()).unwrap())
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/v1/logs")
+                .header(header::AUTHORIZATION, &h.authorization)
+                .body(Body::empty())
+                .unwrap(),
+        )
         .await
         .unwrap();
 

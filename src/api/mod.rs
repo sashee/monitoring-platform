@@ -12,18 +12,18 @@ use crate::AppState;
 /// caller supplies, which is what lets iroh be added without touching this layer (SPEC §8.2).
 ///
 /// The API key layer is applied to each protected router separately rather than once around the
-/// merge, because the two answer errors in different shapes — protobuf `Status` on the OTLP side,
-/// JSON on the read side — and phase 2 has to reject in the shape of the route it refused.
+/// merge, because the two refuse in different shapes — protobuf `Status` on the OTLP side, JSON on the
+/// read side — and a rejection has to look like the route it came from.
 pub fn app(state: AppState) -> Router {
-    let observe = axum::middleware::from_fn_with_state(state.clone(), auth::observe);
-
     let ingest = Router::new()
         .route("/v1/logs", post(ingest::handler))
-        .layer(observe.clone())
-        // Outermost, so it also covers responses the auth layer will produce under enforcement.
+        .layer(axum::middleware::from_fn_with_state(state.clone(), auth::guard_otlp))
+        // Outermost, so it covers the auth layer's own responses too.
         .layer(axum::middleware::map_response(status::ensure_protobuf_errors));
 
-    let measurements = Router::new().route("/v1/measurements", get(query::list)).layer(observe);
+    let measurements = Router::new()
+        .route("/v1/measurements", get(query::list))
+        .layer(axum::middleware::from_fn_with_state(state.clone(), auth::guard_json));
 
     // Deliberately unprotected (SPEC §13): a health check has to answer before any key exists —
     // during a deploy, from an `ExecStartPre`, from a probe that holds no credential — and it

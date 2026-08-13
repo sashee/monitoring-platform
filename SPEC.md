@@ -1516,21 +1516,46 @@ Every HTTP endpoint except `/healthz` is authenticated with an API key. `/health
 not be: it has to answer during a deploy, from an `ExecStartPre`, and from a probe that holds no
 credential, and it discloses nothing but liveness.
 
-**This is being introduced in two steps, and step one is the one implemented here.** The receiver
-verifies the key and records what it concluded, but serves the request either way. Enforcement comes
-after every client has been issued a key and the journal has gone quiet. Shipping verification and
-enforcement together would mean discovering a misconfigured device by losing its telemetry, which for
-a device holding the only copy of a measurement is not a recoverable mistake.
+**This was introduced in two steps, and both have now shipped.** The first release verified the key
+and recorded what it concluded while still serving every request; this one refuses. Doing it in that
+order is what made it safe: shipping verification and enforcement together would have meant
+discovering a misconfigured device by losing its telemetry, which for a device holding the only copy
+of a measurement is not a recoverable mistake. A journal free of the first release's `warn` lines was
+the precondition for this one.
 
-So during step one the log levels carry the whole signal:
+There is no switch to turn enforcement off. A flag for that would be one more thing that has to be
+right, and the rollout it would have served is over.
 
-| Outcome | Level | Meaning |
+### 13.0 What a refusal looks like
+
+| Outcome | Status | Level |
 |---|---|---|
-| valid key | `debug` | nothing to see; quiet by design, since one line per request would drown the handler's own |
-| no key, malformed key, unknown id, wrong secret | `warn` | says *this request would be rejected once enforcement is enabled* |
-| key could not be checked | `error` | the database was unreadable; under enforcement this must become a `503`, never a refusal |
+| valid key | — | `debug`, so one line per request does not drown the handler's own |
+| no key, malformed key, unknown id, wrong secret | `401` + `WWW-Authenticate: Bearer` | `warn`, naming which way it failed |
+| key could not be checked | `503` | `error` |
 
-A journal with no such `warn` lines is the precondition for step two.
+Three properties of that table are deliberate:
+
+- **An unverifiable key is not a wrong key.** A database that cannot be read answers `503`, which is
+  retryable. `401` is not, and answering it would tell a device to discard the only copy of a
+  measurement because *our* storage was broken.
+- **Every wrong key gets the same body.** The log distinguishes an unissued id from a bad secret; the
+  response does not, so it cannot be used to discover which ids exist.
+- **A refusal is shaped like its route.** Protobuf `google.rpc.Status` on the OTLP side (§4.1.1
+  requires it of every 4xx), JSON on the read side. A client that cannot decode the refusal cannot
+  report it.
+
+The layer sits *outside* method routing, so an unauthenticated `GET /v1/logs` is `401` rather than
+`405`: a caller with no credential learns nothing about which methods a route accepts.
+
+Nothing reaches a handler without a key, so a refused batch is never decompressed, never parsed and
+never stored.
+
+Two operational consequences worth knowing. A receiver holding **no keys at all** can serve nothing
+but `/healthz`; it says so with an `error` at startup naming the `create-api-key` command, but it does
+start, because refusing to would take `/healthz` down with it and turn a recoverable state into a
+restart loop. And a collector with a **wrong** key retries indefinitely rather than discarding, so its
+outbox grows for as long as the misconfiguration lasts — see §13.4.
 
 ### 13.1 The token
 
@@ -1583,17 +1608,35 @@ reads.
 `Authorization: Bearer mpk_<id>.<secret>`, on every batch.
 
 The collector reads the key from a **file**, not an environment variable, because that is the shape
-systemd credentials come in: `LoadCredential=mp-api-key:/path` is read by PID 1 as root before the
-sandbox exists, then re-exposed to the service alone at mode 0400 on a private tmpfs. The same value
-in the environment would be readable through `/proc/<pid>/environ` and echoed by `systemctl show`. The
+systemd credentials come in. The source path is read by PID 1 as root before the service's sandbox
+exists, then re-exposed to the service alone at mode 0400 on a private tmpfs. The same value in the
+environment would be readable through `/proc/<pid>/environ` and echoed by `systemctl show`. The
 collector looks for `mp-api-key` under `$CREDENTIALS_DIRECTORY` without being told where that is, so
-setting `services.mp-collector.apiKeyFile` is the whole configuration.
+`services.mp-collector.apiKeyFile` is the whole configuration.
 
-A collector with no key configured sends no `Authorization` header at all — not an empty one, which
-the receiver would have to tell apart from a real attempt. That is the state of every collector until
-it is issued one.
+By default the file is expected to be an **encrypted** credential, as produced by `systemd-creds
+encrypt`, and is loaded with `LoadCredentialEncrypted=`; `apiKeyEncrypted = false` selects plaintext
+and plain `LoadCredential=`. The two must not be confused, which is why it is an explicit option rather
+than a guess: pointing `LoadCredential=` at an encrypted file would hand the collector the *ciphertext*
+to present as its key. Getting it wrong is loud in either direction — the unit fails to decrypt, or the
+collector's own startup check refuses a key that is not printable ASCII.
+
+One interaction to keep in mind: this unit starts very early (see `orderBeforeTimeDaemons`), so a
+credential encrypted against the TPM may be loaded before the TPM is ready, leaving `Restart=on-failure`
+to retry. Encrypting with the host key in `/var/lib/systemd/credential.secret` has no such race, since
+the unit already orders itself after `/var/lib` is mounted.
+
+A collector with no key configured sends no `Authorization` header at all — not an empty one, which the
+receiver would have to tell apart from a real attempt. Since the receiver now enforces, that also means
+it delivers nothing.
 
 The collector validates only that the key *can be sent*: non-empty, and legal in an HTTP header value.
-Whether the receiver recognises it is the receiver's business, and during step one the receiver says
-so in its log for every batch — a better place to learn it than a startup check that would duplicate
-the token format across two crates.
+Whether the receiver recognises it is the receiver's business, and it says so in its log for every
+batch — a better place to learn it than a startup check that would duplicate the token format across
+two crates.
+
+**A wrong key is retried, not discarded.** `Forwarder::send` treats a `401` like any other failure, so
+the batch stays at the front of the outbox and is retried on the backoff. That is the right choice for
+a fixable misconfiguration — the telemetry survives being wrong about a key — but it means the outbox
+grows for the duration, bounded only by `buffer_max_records` counted in *batches* and by memory. A
+device left misconfigured long enough will be OOM-killed rather than shed.

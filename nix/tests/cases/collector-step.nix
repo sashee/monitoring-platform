@@ -80,6 +80,10 @@
         # The ordering §7 exists for. Asserted at runtime rather than from the unit file, because
         # what matters is that it actually happened on this boot.
         machine.wait_for_unit("mp-collector.service")
+
+        # Before a single batch goes through the collector: this issues the key and restarts the
+        # collector to load it, and a restart discards anything already in its outbox.
+        authenticate()
         assert not collector_health()["clock"]["ever_synchronized"], collector_health()
 
     with subtest("nothing is disciplining the clock, and that is visible"):

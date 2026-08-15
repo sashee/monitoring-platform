@@ -72,5 +72,32 @@
 
     # Unknown query parameters fail loudly instead of widening the result set.
     curl("http://localhost/v1/measurements?typo=x", succeed=False)
+
+    # Enforcement, asserted over a real socket against the real unit (SPEC.md §13). Every other
+    # request in this harness carries a key, so without this the whole VM suite would pass with
+    # authentication removed — the one property none of the other cases can notice.
+    #
+    # A bare curl rather than the curl() helper, precisely because the helper adds the key.
+    for path, expected in [
+        ("/v1/logs", "401"),
+        ("/v1/measurements", "401"),
+        # Unauthenticated and must stay that way: a readiness probe holds no credential.
+        ("/healthz", "200"),
+    ]:
+        code = machine.succeed(_as_user(CLIENT,
+            f"curl -sS -o /dev/null -w '%{{http_code}}' --unix-socket {SOCKET} "
+            f"http://localhost{path}"
+        )).strip()
+        assert code == expected, f"unauthenticated {path} gave {code}, expected {expected}"
+
+    # And the challenge, which is what tells a client *how* to authenticate (RFC 7235).
+    challenge = machine.succeed(_as_user(CLIENT,
+        f"curl -sS -o /dev/null -D - --unix-socket {SOCKET} http://localhost/v1/measurements"
+    ))
+    # Both sides lowered: the header name arrives lowercase over HTTP/1.1 but the scheme keeps its
+    # capital, so comparing a mixed-case needle against a lowered haystack can never match.
+    assert "www-authenticate: bearer" in challenge.lower(), f"no challenge on a 401: {challenge!r}"
+
+    assert row_count() == before + 3, "a refused request must not store anything either"
   '';
 }

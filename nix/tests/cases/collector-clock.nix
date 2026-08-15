@@ -75,6 +75,10 @@
         # start here; the collector MUST start, because the window it exists to cover is exactly
         # the one where the clock is wrong.
         machine.wait_for_unit("mp-collector.service")
+
+        # Before a single batch goes through the collector: this issues the key and restarts the
+        # collector to load it, and a restart discards anything already in its outbox.
+        authenticate()
         machine.fail(CLOCK_OK)
         machine.fail("systemctl is-active --quiet monitoring-platform.service")
 

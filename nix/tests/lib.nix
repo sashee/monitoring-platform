@@ -83,6 +83,26 @@ let
       # The client posts through the collector, so it needs to reach that socket too.
       users.users.${clientUser}.extraGroups = [ config.services.mp-collector.group ];
       environment.systemPackages = [ config.services.mp-collector.package ];
+
+      # The receiver refuses unauthenticated requests (SPEC.md §13), so the collector needs a key —
+      # but the key it will use does not exist until the receiver's database does, and this unit
+      # starts before almost everything (orderBeforeTimeDaemons). Rather than order the collector
+      # after key generation, which would dismantle the very boot ordering the `ordering` and
+      # `collector-clock` cases exist to prove, the file is present from boot holding a placeholder
+      # and the preamble overwrites it and restarts the collector.
+      #
+      # `mode` rather than the default "symlink" is what makes /etc/mp-api-key a real, writable file
+      # instead of a link into the read-only store — and it exists from the moment /etc is populated,
+      # so `LoadCredential=` cannot race a tmpfiles rule.
+      #
+      # Plaintext, so the VM does not need a decryption key of its own. A real deployment should use
+      # an encrypted credential, which is this option's default.
+      environment.etc."mp-api-key" = {
+        text = "mpk_0000000000000000.placeholder-not-a-real-key";
+        mode = "0400";
+      };
+      services.mp-collector.apiKeyFile = "/etc/mp-api-key";
+      services.mp-collector.apiKeyEncrypted = false;
     };
 
   # Layered onto the machine under test. The service module creates its own user
@@ -290,6 +310,15 @@ let
       COLLECTOR = "/run/mp-collector/mp-collector.sock"
       COLLECTOR_STATE = "/var/lib/mp-collector"
 
+      # Hardcoded like SOCKET and DB above, and for the same reason: these are the module's
+      # defaults, and a case that overrides them is overriding what this harness asserts on.
+      SERVICE_USER = "monitoring-platform"
+      API_KEY_FILE = "/etc/mp-api-key"
+
+      # The key in force, set by authenticate(). `None` means the helpers present nothing at all,
+      # which is the state every case starts in.
+      API_KEY = None
+
       # What distinguishes this harness's rows from any producer the machine under test
       # runs of its own (see the header). mp-make-sample stamps device.id as a resource
       # attribute; otlp/convert.rs flattens it into the attributes column under the
@@ -319,18 +348,82 @@ let
       def _as_user(user, command):
           return f"su - {user} -c " + shlex.quote(command)
 
+      def _auth():
+          # Every endpoint but /healthz requires an API key (SPEC.md §13). Empty until
+          # authenticate() has run, which is what lets a case assert the refusal instead.
+          return "" if API_KEY is None else f"-H 'Authorization: Bearer {API_KEY}' "
+
+      def authenticate():
+          # Issues a key in the receiver's own database, and hands the collector a copy.
+          #
+          # At runtime rather than declaratively, and this is the trade to understand: the collector
+          # reads its key once at startup and starts before nearly everything else
+          # (orderBeforeTimeDaemons), so provisioning it any earlier would mean ordering it after
+          # the receiver's database exists — dismantling the boot ordering that the `ordering` and
+          # `collector-clock` cases exist to prove. So it boots with the placeholder in
+          # /etc/mp-api-key, delivers nothing until this runs, and is restarted here exactly once.
+          #
+          # As the service user, not root: SQLite writes -wal and -shm beside the database, and
+          # root-owned ones would be files the service itself could no longer write.
+          #
+          # Callable before the receiver has ever started, which the cases that skip the readiness
+          # wait need — and which the two collector cases need for a subtler reason: this restarts
+          # the collector, and a restart discards whatever is in its outbox, so it has to happen
+          # before any batch has been posted through it. Hence the directory is created the way
+          # systemd's StateDirectory= would, since `create-api-key` cannot make its own parent.
+          global API_KEY
+          machine.succeed(
+              f"install -d -m 0700 -o {SERVICE_USER} -g {SERVICE_USER} $(dirname {DB})"
+          )
+          token = machine.succeed(
+              f"runuser -u {SERVICE_USER} -- monitoring-platform create-api-key "
+              f"--db {DB} --label harness 2>/dev/null"
+          ).strip()
+          if not token.startswith("mpk_"):
+              raise Exception(f"create-api-key did not print a token: {token!r}")
+          API_KEY = token
+
+          # Hand it to the collector, if this machine has one — `collector = false` builds a machine
+          # with no such unit. Asked of systemd at runtime rather than templated in from Nix, for the
+          # same reason time_sync_unit() below is: a testScript is a static string with no access to
+          # the evaluated configuration. (Splitting this across two Nix string literals instead would
+          # dedent it out of the function, since each `''''''` strips its own indentation.)
+          loaded = machine.succeed(
+              "systemctl show mp-collector.service -p LoadState --value"
+          ).strip()
+          if loaded == "loaded":
+              # Whether it had synchronized *before* the restart, because a restart resets that: the
+              # flag is per-process and has to be re-earned by a few consecutive good clock polls. A
+              # case asserting on the clock straight after this would otherwise race those polls.
+              # Cases whose clock is deliberately bad never had it set and must not wait for
+              # something that is not going to happen — hence asking rather than assuming.
+              was_synchronized = collector_health()["clock"]["ever_synchronized"]
+
+              # 0400 and root-owned, and writable regardless because root overrides the mode. The
+              # collector never opens this path itself — systemd copies it into the unit's own
+              # credentials directory, which is what the collector reads.
+              machine.succeed(f"printf %s {shlex.quote(token)} > {API_KEY_FILE}")
+              machine.succeed("systemctl restart mp-collector.service")
+              machine.wait_for_unit("mp-collector.service")
+
+              if was_synchronized:
+                  retry(
+                      lambda _: collector_health()["clock"]["ever_synchronized"],
+                      timeout_seconds=120,
+                  )
+
       def curl_raw(args, user=CLIENT, succeed=True):
           # No --fail-with-body: for probes that inspect the status themselves via -w.
           # Run as a group member by default: the socket is only reachable through a
           # 0750 group-owned directory, so root-only probes would not prove access
           # works for the clients that matter.
-          cmd = _as_user(user, f"curl -sS --unix-socket {SOCKET} {args}")
+          cmd = _as_user(user, f"curl -sS {_auth()}--unix-socket {SOCKET} {args}")
           return (machine.succeed if succeed else machine.fail)(cmd)
 
       def curl(args, user=CLIENT, succeed=True):
           # --fail-with-body, so a 4xx/5xx is a non-zero exit and therefore a test
           # failure unless succeed=False.
-          cmd = _as_user(user, f"curl -sS --fail-with-body --unix-socket {SOCKET} {args}")
+          cmd = _as_user(user, f"curl -sS --fail-with-body {_auth()}--unix-socket {SOCKET} {args}")
           return (machine.succeed if succeed else machine.fail)(cmd)
 
       def get_json(path, user=CLIENT):
@@ -450,6 +543,14 @@ let
               if state == "loaded":
                   return unit
           raise Exception("the machine under test runs no time-sync client this harness drives")
+    ''
+    # Last, because it calls the helpers defined above. Only for the cases that waited for the
+    # service: a key cannot be issued into a database whose StateDirectory the service has not
+    # created yet, so the four cases that deliberately start without it call authenticate()
+    # themselves, once they have brought the service up.
+    + lib.optionalString waitForService ''
+
+      authenticate()
     '';
 
   # One VM test on the base machine plus any per-case modules and helper nodes.

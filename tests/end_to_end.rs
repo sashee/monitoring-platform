@@ -15,6 +15,8 @@ use std::path::Path;
 use std::process::{Child, Command};
 use std::time::{Duration, Instant};
 
+mod common;
+
 const T: i64 = 1_785_489_242_123_456_789;
 
 /// How long the process-lifecycle waits below are allowed to take, overridable with
@@ -43,6 +45,8 @@ struct Server {
     child: Child,
     socket: std::path::PathBuf,
     db: std::path::PathBuf,
+    /// Presented on every request but `/healthz`, which requires none (SPEC §13).
+    authorization: String,
     _dir: tempfile::TempDir,
 }
 
@@ -51,6 +55,9 @@ impl Server {
         let dir = tempfile::tempdir().unwrap();
         let socket = dir.path().join("mp.sock");
         let db = dir.path().join("mp.db");
+        // Before the server starts, so it finds the key already in the database it opens. Creating it
+        // here also migrates the file, which the server then has nothing left to do.
+        let authorization = common::issue_key(&db);
 
         let child = Command::new(env!("CARGO_BIN_EXE_monitoring-platform"))
             .args(["serve", "--socket"])
@@ -61,7 +68,7 @@ impl Server {
             .spawn()
             .expect("spawning the server binary");
 
-        let mut server = Server { child, socket, db, _dir: dir };
+        let mut server = Server { child, socket, db, authorization, _dir: dir };
         server.wait_until_ready();
         server
     }
@@ -102,15 +109,20 @@ impl Server {
 
     fn get(&self, path: &str) -> (u16, Vec<u8>) {
         self.request(
-            format!("GET {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
-                .into_bytes(),
+            format!(
+                "GET {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\
+                 Authorization: {}\r\n\r\n",
+                self.authorization
+            )
+            .into_bytes(),
         )
     }
 
     fn post_protobuf(&self, path: &str, body: &[u8], encoding: Option<&str>) -> (u16, Vec<u8>) {
         let mut head = format!(
             "POST {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\
-             Content-Type: {PROTOBUF}\r\nContent-Length: {}\r\n",
+             Authorization: {}\r\nContent-Type: {PROTOBUF}\r\nContent-Length: {}\r\n",
+            self.authorization,
             body.len()
         );
         if let Some(enc) = encoding {
@@ -298,8 +310,14 @@ fn reclaims_a_stale_socket_left_by_a_previous_run() {
         .spawn()
         .unwrap();
 
-    let mut replacement =
-        Server { child: second, socket, db: first.db.clone(), _dir: tempfile::tempdir().unwrap() };
+    // Same database, so the key issued for `first` still applies.
+    let mut replacement = Server {
+        child: second,
+        socket,
+        db: first.db.clone(),
+        authorization: first.authorization.clone(),
+        _dir: tempfile::tempdir().unwrap(),
+    };
     replacement.wait_until_ready();
     assert_eq!(replacement.get("/healthz").0, 200);
     assert!(replacement.terminate());

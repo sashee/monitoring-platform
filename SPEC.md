@@ -486,10 +486,64 @@ noise implying a constraint that does not exist.)
 
 ### 6.2 Migrations
 
-Schema version tracked in `PRAGMA user_version`. On startup, migrations run forward from the
-current version to the latest inside a transaction. The PoC ships version `1` — the table and
-indexes above. A database whose `user_version` is *higher* than the binary knows about is a fatal
-startup error, not a downgrade attempt.
+Schema version tracked in `PRAGMA user_version` as **`major.minor`**. On startup, migrations run
+forward from the current version to the latest inside a transaction.
+
+**Why the version has two components.** A blanket "a newer database is fatal" rule is right for a
+change that rewrites data — version 2 dropped and recreated `measurement` — and wrong for one that
+only adds a table. Applying it to both makes *every* schema bump an irreversible deployment, and
+reverting to an older binary is routine on the deployed host rather than exceptional: it runs
+`system.autoUpgrade` nightly, so a hand-switched generation is replaced by whatever the pipeline last
+delivered. Under a single version number that revert turned into a permanent startup failure retrying
+every 60 s, with `/healthz` down and nothing reporting it (§9.2, §9.4).
+
+The split confines the fatal case to the changes that genuinely are fatal:
+
+| Database vs. binary | Outcome |
+|---|---|
+| newer major | **Fatal.** It may have rewritten data this binary cannot read. |
+| same major, newer minor | **Runs**, with a `warn!` naming both versions. Applies nothing, writes nothing. |
+| equal | No-op. Nothing is written. |
+| older | Migrated forward, in one transaction. |
+
+**What may be a minor bump.** Nothing in code can enforce this; it is a discipline on the content of
+a migration, and accepting a newer minor is only sound while it holds. A minor bump may only:
+
+- `CREATE TABLE` — a table an older binary neither reads nor writes;
+- `CREATE INDEX`;
+- `ALTER TABLE … ADD COLUMN` that is nullable or has a default, on a table an older binary writes.
+  That binary's `INSERT` does not name the column, so the column must be satisfiable without it. (On a
+  STRICT table `ADD COLUMN` requires a declared type, and a `NOT NULL` addition requires a non-null
+  default — consistent with this rule.)
+
+Everything else is a major bump: dropping or renaming a table or column, changing a column's type,
+adding a constraint an older binary's writes could violate, adding `NOT NULL` without a default, or
+changing the meaning of existing data.
+
+The test is not "is it additive in SQL" but **"would the previous binary still behave correctly
+against it"**. Version 2 is the illustration of the answer being no.
+
+**Encoding.** `user_version` is a 32-bit signed integer, so the two components pack into it — and the
+packing is chosen so that introducing the scheme rewrote nothing:
+
+```
+encode(major, 0)     = major                  # the legacy form, unchanged
+encode(major, minor) = major * 1000 + minor   # minor > 0
+decode(raw)          = if raw < 1000 then (raw, 0) else (raw / 1000, raw % 1000)
+```
+
+A bare `N` therefore reads as `N.0`, which is what every database written before this scheme already
+holds, and a version with no minor component is written back in that same bare form. So a deployed
+3.0 database still has `user_version = 3` literally, and a binary from before major.minor still reads
+it. That property is the point: a scheme whose own arrival broke the binary it replaced would have
+been self-defeating. `decode` is total over the whole range regardless, since `user_version` can be
+hand-edited to anything; `3000` also reads as 3.0 even though nothing writes it. Both components are
+bounded below 1000, or a major of 1000 would be indistinguishable from 1.0.
+
+**The first three versions are grandfathered.** They shipped as the single numbers 1, 2 and 3 and so
+denote 1.0, 2.0 and 3.0. Under the rule above, 3.0 only added `api_key` and *would* have been 2.1 —
+but it is already deployed, and renumbering a database in the field buys nothing. The scheme applies
+from here on; this is not an inconsistency to go and fix.
 
 ### 6.3 Write path
 
@@ -830,8 +884,9 @@ Notes on specific lines:
 - `Group=` is what local clients need membership of to reach the socket. A `DynamicUser=yes` setup
   is tempting for a service holding no long-lived identity, but it makes the owning group transient
   and therefore awkward to grant clients access to; a static system user is simpler here.
-- `Restart=on-failure` matters more than it looks: §6.2 makes a database whose `user_version`
-  exceeds the binary's a *fatal* startup error, and §8.1 fails startup when the socket path is
+- `Restart=on-failure` matters more than it looks: §6.2 makes a database whose *major* schema version
+  exceeds the binary's a fatal startup error (a newer *minor* runs, which is what confines this to the
+  changes that genuinely cannot be served), and §8.1 fails startup when the socket path is
   occupied by a live listener or a non-socket file. Those are permanent conditions, and a start
   rate limiter (5 starts / 10 s) is what would turn an infinite restart loop into a failed unit
   that reports the reason. **§9.4 disables that limiter and explains the trade** — fail-closed
@@ -961,8 +1016,8 @@ package output.
 exposes it as `systemd.services.<name>.startLimitIntervalSec`, not through `serviceConfig`,
 where systemd would parse it and then drop it with *"Unknown key … ignoring"*), reversing part
 of §9.2. That
-limiter existed to turn a permanent startup failure — a schema newer than the binary (§6.2), an
-occupied socket (§8.1) — into a failed unit that reports the reason instead of an endless loop.
+limiter existed to turn a permanent startup failure — a schema *major* newer than the binary (§6.2),
+an occupied socket (§8.1) — into a failed unit that reports the reason instead of an endless loop.
 Fail-closed gating trades it away: a device that boots without a network legitimately fails for
 hours, and a limiter would give up permanently during exactly the outage it must survive. The cost
 is real — a genuinely permanent failure now retries every 60 s rather than stopping and saying so —
@@ -1178,6 +1233,19 @@ Unit tests (pure functions, no I/O):
   same batch still converted. A record failing both checks is counted once, not twice.
 - Query building: filter combinations, cursor round-trip, `limit` clamping, unknown-parameter
   rejection.
+- Schema versions (§6.2). `encode`/`decode` round-trip; a bare integer decodes as that major at minor
+  zero, which is what every deployed database holds; a zero minor encodes back to the bare major —
+  asserted on the integer, because that integer is the compatibility promise; the packed form of a
+  zero minor still decodes, since `user_version` can be hand-edited to anything; and ordering is
+  numeric, so 3.9 < 3.10 rather than the reverse a lexical comparison would give. Plus a guard that
+  `MIGRATIONS` ascends and its last entry is exactly `SCHEMA_VERSION`, which catches both adding a
+  migration without bumping the constant and bumping it without adding one.
+- Migrating (§6.2): forward from empty, from 1.0 and from 2.0 (keeping the measurements beside the
+  new table), and idempotent. A newer **major** is refused. A newer **minor** is *accepted* — it
+  applies nothing, leaves the stored version alone rather than silently downgrading the file, and
+  leaves the newer binary's extra table intact. A database already at the current version is not
+  written to at all, which is what keeps a deployed 3.0 database readable by a binary from before
+  major.minor existed.
 - The JSON path builder (§7.1): keys containing `"`, `\`, `.`, `[`, `]`, `$` and `*` all produce paths
   that match the intended key. Verified that unquoted/unescaped variants fail *silently* in SQLite
   (`NULL`, not an error), which is why this is a unit-tested function rather than inline formatting.
@@ -1220,6 +1288,11 @@ Integration tests:
   assert the socket file is gone.
 - Stale-socket handling: leave a dead socket file behind and assert startup reclaims it; leave a
   regular file and assert startup fails without deleting it.
+- Schema compatibility, against the spawned binary rather than only `migrate` (§6.2): a database at a
+  newer **major** exits non-zero with the reason on stderr; one at a newer **minor** starts, serves
+  `/healthz` *and* `/v1/measurements`, and leaves `user_version` untouched. The end-to-end shape is
+  the point on the second one — what has to hold is that the process comes up and serves, which is
+  the case a reverted deployment lands in.
 
 Deployment (§9.3, §10.3):
 

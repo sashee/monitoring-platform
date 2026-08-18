@@ -5,6 +5,7 @@
 
 use monitoring_platform::api::status::PROTOBUF;
 use monitoring_platform::otlp::test_support::*;
+use monitoring_platform::store::schema::{SCHEMA_VERSION, Version};
 use opentelemetry_proto::tonic::collector::logs::v1::{
     ExportLogsPartialSuccess, ExportLogsServiceResponse,
 };
@@ -344,14 +345,20 @@ fn refuses_to_start_when_the_socket_path_is_a_regular_file() {
     assert_eq!(std::fs::read(&path).unwrap(), b"not a socket", "the file must be untouched");
 }
 
-/// SPEC §6.2: a database from a newer binary is a startup failure, not a downgrade.
+/// SPEC §6.2: a database from a newer *major* is a startup failure, not a downgrade.
+///
+/// `user_version` is a packed `major.minor` (§6.2), so the value here is not a free choice: it used to
+/// be `999`, which now denotes 0.999 — an *older* major, which would be migrated forward and start
+/// happily. `Version::new(major + 1, 0).encode()` is derived from the constant instead, so bumping
+/// SCHEMA_VERSION cannot leave this test silently asserting nothing.
 #[test]
-fn refuses_to_start_against_a_newer_schema() {
+fn refuses_to_start_against_a_newer_major_schema() {
     let dir = tempfile::tempdir().unwrap();
     let db = dir.path().join("future.db");
+    let newer = Version::new(SCHEMA_VERSION.major + 1, 0);
     {
         let conn = rusqlite::Connection::open(&db).unwrap();
-        conn.pragma_update(None, "user_version", 999).unwrap();
+        conn.pragma_update(None, "user_version", newer.encode()).unwrap();
     }
 
     let output = Command::new(env!("CARGO_BIN_EXE_monitoring-platform"))
@@ -365,4 +372,49 @@ fn refuses_to_start_against_a_newer_schema() {
     assert!(!output.status.success());
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stderr.contains("newer than this binary"), "unexpected stderr: {stderr}");
+}
+
+/// SPEC §6.2: a newer *minor* must start, because a minor version only adds tables, indexes and
+/// defaulted columns — so everything this binary knows about is still where it expects it.
+///
+/// The end-to-end shape matters here rather than only the unit test on `migrate`: this is the case a
+/// reverted deployment lands in, and what has to hold is that the process comes up and serves, not
+/// merely that one function returned `Ok`.
+#[test]
+fn starts_against_a_newer_minor_schema() {
+    let dir = tempfile::tempdir().unwrap();
+    let socket = dir.path().join("mp.sock");
+    let db = dir.path().join("mp.db");
+    let future = Version::new(SCHEMA_VERSION.major, SCHEMA_VERSION.minor + 1);
+
+    // Migrated and keyed by *this* binary first, so the tables it needs exist, and then moved forward
+    // the way a newer one would have left it: an extra table, and a higher minor.
+    let authorization = common::issue_key(&db);
+    {
+        let conn = rusqlite::Connection::open(&db).unwrap();
+        conn.execute_batch("CREATE TABLE from_the_future (x INTEGER) STRICT;").unwrap();
+        conn.pragma_update(None, "user_version", future.encode()).unwrap();
+    }
+
+    let child = Command::new(env!("CARGO_BIN_EXE_monitoring-platform"))
+        .args(["serve", "--socket"])
+        .arg(&socket)
+        .arg("--db")
+        .arg(&db)
+        .args(["--log-level", "warn"])
+        .spawn()
+        .unwrap();
+
+    let mut server = Server { child, socket, db: db.clone(), authorization, _dir: dir };
+    server.wait_until_ready();
+    assert_eq!(server.get("/healthz").0, 200);
+    // Not just liveness: the routes that need the schema have to work too, since the point is that
+    // this binary can still serve a database a newer one migrated.
+    assert_eq!(server.get("/v1/measurements").0, 200);
+    assert!(server.terminate());
+
+    // Still untouched: writing our own version back would be a silent downgrade of the file.
+    let conn = rusqlite::Connection::open(&db).unwrap();
+    let stored: i64 = conn.pragma_query_value(None, "user_version", |r| r.get(0)).unwrap();
+    assert_eq!(stored, future.encode());
 }

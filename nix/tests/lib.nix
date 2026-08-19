@@ -543,13 +543,23 @@ let
               f"monitoring-platform create-user --db {DB} --username {shlex.quote(username)}"
           )
 
-      def web_curl(args, cookie=None, user=CLIENT, succeed=True):
+      # What a browser would send, and what the §14.3 origin check compares against the Host header. curl
+      # derives `Host: localhost` from the URL, so this pairs with it.
+      WEB_ORIGIN = "http://localhost"
+
+      def web_curl(args, cookie=None, user=CLIENT, succeed=True, origin=WEB_ORIGIN):
           # Deliberately NOT reusing curl(): that helper sends the API key on every request, and the whole
           # point of §14 is that the pages do not accept one. A web probe that happened to carry a bearer
           # token would pass whether or not the session layer worked.
           #
+          # Every request carries an Origin, because every state-changing route requires one (SPEC.md
+          # §14.3) — a browser always sends it on POST, and a command-line client has to. `origin=None`
+          # omits it, which is how a case asserts the refusal.
+          #
           # -i, because everything asserted here is in the head: the status, Location, and Set-Cookie.
           header = f"-H 'Cookie: mp_session={cookie}' " if cookie else ""
+          if origin:
+              header += f"-H 'Origin: {origin}' "
           cmd = _as_user(user, f"curl -sS -i {header}--unix-socket {SOCKET} {args}")
           return (machine.succeed if succeed else machine.fail)(cmd)
 

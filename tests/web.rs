@@ -121,15 +121,43 @@ impl Harness {
         self.send(request.body(Body::empty()).unwrap()).await
     }
 
+    /// A `POST` from the same origin it was sent to — what a browser does.
     async fn post_form(&self, uri: &str, body: &str, cookie: Option<&str>) -> Reply {
+        self.post_from(uri, body, cookie, Some("http://localhost")).await
+    }
+
+    /// `origin` is `None` to simulate a client that sends none, which the check must refuse.
+    async fn post_from(
+        &self,
+        uri: &str,
+        body: &str,
+        cookie: Option<&str>,
+        origin: Option<&str>,
+    ) -> Reply {
         let mut request = Request::builder()
             .method("POST")
             .uri(uri)
+            // The origin check compares `Origin` against `Host`, so a test request needs both — a
+            // relative URI carries no `Host` of its own.
+            .header(header::HOST, "localhost")
             .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded");
+        if let Some(value) = origin {
+            request = request.header(header::ORIGIN, value);
+        }
         if let Some(value) = cookie {
             request = request.header(header::COOKIE, format!("{COOKIE}={value}"));
         }
         self.send(request.body(Body::from(body.to_owned())).unwrap()).await
+    }
+
+    /// Ingests measurements directly, for the explorer tests.
+    fn ingest(&self, measurements: &[monitoring_platform::model::Measurement]) {
+        let mut conn = store::open_write(&self.db).unwrap();
+        store::write::insert_batch(&mut conn, measurements).unwrap();
+    }
+
+    fn users(&self) -> Vec<String> {
+        store::users::list(&self.read()).unwrap().into_iter().map(|u| u.username).collect()
     }
 
     /// Logs in and returns the cookie value.
@@ -500,6 +528,603 @@ async fn device_supplied_text_cannot_become_markup() {
         "an unescaped script tag reached the page: {}",
         reply.body
     );
+}
+
+// ------------------------------------------------------- the origin check (SPEC §14.3)
+
+/// **The case the origin check exists for.** `SameSite` ignores the port, so another server on loopback
+/// is same-site and its forged POST arrives *with* the session cookie. Only comparing `Origin` to `Host`
+/// sees the difference.
+#[tokio::test]
+async fn a_post_from_another_port_on_the_same_host_is_refused() {
+    let harness = harness();
+    let cookie = harness.login().await;
+
+    let reply = harness
+        .post_from(
+            "/users/create",
+            "username=intruder&password=whatever",
+            Some(&cookie),
+            Some("http://localhost:3000"),
+        )
+        .await;
+
+    assert_eq!(reply.status, StatusCode::FORBIDDEN);
+    assert_eq!(harness.users(), vec![USER.to_owned()], "nothing may have been written");
+}
+
+#[tokio::test]
+async fn a_post_with_no_origin_is_refused() {
+    let harness = harness();
+    let cookie = harness.login().await;
+
+    let reply =
+        harness.post_from("/users/create", "username=x&password=y", Some(&cookie), None).await;
+
+    assert_eq!(reply.status, StatusCode::FORBIDDEN);
+    assert_eq!(harness.users(), vec![USER.to_owned()]);
+}
+
+/// The check runs **before** the credentials are even looked at, which is what makes it a defence rather
+/// than a second opinion: a forged login attempt is refused as forged, not as wrong.
+#[tokio::test]
+async fn login_itself_is_origin_checked() {
+    let harness = harness();
+
+    let reply = harness
+        .post_from(
+            "/login",
+            &format!("username={USER}&password={PASSWORD}"),
+            None,
+            Some("http://evil.example"),
+        )
+        .await;
+
+    assert_eq!(reply.status, StatusCode::FORBIDDEN, "not 303, and not 401");
+    assert!(reply.session().is_none());
+    assert_eq!(harness.session_count(), 0);
+}
+
+/// Logging out is state-changing too, so it is checked — otherwise any local page could log you out.
+#[tokio::test]
+async fn logout_is_origin_checked() {
+    let harness = harness();
+    let cookie = harness.login().await;
+
+    let reply = harness.post_from("/logout", "", Some(&cookie), Some("http://other:9")).await;
+
+    assert_eq!(reply.status, StatusCode::FORBIDDEN);
+    assert_eq!(harness.session_count(), 1, "the session must survive a forged logout");
+}
+
+/// Reads are not checked. A `GET` changes nothing, and requiring the header on every page load would
+/// break following a bookmark, where a browser sends no `Origin`.
+#[tokio::test]
+async fn reads_are_not_origin_checked() {
+    let harness = harness();
+    let cookie = harness.login().await;
+    assert_eq!(harness.get("/", Some(&cookie)).await.status, StatusCode::OK);
+    assert_eq!(harness.get("/login", None).await.status, StatusCode::OK);
+}
+
+// ------------------------------------------------------- managing users
+
+#[tokio::test]
+async fn a_user_can_be_created_and_then_log_in() {
+    let harness = harness();
+    let cookie = harness.login().await;
+
+    let reply =
+        harness.post_form("/users/create", "username=second&password=another-long-one", Some(&cookie)).await;
+
+    assert_eq!(reply.status, StatusCode::SEE_OTHER);
+    assert_eq!(reply.location.as_deref(), Some("/users"));
+    assert!(harness.users().contains(&"second".to_owned()));
+
+    // The real check: the stored hash is one the login path accepts.
+    let logged_in = harness
+        .post_form("/login", "username=second&password=another-long-one", None)
+        .await;
+    assert_eq!(logged_in.status, StatusCode::SEE_OTHER);
+    assert!(logged_in.session().is_some());
+}
+
+/// A duplicate is the operator's typo, so it is a message on the page rather than a 500.
+#[tokio::test]
+async fn a_duplicate_username_is_reported_not_crashed() {
+    let harness = harness();
+    let cookie = harness.login().await;
+
+    let reply = harness
+        .post_form("/users/create", &format!("username={USER}&password=x"), Some(&cookie))
+        .await;
+
+    assert_eq!(reply.status, StatusCode::BAD_REQUEST);
+    assert!(reply.body.contains("already exists"), "{}", reply.body);
+    assert_eq!(harness.users().len(), 1);
+}
+
+#[tokio::test]
+async fn a_user_needs_both_a_name_and_a_password() {
+    let harness = harness();
+    let cookie = harness.login().await;
+
+    for body in ["username=&password=x", "username=x&password=", "username=%20%20&password=x"] {
+        let reply = harness.post_form("/users/create", body, Some(&cookie)).await;
+        assert_eq!(reply.status, StatusCode::BAD_REQUEST, "on {body:?}");
+        assert_eq!(harness.users().len(), 1, "on {body:?}");
+    }
+}
+
+#[tokio::test]
+async fn a_user_can_be_deleted_once_another_exists() {
+    let harness = harness();
+    let cookie = harness.login().await;
+    harness.post_form("/users/create", "username=second&password=xxxxxxxxxxxx", Some(&cookie)).await;
+
+    let reply = harness.post_form("/users/delete", "username=second", Some(&cookie)).await;
+
+    assert_eq!(reply.status, StatusCode::SEE_OTHER);
+    assert_eq!(harness.users(), vec![USER.to_owned()]);
+}
+
+/// **A delete button that can lock you out is a footgun.** Refused in the handler, not merely hidden in
+/// the rendering — the page whose button was pressed may be minutes old.
+#[tokio::test]
+async fn the_last_user_cannot_be_deleted() {
+    let harness = harness();
+    let cookie = harness.login().await;
+
+    let reply = harness.post_form("/users/delete", &format!("username={USER}"), Some(&cookie)).await;
+
+    assert_eq!(reply.status, StatusCode::BAD_REQUEST);
+    assert_eq!(harness.users(), vec![USER.to_owned()], "the only user must survive");
+    assert!(reply.body.contains("only user"), "{}", reply.body);
+}
+
+/// Deleting yourself takes your sessions with you (`users::delete` cascades), so the response has to be
+/// the login form — anything else would be a redirect to a page the browser can no longer load.
+#[tokio::test]
+async fn deleting_your_own_user_logs_you_out() {
+    let harness = harness();
+    let cookie = harness.login().await;
+    harness.post_form("/users/create", "username=second&password=xxxxxxxxxxxx", Some(&cookie)).await;
+
+    let reply = harness.post_form("/users/delete", &format!("username={USER}"), Some(&cookie)).await;
+
+    assert_eq!(reply.status, StatusCode::SEE_OTHER);
+    assert_eq!(reply.location.as_deref(), Some("/login"));
+    assert!(reply.set_cookie.iter().any(|c| c.contains("Max-Age=0")), "{:?}", reply.set_cookie);
+    assert_eq!(harness.session_count(), 0, "the cascade must have removed the session");
+    assert_eq!(harness.get("/", Some(&cookie)).await.status, StatusCode::SEE_OTHER);
+}
+
+#[tokio::test]
+async fn deleting_a_user_who_does_not_exist_is_reported() {
+    let harness = harness();
+    let cookie = harness.login().await;
+    harness.post_form("/users/create", "username=second&password=xxxxxxxxxxxx", Some(&cookie)).await;
+
+    let reply = harness.post_form("/users/delete", "username=ghost", Some(&cookie)).await;
+    assert_eq!(reply.status, StatusCode::BAD_REQUEST);
+    assert!(reply.body.contains("no such user"), "{}", reply.body);
+}
+
+// ------------------------------------------------------- ending sessions
+
+#[tokio::test]
+async fn another_session_can_be_ended_without_touching_your_own() {
+    let harness = harness();
+    let theirs = harness.login().await;
+    let mine = harness.login().await;
+    assert_eq!(harness.session_count(), 2);
+
+    let theirs_id = theirs.strip_prefix("mps_").unwrap().split_once('.').unwrap().0.to_owned();
+    let reply = harness.post_form("/sessions/end", &format!("id={theirs_id}"), Some(&mine)).await;
+
+    assert_eq!(reply.status, StatusCode::SEE_OTHER);
+    assert_eq!(reply.location.as_deref(), Some("/sessions"));
+    assert_eq!(harness.session_count(), 1);
+    assert_eq!(harness.get("/", Some(&theirs)).await.status, StatusCode::SEE_OTHER, "ended");
+    assert_eq!(harness.get("/", Some(&mine)).await.status, StatusCode::OK, "mine still works");
+}
+
+/// Ending your own is allowed — it is logout by another route, and it is the one a reader is most likely
+/// to want gone.
+#[tokio::test]
+async fn ending_your_own_session_logs_you_out() {
+    let harness = harness();
+    let cookie = harness.login().await;
+    let id = cookie.strip_prefix("mps_").unwrap().split_once('.').unwrap().0.to_owned();
+
+    let reply = harness.post_form("/sessions/end", &format!("id={id}"), Some(&cookie)).await;
+
+    assert_eq!(reply.status, StatusCode::SEE_OTHER);
+    assert_eq!(reply.location.as_deref(), Some("/login"));
+    assert!(reply.set_cookie.iter().any(|c| c.contains("Max-Age=0")));
+    assert_eq!(harness.session_count(), 0);
+}
+
+// ------------------------------------------------------- the explorer (SPEC §14.9)
+
+use monitoring_platform::model::Measurement;
+use serde_json::json;
+
+/// Measurements shaped like the real `bms.status.cell` data: one numeric body leaf, split by an
+/// attribute, one row per cell per bucket.
+fn cells(count: i64, cells: i64) -> Vec<Measurement> {
+    let mut out = Vec::new();
+    for i in 0..count {
+        for c in 1..=cells {
+            out.push(Measurement {
+                event_time: T + i * 1_000_000_000,
+                processed_time: T,
+                kind: "bms.status.cell".to_owned(),
+                body: Some(json!({"voltage_volts": 3.29 + (c as f64) * 0.001})),
+                attributes: json!({"record.attributes.cell": c.to_string()})
+                    .as_object()
+                    .unwrap()
+                    .clone(),
+            });
+        }
+    }
+    out
+}
+
+/// The explorer's URL is its state, so a filter is exercised the way a reader reaches it.
+async fn explore(harness: &Harness, cookie: &str, query: &str) -> Reply {
+    harness.get(&format!("/?{query}"), Some(cookie)).await
+}
+
+#[tokio::test]
+async fn the_explorer_offers_the_types_that_exist() {
+    let harness = harness();
+    harness.ingest(&cells(2, 2));
+    let cookie = harness.login().await;
+
+    let reply = explore(&harness, &cookie, "range=all").await;
+    assert_eq!(reply.status, StatusCode::OK);
+    assert!(reply.body.contains("bms.status.cell"), "the type must be offered");
+    assert!(reply.body.contains("Choose a type"), "and the hint shown until one is chosen");
+}
+
+#[tokio::test]
+async fn an_attribute_filter_narrows_the_table() {
+    let harness = harness();
+    harness.ingest(&cells(3, 3));
+    let cookie = harness.login().await;
+
+    let all = explore(&harness, &cookie, "range=all&type=bms.status.cell&t0=bms.status.cell").await;
+    let filtered = explore(
+        &harness,
+        &cookie,
+        "range=all&type=bms.status.cell&t0=bms.status.cell&attr.record.attributes.cell=2",
+    )
+    .await;
+
+    let rows = |b: &str| b.matches("<tr>").count();
+    assert!(rows(&all.body) > rows(&filtered.body), "the filter must remove rows");
+    assert!(filtered.body.contains("3.292"), "cell 2's value is 3.29 + 2*0.001");
+    assert!(!filtered.body.contains("3.291"), "cell 1 must be gone: {}", filtered.body);
+}
+
+#[tokio::test]
+async fn a_numeric_field_renders_a_value_chart() {
+    let harness = harness();
+    harness.ingest(&cells(5, 1));
+    let cookie = harness.login().await;
+
+    let reply = explore(
+        &harness,
+        &cookie,
+        "range=all&type=bms.status.cell&t0=bms.status.cell&field=voltage_volts",
+    )
+    .await;
+
+    assert_eq!(reply.status, StatusCode::OK);
+    assert!(reply.body.contains("class=\"line\""), "a line must be drawn: {}", reply.body);
+    assert!(reply.body.contains("var(--series-1)"), "in a palette slot, not a hex literal");
+}
+
+/// The timeline is always there, whatever the bodies contain — it is the only plot a text-bodied type can
+/// have, and it is what answers "when did these arrive".
+#[tokio::test]
+async fn a_text_only_type_gets_a_timeline_and_no_value_chart() {
+    let harness = harness();
+    harness.ingest(&[Measurement {
+        event_time: T,
+        processed_time: T,
+        kind: "system.unit".to_owned(),
+        body: Some(json!({"active_state": "active"})),
+        attributes: json!({"record.attributes.unit": "sshd"}).as_object().unwrap().clone(),
+    }]);
+    let cookie = harness.login().await;
+
+    let reply = explore(&harness, &cookie, "range=all&type=system.unit&t0=system.unit").await;
+
+    assert_eq!(reply.status, StatusCode::OK);
+    assert!(reply.body.contains("measurements over time"), "the timeline is always shown");
+    assert!(reply.body.contains("class=\"col\""), "with its columns: {}", reply.body);
+    // `active_state` is text, so it must not be offered as a chart field...
+    assert!(
+        !reply.body.contains(r#"name="field" value="active_state""#),
+        "a text leaf is not chartable: {}",
+        reply.body
+    );
+    // ...but it is still worth a table column, since its values are the thing you came to read.
+    assert!(reply.body.contains("<th>active_state</th>"), "{}", reply.body);
+}
+
+/// Past the series cap the chart says how many groups it left out, rather than inventing more hues.
+#[tokio::test]
+async fn more_groups_than_the_cap_are_reported() {
+    let harness = harness();
+    harness.ingest(&cells(2, 12));
+    let cookie = harness.login().await;
+
+    let reply = explore(
+        &harness,
+        &cookie,
+        "range=all&type=bms.status.cell&t0=bms.status.cell&field=voltage_volts\
+         &group=record.attributes.cell",
+    )
+    .await;
+
+    assert!(reply.body.contains("Showing 8 of 12 groups"), "{}", reply.body);
+    assert!(reply.body.contains("var(--series-8)"), "eight slots used");
+    assert!(!reply.body.contains("var(--series-9)"), "and never a ninth");
+}
+
+/// Groups are chosen and coloured by *sorted* value, and numerically when they are numbers — otherwise
+/// "the first eight" of sixteen cells would be 1 and 10–16.
+#[tokio::test]
+async fn numeric_groups_are_ordered_numerically() {
+    let harness = harness();
+    harness.ingest(&cells(2, 12));
+    let cookie = harness.login().await;
+
+    let reply = explore(
+        &harness,
+        &cookie,
+        "range=all&type=bms.status.cell&t0=bms.status.cell&field=voltage_volts\
+         &group=record.attributes.cell",
+    )
+    .await;
+
+    // The legend lists the plotted groups in order: 1..8, not 1,10,11,12.
+    let legend = reply.body.split("<ul class=\"legend\">").nth(1).expect("a legend").to_owned();
+    for expected in 1..=8 {
+        assert!(legend.contains(&format!(">{expected}</li>")), "cell {expected} missing: {legend}");
+    }
+    assert!(!legend.contains(">10</li>"), "cell 10 is past the cap: {legend}");
+}
+
+/// Device-supplied text reaches the SVG through group labels. SVG is XML, so an unescaped `<` is as
+/// dangerous there as in HTML.
+#[tokio::test]
+async fn device_supplied_group_labels_cannot_break_out_of_the_svg() {
+    let harness = harness();
+    let hostile = "<script>alert('x')</script>";
+    harness.ingest(&[
+        Measurement {
+            event_time: T,
+            processed_time: T,
+            kind: "t".to_owned(),
+            body: Some(json!({"v": 1.0})),
+            attributes: json!({ "g": hostile }).as_object().unwrap().clone(),
+        },
+        Measurement {
+            event_time: T + 1_000_000_000,
+            processed_time: T,
+            kind: "t".to_owned(),
+            body: Some(json!({"v": 2.0})),
+            attributes: json!({"g": "ordinary"}).as_object().unwrap().clone(),
+        },
+    ]);
+    let cookie = harness.login().await;
+
+    let reply = explore(&harness, &cookie, "range=all&type=t&t0=t&field=v&group=g").await;
+
+    assert!(!reply.body.contains("<script>"), "unescaped markup: {}", reply.body);
+    assert!(reply.body.contains("&lt;script&gt;"), "the label must still be shown, escaped");
+}
+
+/// Changing the type in the one filter form resubmits the previous type's attribute selects. They belong
+/// to a type that no longer applies, so they must be dropped rather than return an empty page.
+#[tokio::test]
+async fn switching_type_drops_the_previous_type_s_filters() {
+    let harness = harness();
+    harness.ingest(&cells(3, 2));
+    harness.ingest(&[Measurement {
+        event_time: T,
+        processed_time: T,
+        kind: "system.unit".to_owned(),
+        body: Some(json!({"n_restarts": 0})),
+        attributes: json!({"record.attributes.unit": "sshd"}).as_object().unwrap().clone(),
+    }]);
+    let cookie = harness.login().await;
+
+    // `t0` is the old type, `type` the new one, and the stale filter is for a key system.unit lacks.
+    let reply = explore(
+        &harness,
+        &cookie,
+        "range=all&type=system.unit&t0=bms.status.cell&attr.record.attributes.cell=1",
+    )
+    .await;
+
+    assert_eq!(reply.status, StatusCode::OK);
+    assert!(reply.body.contains("sshd"), "the new type's rows must show: {}", reply.body);
+}
+
+/// **A filter must not be a one-way door.** With its own filter applied, a key's dropdown used to collapse
+/// to the single value already chosen, so switching from cell 2 to cell 3 meant clearing the filter first.
+#[tokio::test]
+async fn a_filtered_attribute_still_offers_its_other_values() {
+    let harness = harness();
+    harness.ingest(&cells(2, 4));
+    let cookie = harness.login().await;
+
+    let reply = explore(
+        &harness,
+        &cookie,
+        "range=all&type=bms.status.cell&t0=bms.status.cell&attr.record.attributes.cell=2",
+    )
+    .await;
+
+    // The select for `cell` must still list every cell, with 2 marked.
+    let select = reply
+        .body
+        .split(r#"name="attr.record.attributes.cell""#)
+        .nth(1)
+        .expect("the cell select")
+        .split("</select>")
+        .next()
+        .expect("its end")
+        .to_owned();
+    for expected in ["1", "2", "3", "4"] {
+        assert!(
+            select.contains(&format!(r#"value="{expected}""#)),
+            "cell {expected} is missing, so the filter is a one-way door: {select}"
+        );
+    }
+    assert!(select.contains(r#"value="2" selected"#), "and 2 must be the current one: {select}");
+}
+
+/// Ticking two fields draws two plots — never two scales on one, which would invent a correlation.
+#[tokio::test]
+async fn two_chart_fields_render_two_plots() {
+    let harness = harness();
+    harness.ingest(&[
+        Measurement {
+            event_time: T,
+            processed_time: T,
+            kind: "c".to_owned(),
+            body: Some(json!({"volts": 3.29, "ohms": 0.069})),
+            attributes: json!({"cell": "1"}).as_object().unwrap().clone(),
+        },
+        Measurement {
+            event_time: T + 1_000_000_000,
+            processed_time: T,
+            kind: "c".to_owned(),
+            body: Some(json!({"volts": 3.30, "ohms": 0.070})),
+            attributes: json!({"cell": "1"}).as_object().unwrap().clone(),
+        },
+    ]);
+    let cookie = harness.login().await;
+
+    let reply = explore(&harness, &cookie, "range=all&type=c&t0=c&field=volts&field=ohms").await;
+
+    assert_eq!(reply.status, StatusCode::OK);
+    // Two plots, each with its own heading and its own axis.
+    assert!(reply.body.contains("<h2>volts</h2>"), "{}", reply.body);
+    assert!(reply.body.contains("<h2>ohms</h2>"));
+    assert_eq!(reply.body.matches("class=\"line\"").count(), 2, "one line per plot");
+    // Three SVGs: the timeline plus one per field.
+    assert_eq!(reply.body.matches("<svg").count(), 3);
+}
+
+/// The fields control is checkboxes, because a multi-select needs ctrl-click and a phone has none.
+#[tokio::test]
+async fn chart_fields_are_offered_as_checkboxes() {
+    let harness = harness();
+    harness.ingest(&cells(2, 1));
+    let cookie = harness.login().await;
+
+    let reply =
+        explore(&harness, &cookie, "range=all&type=bms.status.cell&t0=bms.status.cell").await;
+
+    assert!(reply.body.contains(r#"type="checkbox" name="field""#), "{}", reply.body);
+    assert!(!reply.body.contains(r#"<select name="field""#));
+}
+
+/// "one line per" only appears when something is being charted — which is the clearest possible answer to
+/// what it does — and it comes with a sentence saying so.
+#[tokio::test]
+async fn the_grouping_control_appears_only_when_it_would_do_something() {
+    let harness = harness();
+    harness.ingest(&cells(2, 3));
+    let cookie = harness.login().await;
+
+    let without =
+        explore(&harness, &cookie, "range=all&type=bms.status.cell&t0=bms.status.cell").await;
+    assert!(!without.body.contains(r#"name="group""#), "nothing to split yet: {}", without.body);
+
+    let with = explore(
+        &harness,
+        &cookie,
+        "range=all&type=bms.status.cell&t0=bms.status.cell&field=voltage_volts",
+    )
+    .await;
+    assert!(with.body.contains(r#"name="group""#), "{}", with.body);
+    assert!(with.body.contains("one line per"), "the label must say what it does");
+    assert!(with.body.contains("class=\"hint\""), "and the hint must explain it");
+}
+
+/// With a type selected, each body leaf gets its own column and the attributes that are identical on every
+/// row move out of the table — that restating of constants is what made the old table unreadable.
+#[tokio::test]
+async fn the_table_splits_body_leaves_into_columns_and_lifts_out_constants() {
+    let harness = harness();
+    harness.ingest(&cells(3, 2));
+    let cookie = harness.login().await;
+
+    let reply =
+        explore(&harness, &cookie, "range=all&type=bms.status.cell&t0=bms.status.cell").await;
+
+    // A column per body leaf, and the value in a plain cell rather than inside JSON.
+    assert!(reply.body.contains("<th>voltage_volts</th>"), "{}", reply.body);
+    assert!(!reply.body.contains(r#"{&quot;voltage_volts&quot;"#), "no raw JSON blob in a cell");
+    // `cell` differs between rows, so it earns a column.
+    assert!(reply.body.contains("<th>cell</th>"));
+
+    // With one cell filtered, `cell` becomes constant and moves under the table instead.
+    let filtered = explore(
+        &harness,
+        &cookie,
+        "range=all&type=bms.status.cell&t0=bms.status.cell&attr.record.attributes.cell=1",
+    )
+    .await;
+    assert!(filtered.body.contains("Same on every row shown"), "{}", filtered.body);
+    assert!(filtered.body.contains("cell=1"));
+    assert!(!filtered.body.contains("<th>cell</th>"), "a constant is not worth a column");
+}
+
+/// Without a type the rows are unrelated shapes, so a column per key would be mostly empty cells.
+#[tokio::test]
+async fn the_table_stays_compact_when_no_type_is_chosen() {
+    let harness = harness();
+    harness.ingest(&cells(2, 1));
+    let cookie = harness.login().await;
+
+    let reply = explore(&harness, &cookie, "range=all").await;
+    assert!(reply.body.contains("<th>type</th>"), "{}", reply.body);
+    assert!(reply.body.contains("<th>body</th>"));
+}
+
+/// The plots scroll rather than shrink, and the table labels its own cells — the two halves of being usable
+/// on a phone.
+#[tokio::test]
+async fn the_page_carries_its_narrow_screen_affordances() {
+    let harness = harness();
+    harness.ingest(&cells(2, 1));
+    let cookie = harness.login().await;
+
+    let reply = explore(&harness, &cookie, "range=all").await;
+    assert!(reply.body.contains(r#"name="viewport""#), "a viewport meta tag");
+    assert!(reply.body.contains("class=\"plot-wrap\""), "a scrollable plot wrapper");
+    assert!(reply.body.contains("data-label="), "cells that label themselves");
+    assert!(reply.body.contains("@media(max-width:46rem)"), "and the card layout");
+}
+
+#[tokio::test]
+async fn an_empty_range_says_so_rather_than_rendering_a_broken_plot() {
+    let harness = harness();
+    let cookie = harness.login().await;
+
+    let reply = explore(&harness, &cookie, "range=1h").await;
+
+    assert_eq!(reply.status, StatusCode::OK);
+    assert!(reply.body.contains("no measurements in range"), "{}", reply.body);
 }
 
 /// The pages are HTML with an explicit charset. Without one, a browser guesses the encoding of a page that

@@ -98,6 +98,90 @@
     assert keyed == "303", f"an API key opened a page: {keyed}"
     assert WEB_USER not in machine.succeed("cat /tmp/keyed-headers")
 
+    # **The origin check** (SPEC.md §14.3), against the real unit. Two refusals, one for each way the
+    # check can fail, and each must leave the database untouched — a 403 that still wrote would be worse
+    # than no check at all.
+    forged = web_curl(
+        "-X POST --data-urlencode username=intruder --data-urlencode password=whatever "
+        "http://localhost/users/create",
+        cookie=cookie,
+        origin="http://localhost:3000",
+    )
+    assert http_status(forged) == 403, f"a cross-port POST was not refused: {forged}"
+
+    headerless = web_curl(
+        "-X POST --data-urlencode username=intruder2 --data-urlencode password=whatever "
+        "http://localhost/users/create",
+        cookie=cookie,
+        origin=None,
+    )
+    assert http_status(headerless) == 403, f"a POST with no Origin was not refused: {headerless}"
+
+    listed = machine.succeed(
+        f"runuser -u {SERVICE_USER} -- monitoring-platform list-users --db {DB} 2>/dev/null"
+    )
+    assert "intruder" not in listed, f"a refused POST still wrote to the database: {listed}"
+
+    # **A mutation round trip through the real unit.** This is the assertion that cannot be made off-VM:
+    # the handler writes to a database the running service holds open, as the service user, through
+    # systemd's sandbox.
+    created = web_curl(
+        "-X POST --data-urlencode username=second --data-urlencode "
+        + shlex.quote(f"password={WEB_PASSWORD}-2")
+        + " http://localhost/users/create",
+        cookie=cookie,
+    )
+    assert http_status(created) == 303, created
+
+    users_page = web_curl("http://localhost/users", cookie=cookie)
+    assert "second" in users_page, users_page
+
+    # And the new user can actually log in, which is what proves the hash the form stored is one the login
+    # path accepts — a create that wrote an unusable hash would look identical up to here.
+    second_cookie = web_login(username="second", password=f"{WEB_PASSWORD}-2")
+    assert http_status(web_curl("http://localhost/", cookie=second_cookie)) == 200
+
+    # Ending someone else's session must not touch your own.
+    second_id = second_cookie.split(".", 1)[0].removeprefix("mps_")
+    ended = web_curl(
+        f"-X POST --data-urlencode id={second_id} http://localhost/sessions/end", cookie=cookie
+    )
+    assert http_status(ended) == 303, ended
+    assert http_status(web_curl("http://localhost/", cookie=second_cookie)) == 303, "ended"
+    assert http_status(web_curl("http://localhost/", cookie=cookie)) == 200, "mine survives"
+
+    # Deleting the user we just made, now that two exist.
+    deleted = web_curl(
+        "-X POST --data-urlencode username=second http://localhost/users/delete", cookie=cookie
+    )
+    assert http_status(deleted) == 303, deleted
+    listed = machine.succeed(
+        f"runuser -u {SERVICE_USER} -- monitoring-platform list-users --db {DB} 2>/dev/null"
+    )
+    assert "second" not in listed, listed
+
+    # The last remaining user cannot be deleted — a delete button that locks you out is a footgun, and the
+    # handler refuses it rather than relying on the page having hidden it.
+    refused = web_curl(
+        f"-X POST --data-urlencode username={WEB_USER} http://localhost/users/delete", cookie=cookie
+    )
+    assert http_status(refused) == 400, refused
+    listed = machine.succeed(
+        f"runuser -u {SERVICE_USER} -- monitoring-platform list-users --db {DB} 2>/dev/null"
+    )
+    assert WEB_USER in listed, f"the only user must survive: {listed}"
+
+    # **The explorer** over whatever this machine has actually collected (SPEC.md §14.9). No row counts
+    # here: the machine under test runs producers of its own, so the assertions are about the page's
+    # structure rather than about how many measurements exist.
+    explorer = web_curl("'http://localhost/?range=all'", cookie=cookie)
+    assert http_status(explorer) == 200, explorer
+    assert 'name="range"' in explorer, "the filter row must render"
+    assert "measurements over time" in explorer, "the timeline is always shown"
+    # The plot is inline SVG referencing palette slots, never a hex literal — the light/dark swap lives in
+    # the stylesheet.
+    assert "var(--series-1)" in explorer, explorer[:400]
+
     # Logging out invalidates the cookie the browser is holding.
     logged_out = web_curl("-X POST http://localhost/logout", cookie=cookie)
     assert http_status(logged_out) == 303, logged_out

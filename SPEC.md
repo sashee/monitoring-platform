@@ -1364,6 +1364,38 @@ Web interface (§14), at the router level over a temp-file database:
 - The three credential domains are mutually distinct, and an API key and a session token from the same
   source bytes hash differently — the database-level half of the separation above.
 
+The origin check (§14.3.1), as pure functions over the two header values plus router-level tests:
+
+- A matching host:port passes; **a different port on the same host fails**, which is the loopback case the
+  check exists for and the one `SameSite` cannot see. An absent or `null` `Origin` fails, an empty `Host`
+  matches nothing, a default port is not normalised away, and the scheme is ignored.
+- Router level: each mutation is refused with a bad or missing `Origin` **and the database is unchanged**;
+  `/login` is refused as forged rather than as wrong credentials, so the check demonstrably runs first;
+  `GET` is unaffected.
+
+User and session management (§14.1):
+
+- A created user can then **log in** — which is what proves the form stored a hash the login path accepts,
+  since a create that wrote an unusable one looks identical up to that point. A duplicate username is a
+  message, not a 500. A blank or whitespace-only username is refused.
+- Deleting the last user is refused and it survives. Deleting your own user logs you out, and the cascade
+  leaves no session behind. Ending another session invalidates that cookie and leaves yours working;
+  ending your own logs you out.
+
+The explorer (§14.9):
+
+- An attribute filter narrows the table. A numeric field renders a line; an all-text type renders the
+  timeline and offers no chart field at all. Sixteen groups render exactly eight series, use all eight
+  slots and never a ninth, and the legend lists them in **numeric** order (1–8, not 1, 10, 11 …).
+- Switching type drops the previous type's filters and the new type's rows appear.
+- Partial coverage is reported whether or not markers were drawn, since markers are dropped on precisely
+  the dense charts that have most buckets to be partially covered.
+- An empty range says so rather than rendering an axis with nothing on it. Device-supplied group labels
+  cannot break out of the SVG.
+- Rendering is checked as well as asserted: the generated SVG is parsed as XML, and the plots are read
+  against a copy of the deployed database rather than only against synthetic rows — the validator checks
+  colour, not layout.
+
 Deployment (§9.3, §10.3):
 
 - Config resolution order (§9.1): flag beats env beats `$STATE_DIRECTORY`/`$RUNTIME_DIRECTORY` beats
@@ -1800,17 +1832,32 @@ operator's own view, not a product surface: no dashboards, no charts, no JavaScr
 | `/login` | `GET` | none | the form |
 | `/login` | `POST` | none | success → `303` to `/` with a session cookie; failure → the form again, `401` |
 | `/logout` | `POST` | session | delete the row, clear the cookie, `303` to `/login` |
-| `/` | `GET` | session | the 50 most recent measurements |
-| `/users` | `GET` | session | the `web_user` table |
+| `/` | `GET` | session | the measurement explorer (§14.9) |
+| `/users` | `GET` | session | the `web_user` table, with a create form |
+| `/users/create` | `POST` | session | `username` + `password` → a new user |
+| `/users/delete` | `POST` | session | `username` → that user and their sessions |
 | `/sessions` | `GET` | session | the `web_session` table |
+| `/sessions/end` | `POST` | session | `id` → delete that session |
 
-The front page reuses §7's `QuerySpec` and query builder unchanged — a second SQL path for the same
-question would be a second thing to keep correct. It is deliberately **not** paginated: §7.1's cursor
-exists for a client walking the whole table, and this page answers "what is arriving", which the newest
-fifty answers. A page that grows a cursor is a page whose links carry state.
+Every mutation is a `POST` and answers `303` back to the page it came from, so a reload does not
+resubmit. None is a link: a `GET` that changes something is a URL a prefetcher or an `<img src>` can
+fire. All of them additionally require a matching `Origin` (§14.3.1).
 
-`/logout` is `POST`, never `GET`: a `GET` that logs you out is a link a prefetcher or an `<img src>` can
-fire, and `SameSite=Strict` is no defence against a same-site prefetch of your own page.
+Three guard rails, none of them about privilege — a session is full authority (§14.3) — and all about
+not locking yourself out:
+
+- **The last remaining user cannot be deleted.** Checked in the handler on the same connection as the
+  delete, not merely hidden in the rendering: the page whose button was pressed may be minutes old.
+  Recovery would otherwise mean ssh.
+- **Deleting your own user ends your own session**, since `web_user` deletion cascades to `web_session`
+  in code (§14.8). The response is the login form, because a redirect to a page the browser can no
+  longer load would read as a loop.
+- **Ending your own session is allowed** and is simply logout by another route. It is on the list like
+  any other, and it is the one a reader is most likely to want gone; refusing it would be surprising.
+
+A failed mutation renders its page with the message rather than redirecting — a `303` cannot carry one
+without a query parameter or server-side flash state, and `?error=…` is a reflected string in a URL that
+gets pasted around.
 
 **Every URL the server emits is root-relative.** The receiver listens on a unix socket and the browser
 reaches it through a tunnel and a local TCP shim (§14.5), so the `Host` it sees is whatever that shim is
@@ -1862,10 +1909,6 @@ goes if a host ever needs to differ.
 Stated rather than left implicit, because each of these is a deliberate stop and would otherwise read as
 an oversight:
 
-- **No CSRF token.** `SameSite=Strict` means a forged cross-site request carries no cookie, so the
-  handler has nothing to act on. Sufficient while login and logout are the only state-changing
-  endpoints. **The moment a page grows a form that changes something worth forging** — deleting a user,
-  revoking a key — a token belongs here.
 - **No login rate limiting, and no lockout.** The password is 2^n of the operator's own choosing, not a
   human-memorable string, so online guessing is not the threat model (§14.7). A lockout would also be a
   denial-of-service on the only account.
@@ -1875,6 +1918,53 @@ an oversight:
   one operator whose username is not secret, closing that would be machinery guarding nothing.
 - **No password change page.** `create-user` and `delete-user` are the interface; a form would need the
   old password, a confirmation field and a re-login path, for something done about once.
+- **A session is full authority.** Creating and deleting users needs nothing beyond being logged in — no
+  re-entered password. So a stolen cookie can mint a second login and make its access outlive the
+  session. Accepted deliberately for a single operator: that cookie already reads every measurement and
+  every credential id, and the realistic ways it leaks (a shared laptop, a local process) are ones a
+  re-auth prompt on one form does not close. Re-authentication is the thing to add first if this ever
+  serves more than one person.
+
+### 14.3.1 CSRF: an origin check, because `SameSite` is not enough here
+
+The previous revision of §14.3 rested the whole CSRF story on `SameSite=Strict`, on the grounds that a
+forged cross-site request then carries no cookie, and noted that a token would be needed *"the moment a
+page grows a form that changes something worth forging"*. §14.1's user and session mutations are that
+moment — and re-examining it turned up a reason that is specific to how this service is reached, not
+merely a matter of diligence:
+
+**`SameSite` does not consider the port.** The browser reaches these pages at `http://127.0.0.1:8080`
+through the tunnel shim (§14.5), so *anything else* served from `127.0.0.1` — any port, any other
+development server on the same laptop — is **same-site**. A page on `127.0.0.1:3000` can therefore
+`POST /users/delete` and the browser will attach the session cookie. On a real domain this attack needs
+control of a subdomain; on loopback it needs any local process that can serve a page.
+
+**Every state-changing request must prove its origin.** `Origin` must be present, and its host:port must
+equal the `Host` header. Enforced by one middleware over all `POST` routes, `/login` and `/logout`
+included — login CSRF is a real if minor attack, and *"every state-changing request proves its origin"*
+stays true as routes are added, where *"the mutating ones do"* is a rule someone has to remember to
+extend. `GET` is not checked: it changes nothing, and a browser following a bookmark sends no `Origin`.
+
+**Why this rather than a synchronised token**, which is the conventional answer:
+
+- **There is no canonical origin to compare against.** The receiver listens on a unix socket and is
+  reached through whatever port the shim happens to bind, so any expected origin baked into the
+  configuration would be wrong for some legitimate way of reaching it. `Origin` against `Host` needs no
+  such constant — both headers describe the same hop, so the check is self-consistent however the
+  request arrived, and it is sufficient because an attacker's page carries *its own* origin.
+- **It is stateless.** Nothing to mint, store, expire, or thread through every form.
+
+The scheme is deliberately not compared: `Host` carries none, requiring `https` would break the
+plain-HTTP loopback path this is reached over today, and requiring `http` would break TLS tomorrow. What
+matters for CSRF is the authority.
+
+The cost is that a command-line client must now send the header:
+
+```sh
+curl -H 'Origin: http://localhost' --unix-socket … -X POST …
+```
+
+A token becomes worth adding only if a client that cannot send `Origin` ever needs to `POST`.
 
 ### 14.4 The two credentials do not cross
 
@@ -1962,7 +2052,9 @@ the password need not be typed where it can be seen.
 ### 14.8 Schema
 
 Version **3.1** — the first minor bump under §6.2, and the reason that scheme was introduced before this
-section was written. Two new tables and one index; nothing that a 3.0 binary reads or writes is touched,
+section was written. **Everything in §14.1's mutations and §14.9's explorer is queries and rendering over
+these same two tables**, so the version has not moved since: nothing after 3.1 has needed a schema change,
+and a deploy of that work is a plain binary swap. Two new tables and one index; nothing that a 3.0 binary reads or writes is touched,
 so a receiver reverted to 3.0 by the nightly upgrade starts against this database, ignores both tables,
 and serves measurements exactly as before.
 
@@ -1996,3 +2088,139 @@ work would buy nothing. A second writer against a live receiver is already estab
 `create-api-key` does exactly this — because WAL admits one and `busy_timeout` covers the overlap. Those
 writes use a connection that **does not migrate**, so a login can never be the thing that discovers the
 schema needs upgrading.
+
+### 14.9 The measurement explorer
+
+`GET /` with everything driven by the query string. With no parameters it shows the newest measurements
+across all types; with a type chosen it offers that type's attributes as filters and its numeric body
+leaves as chartable fields.
+
+```
+/?type=bms.status.cell&range=24h&attr.record.attributes.cell=3&field=voltage_volts&group=record.attributes.cell
+```
+
+**State is in the URL, not the browser.** With no scripting, "which type is selected" is a fact about
+the query string, re-read and re-rendered into the controls on every request. Every view is therefore a
+link that can be bookmarked or pasted, which is worth more here than it costs.
+
+**One filter row, above everything it scopes.** Range first (presets `15m … 30d`, `all`, or explicit
+`from`/`to`), then type, then that type's attributes, then the chart field and the split-by key. Both
+plots and the table re-render against the same slice, so the numbers below always agree with the picture
+above; per-chart filters would let them disagree.
+
+Two details that only exist because there is no JavaScript:
+
+- **An empty value is not a filter.** A `GET` form submits every control it holds, so an unset `<select>`
+  arrives as `field=`. Treating that as "filter where the field is empty" would make clearing a filter
+  impossible.
+- **A hidden `t0` field carries the type the form was rendered for.** The filter row is one form, so
+  changing the type resubmits the *previous* type's attribute selects — keys the new type does not have,
+  which would return an empty page with no hint why. A `t0` mismatch means the reader just changed the
+  type, and the attribute filters, field and grouping are dropped with it.
+
+Unknown parameters are **ignored** here, unlike §7.1's read API which rejects them. A device with a typo
+in a filter name deserves an error; a person following a stale bookmark deserves a page.
+
+#### Facets: what there is to filter on
+
+Discovery reads the newest `FACET_SCAN_LIMIT` (2000) rows **matching the current type, window and
+already-applied filters** — not the whole table, and not globally.
+
+Scoping to the current slice is more useful *and* cheaper than a global list: a dropdown can never offer
+an option that matches nothing in view, and the cost is bounded by the window already being queried.
+Sampling rather than scanning is about growth, not about today — a full scan of the largest type measures
+145 ms now, but this host projects millions of rows a year, and the same page would take seconds within a
+year of running. What makes it sound is that **attribute keys are uniform per type**: all 32,112
+`bms.status.cell` rows carry the same twelve keys, so a few hundred rows reveal every one.
+
+**Only discovery is sampled. Filtering is always exact** over the whole window — facets populate the
+controls, they never restrict what a query returns. When the cap is reached the page says so, because
+distinct *values* can be missed where keys cannot: a device that stopped reporting early in a long
+window.
+
+A key with more distinct values than a dropdown can carry (`MAX_FACET_VALUES`, 40 — a boot id, a clock
+correction in nanoseconds) is offered as a text box instead. Nested attributes are not offered at all,
+since §7.1 makes them unfilterable and an option that cannot work is worse than none.
+
+#### The plots
+
+Two, stacked, sharing an x axis and **never a y axis**. Two measures on one plot means two arbitrary
+scales and an invented correlation; two measures means two plots.
+
+- **Timeline — always.** A column chart of matching measurements per bucket. It works for every type
+  including the all-text ones (`system.unit` state changes, BLE scans), and answers "when did these
+  arrive", which is the only question such a type can be asked.
+- **Value chart — when a numeric field is chosen.** A 2 px line of the **average per bucket**, with a
+  translucent **min/max band** behind it in the same hue. The band is not decoration: every point is an
+  average, and a bare line would imply a smoothness the samples never had.
+
+**Bucketing is what makes this bounded.** 24 h of `bms.status.cell` is ~23,000 rows, far past `MAX_LIMIT`
+and far past useful pixel density. Instead `SERIES_BUCKETS` (240) buckets span the window and SQLite
+aggregates to `count(*)`, `count(<field>)`, `avg`, `min`, `max` — output bounded by buckets × series
+regardless of window, measured at 131 ms for 16 series over 24 h.
+
+Two guards in that query carry most of the correctness:
+
+- **The field is aggregated only where it is numeric.** `json_extract` on a text leaf returns text and
+  SQLite's `avg()` coerces text to 0, so without a `json_type` guard a chart of a text field would render
+  a confident flat line at zero rather than nothing at all.
+- **`count(*)` and `count(<field>)` are both returned**, and where they differ the page says so.
+  `system.unit.active_enter_seconds_ago` is null on more than half its rows; an average over 5,652 of
+  12,166 rows is a different claim from an average over all of them. This is stated as a note under the
+  chart rather than only in a mark's tooltip, because marks are dropped on a dense chart — exactly when
+  there are most buckets to be partially covered.
+
+#### Series, colour and the cap
+
+| Series | Treatment |
+|---|---|
+| 1 | one hue, **no legend** — the heading names it |
+| 2–8 | the palette's slots in fixed order, legend always present, ≤4 also direct-labelled at the line end |
+| >8 | the first 8 by sorted group value, and a visible "showing 8 of N" note |
+
+Never a ninth generated hue: past eight, adjacent colours are indistinguishable under colour-vision
+deficiency and the palette's separation guarantees stop holding. Small multiples are the better answer
+beyond the cap and are deliberately deferred.
+
+**Colour follows the group, not its rank.** Slots are assigned by position in the *sorted* list of group
+values, so filtering one group out cannot repaint the others — a reader who learned that cell 3 is aqua
+must not find it orange after narrowing. Sorting is **numeric when every value is a number**, which is
+not cosmetic: lexicographically the sixteen BMS cells order 1, 10, 11 … 16, 2, 3, so "the first eight"
+would be cells 1 and 10–16 rather than 1–8.
+
+The palette is a documented instance used unchanged and in its published order — the order *is* the
+CVD-safety mechanism — and it was validated with a checker rather than by eye: all gates pass for eight
+slots in both modes (worst adjacent CVD ΔE 9.1 light / 8.4 dark against a ≥8 target; worst normal-vision
+19.6 / 19.3 against a ≥15 floor). Three light-mode slots sit below 3:1 on the light surface, which
+obliges *relief* — the values must be legible without the colour. **The measurements table under the
+plots is that relief**, which is why it is not collapsible.
+
+Colours are emitted as `var(--series-N)`, never as hex, so the light and dark values live in the
+stylesheet and a plot cannot be rendered in the wrong mode's palette. Dark is a selected set of steps for
+the dark surface, not an inversion of the light values.
+
+#### Three departures from what an interactive chart would do
+
+All follow from §14.6's no-JavaScript rule, and each is a trade rather than an omission:
+
+- **No crosshair or hover readout.** Each mark carries an SVG `<title>`, which browsers render as a
+  native tooltip with no scripting. The property that matters — *a tooltip must never be the only way to
+  read a value* — holds because the table below carries every value.
+- **No zoom or pan.** The range control re-queries instead, which is more honest: zooming a bucketed plot
+  would show more pixels of the same averages.
+- **Monospace rather than a UI sans.** It is the established look of these pages, suits the hex-id and
+  JSON-heavy tables, and gives tabular figures on axis ticks for free.
+
+#### Rendering
+
+`web::svg` is pure — data in, a `String` of markup out — so scales, tick selection and path building are
+ordinary unit-tested functions. Ticks are round: values on a 1 / 2 / 5 × 10ⁿ ladder, instants on a fixed
+ladder of 1 s … 30 d steps aligned to the epoch, because those are the only intervals that land on round
+wall-clock times.
+
+**A bucket with no value breaks the line rather than being interpolated across.** Joining across a gap
+draws a straight line through a period when nothing was reported, which is the most common way a
+time-series chart lies.
+
+SVG is XML, so the same escaping applies as in §14.6: an unescaped `<` in a group label — and group
+labels are device-supplied — is as dangerous in a `<title>` as in an element body.

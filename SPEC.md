@@ -30,6 +30,8 @@ In scope:
 - Mapping OTLP log records to measurements.
 - Persistence in a single SQLite table.
 - A read HTTP API (JSON) over the same Unix socket, for listing and filtering measurements.
+- A browser interface on that same socket — login, the recent measurements, and the credential
+  tables — for one operator (§14).
 - Unix domain socket transport with sane lifecycle handling.
 
 Explicitly out of scope for the PoC (see §12 for what this defers):
@@ -39,8 +41,9 @@ Explicitly out of scope for the PoC (see §12 for what this defers):
 - OTLP/gRPC and OTLP/JSON encodings.
 - Request compression other than `gzip` (no `zstd`, no `deflate`), and response compression of
   any kind.
-- Authorization, TLS, multi-tenancy. (Authentication *is* handled — see §13. A key is either valid or
-  not; there are no scopes, and no key is tied to a device or a tenant.)
+- Authorization, TLS, multi-tenancy. (Authentication *is* handled — API keys in §13, an operator login
+  in §14. A key is either valid or not; there are no scopes, no roles, and no key or user is tied to a
+  device or a tenant.)
 - Retention, downsampling, compaction. (Deduplication *is* handled — see §6.6.)
 - Rate limiting, load shedding and `429` throttling with `Retry-After`. (`503` *is* returned for
   storage failure — see §4.1 — but never as a backpressure signal.)
@@ -545,6 +548,15 @@ denote 1.0, 2.0 and 3.0. Under the rule above, 3.0 only added `api_key` and *wou
 but it is already deployed, and renumbering a database in the field buys nothing. The scheme applies
 from here on; this is not an inconsistency to go and fix.
 
+The versions that exist:
+
+| | added | kind |
+|---|---|---|
+| 1.0 | `measurement`, keyed by rowid | — |
+| 2.0 | content-addressed ids (§6.6): `measurement` dropped and recreated | major, and the illustration of why majors exist |
+| 3.0 | `api_key` (§13) | additive, but shipped as a single number |
+| 3.1 | `web_user`, `web_session` (§14) | **minor** — the first under this scheme |
+
 ### 6.3 Write path
 
 A single dedicated writer owns the write connection; nothing else holds it. Requests reach it over
@@ -773,7 +785,9 @@ listener; `axum::serve` accepts `tokio::net::UnixListener` directly. Adding iroh
 
 ### 9.1 CLI
 
-Single binary, two subcommands:
+Single binary. `serve` and `wait-for-clock` are the deployment surface and are specified below; the
+credential commands belong to the sections that define what they manage — API keys in §13.3, web users
+and sessions in §14.7.
 
 ```
 monitoring-platform serve
@@ -793,6 +807,25 @@ monitoring-platform wait-for-clock       # the §9.4 boot gate; exit 1 if the cl
   --consecutive <n>          [MP_CLOCK_CONSECUTIVE]          default 3
   --log-level <level>        [MP_LOG_LEVEL]       default info
 ```
+
+```
+monitoring-platform create-api-key --label <name>   # §13.3; prints the token to stdout once
+monitoring-platform list-api-keys                   # §13.3
+monitoring-platform create-user --username <name>   # §14.7; password on stdin, never in argv
+monitoring-platform list-users                      # §14
+monitoring-platform list-sessions                   # §14
+monitoring-platform delete-user --username <name>   # §14; removes their sessions too
+```
+
+All six take `--db` and `--log-level` with the same defaults as `serve`, and all six log to **stderr**
+rather than stdout: for `create-api-key` stdout *is* the token, so `TOKEN=$(… create-api-key …)` must not
+capture migration lines, and the rest follow it so the set is consistent. The listings print to stdout,
+since that is their output.
+
+Sharing `--db`'s resolution with `serve` is what stops a key or a user being written to a different file
+from the one the receiver reads — with `--db` unset and `STATE_DIRECTORY` exported for the service but
+not for an operator's shell, that is exactly the mistake available to make, so both creation commands
+warn when the database does not already exist.
 
 `wait-for-clock` is run as the service's `ExecStartPre`, and is useful on its own to diagnose a
 host that will not start monitoring: it logs the measured error on both the success and the
@@ -1056,7 +1089,8 @@ Approaches considered and rejected, recorded so they are not reinvented:
 ```
 src/
   main.rs              CLI, wiring, signal handling, shutdown ordering
-  lib.rs               AppState
+  lib.rs               AppState, random_bytes
+  auth.rs              pure: API key, session token and password identity (§13, §14)
   bin/
     mp-make-sample.rs  writes a sample OTLP batch, posts one with --post, or stamps a
                        different --device-id; a shipped bin, not an example, so the VM
@@ -1069,19 +1103,29 @@ src/
     anyvalue.rs        pure: AnyValue -> serde_json::Value
     test_support.rs    OTLP payload builders, shared by unit and integration tests
   store/
-    schema.rs          migrations, pragmas
+    schema.rs          version encoding, migrations, pragmas
     write.rs           writer task, insert_batch
     read.rs            query building, JSON path builder, row mapping
+    keys.rs            the api_key table (§13)
+    users.rs           the web_user table (§14)
+    sessions.rs        the web_session table (§14)
   api/
-    mod.rs             Router construction
+    mod.rs             Router construction, and which credential guards what
+    auth.rs            API key middleware (§13)
     ingest.rs          POST /v1/logs: limits, decompression, conversion
     query.rs           GET /v1/measurements, /healthz
     status.rs          google.rpc.Status + the non-protobuf error rewrite layer
+  web/                 the browser interface (§14)
+    mod.rs             routers and handlers
+    html.rs            pure: escaping and page rendering
+    session.rs         pure cookie format + the session middleware
   transport/
     uds.rs             the receiver's name for mp-host::uds
 tests/
   ingest.rs            router-level OTLP ingest
   read_api.rs          router-level read API
+  auth.rs              router-level API key enforcement (§13)
+  web.rs               router-level login, guard and credential separation (§14)
   end_to_end.rs        the compiled binary over a real socket, incl. SIGTERM
 crates/                see collector-clock-correction-design.md for these two
   mp-host/             clock and socket primitives shared by both binaries
@@ -1293,6 +1337,32 @@ Integration tests:
   `/healthz` *and* `/v1/measurements`, and leaves `user_version` untouched. The end-to-end shape is
   the point on the second one — what has to hold is that the process comes up and serves, which is
   the case a reverted deployment lands in.
+
+Web interface (§14), at the router level over a temp-file database:
+
+- The login form and `/healthz` answer with no credential at all; every other page redirects to
+  `/login` and its body does **not** contain what it would have shown.
+- A correct password answers `303` with a cookie and a row; a wrong one answers `401` with neither.
+  An unknown username and a wrong password produce byte-identical responses, so the form is not an
+  oracle for which usernames exist.
+- The cookie carries `HttpOnly`, `SameSite=Strict`, `Path=/` and a `Max-Age` matching the row — and
+  **not** `Secure`, which is pinned in both the unit and the integration tests because adding it would
+  silently make every request after login anonymous (§14.2).
+- A cookie is refused when it names no session, when it names a real session with the wrong secret
+  (so the public id on the sessions page is not itself a credential), when it is malformed, and when
+  the session has expired. Logging in sweeps what expired; logging out deletes the row and the same
+  cookie stops working. `GET /logout` is `405` and leaves the session intact.
+- A password containing `&`, `+` and `%` survives form encoding, so a login that works from `curl`
+  also works from a browser.
+- **The credentials do not cross, in both directions** (§14.4): a session cookie gets `401` on
+  `/v1/measurements` *and* on `/v1/logs` with nothing written, and a valid API key gets `303` on every
+  page with no user data in the body. Plus the control — that the same key still works on `/v1` — so
+  the previous assertion cannot pass merely because the key was invalid.
+- A measurement whose `type`, body and attribute key are all `<script>alert('x')</script>` renders
+  escaped, with no `<script>` anywhere in the page. Unit tests cover `escape` directly, including that
+  it cannot be broken out of either quote form in an attribute and that it does not double-escape.
+- The three credential domains are mutually distinct, and an API key and a session token from the same
+  source bytes hash differently — the database-level half of the separation above.
 
 Deployment (§9.3, §10.3):
 
@@ -1713,3 +1783,216 @@ the batch stays at the front of the outbox and is retried on the backoff. That i
 a fixable misconfiguration — the telemetry survives being wrong about a key — but it means the outbox
 grows for the duration, bounded only by `buffer_max_records` counted in *batches* and by memory. A
 device left misconfigured long enough will be OOM-killed rather than shed.
+
+## 14. Web interface
+
+A browser-facing view of the data, and the login that guards it. Server-rendered HTML on the same
+router and the same socket as everything else, sharing the database and **nothing else — in particular
+not the credential**.
+
+This exists because there was no way to look at the measurements without a shell and `curl`. It is one
+operator's own view, not a product surface: no dashboards, no charts, no JavaScript, no build step.
+
+### 14.1 Pages
+
+| Route | Method | Auth | |
+|---|---|---|---|
+| `/login` | `GET` | none | the form |
+| `/login` | `POST` | none | success → `303` to `/` with a session cookie; failure → the form again, `401` |
+| `/logout` | `POST` | session | delete the row, clear the cookie, `303` to `/login` |
+| `/` | `GET` | session | the 50 most recent measurements |
+| `/users` | `GET` | session | the `web_user` table |
+| `/sessions` | `GET` | session | the `web_session` table |
+
+The front page reuses §7's `QuerySpec` and query builder unchanged — a second SQL path for the same
+question would be a second thing to keep correct. It is deliberately **not** paginated: §7.1's cursor
+exists for a client walking the whole table, and this page answers "what is arriving", which the newest
+fifty answers. A page that grows a cursor is a page whose links carry state.
+
+`/logout` is `POST`, never `GET`: a `GET` that logs you out is a link a prefetcher or an `<img src>` can
+fire, and `SameSite=Strict` is no defence against a same-site prefetch of your own page.
+
+**Every URL the server emits is root-relative.** The receiver listens on a unix socket and the browser
+reaches it through a tunnel and a local TCP shim (§14.5), so the `Host` it sees is whatever that shim is
+bound to. An absolute URL would work from exactly one vantage point.
+
+### 14.2 Sessions and the cookie
+
+A session token has the same two-half shape as an API key (§13.1) and for the same reasons — public id
+looked up first, only `blake3(domain ‖ secret)` stored — with a distinct `mps_` prefix and a distinct
+domain. Both distinctions are load-bearing. The prefix means a secret scanner can tell which credential
+leaked and that a cookie can never be mistaken for a key; the separate domain means the same 32 bytes
+presented as a cookie and as a bearer token hash *differently*, so one stored hash cannot authenticate on
+both surfaces. Without that, §14.4's separation would hold in the router and leak through the database.
+
+```
+Set-Cookie: mp_session=mps_<id>.<secret>; HttpOnly; SameSite=Strict; Path=/; Max-Age=2592000
+```
+
+- `HttpOnly` — script cannot read it, so an injection anywhere in these pages cannot exfiltrate the
+  session. Escaping (§14.6) is the first line of that; this is the second.
+- `SameSite=Strict` — not sent on any cross-site request, which is what makes a forged submission from
+  another origin arrive with no session at all. This is also the entire CSRF story; see §14.3.
+- `Max-Age` — matched to the row's `expires_at`, so the browser stops presenting a cookie at the same
+  moment the server stops accepting it. Without it the cookie dies with the window, which is a
+  different lifetime.
+- **No `Secure`, and that is deliberate.** The browser reaches this over plain HTTP on loopback
+  (§14.5). `Secure` would tell it to withhold the cookie from an `http://` origin, so login would
+  appear to succeed and every subsequent request would be anonymous — a failure that looks like a bug
+  in the session layer. What stands in for it is the shape of the path: the only network hop is iroh's
+  QUIC, encrypted and authenticating the far endpoint by its id, and either end of it is loopback or a
+  unix socket inside a 0750 group-owned directory. **Adding `Secure` is what to do the day this is
+  served over TLS, and not before.**
+
+**Expiry is absolute**, thirty days from creation, and never moves. A sliding window would mean writing
+to the database on every page load to record activity nothing reads — turning the read path into a
+writer, which for a receiver whose single storage writer carries measurement throughput is a poor trade
+for a one-operator UI. There is no `last_seen_at` column for the same reason.
+
+Expired rows are swept opportunistically at the next login, not by a timer: a login is the only moment
+the table can grow. An expired row left lying around is inert regardless — the expiry check is what
+decides, not the row's presence.
+
+The TTL is a constant in code, not a module option. Nothing depends on the value, and `nix/module.nix`
+gaining a knob nobody turns is a thing to explain later; `sessionTtlDays` beside `logLevel` is where it
+goes if a host ever needs to differ.
+
+### 14.3 What is *not* defended, and why
+
+Stated rather than left implicit, because each of these is a deliberate stop and would otherwise read as
+an oversight:
+
+- **No CSRF token.** `SameSite=Strict` means a forged cross-site request carries no cookie, so the
+  handler has nothing to act on. Sufficient while login and logout are the only state-changing
+  endpoints. **The moment a page grows a form that changes something worth forging** — deleting a user,
+  revoking a key — a token belongs here.
+- **No login rate limiting, and no lockout.** The password is 2^n of the operator's own choosing, not a
+  human-memorable string, so online guessing is not the threat model (§14.7). A lockout would also be a
+  denial-of-service on the only account.
+- **Username existence is observable by timing.** An unknown username returns before any hashing
+  happens, so it is measurably faster than a wrong password. The *response* is identical either way —
+  one message for every failure, so the form is not an oracle — but the timing is not equalised. With
+  one operator whose username is not secret, closing that would be machinery guarding nothing.
+- **No password change page.** `create-user` and `delete-user` are the interface; a form would need the
+  old password, a confirmation field and a re-login path, for something done about once.
+
+### 14.4 The two credentials do not cross
+
+There are now two credentials, and each works only on the surface it belongs to:
+
+| routes | credential | a refusal looks like |
+|---|---|---|
+| `/v1/logs` | API key | protobuf `google.rpc.Status`, as §4.1.1 requires |
+| `/v1/measurements` | API key | JSON, matching the read API's own errors |
+| `/`, `/users`, `/sessions`, `/logout` | session cookie | `303` to `/login` |
+| `/login`, `/healthz` | none | — |
+
+Enforced structurally rather than by a check: each group carries its own middleware, applied to that
+router and not around the merge. The session layer never reads `Authorization`; the API-key layer never
+reads `Cookie`. So a session cannot reach an OTLP endpoint and a device's key cannot open the
+operator's pages. **Hoisting either layer out to wrap the merge would quietly end that**, which is why
+`tests/web.rs` and `nix/tests/cases/web-ui.nix` both assert it in both directions.
+
+The web layer answers `303` where the API layer answers `401`, and the divergence is deliberate: a
+`401` with a `WWW-Authenticate` challenge makes a browser show its native basic-auth dialog, which for
+a form-based login is a dead end. §13's clients are not browsers, so they keep the challenge RFC 7235
+requires.
+
+A database that cannot be *read* answers `503`, not a redirect — the same distinction §13.0 draws.
+Bouncing to a login form that would fail the same way is a redirect loop.
+
+### 14.5 How a browser reaches it
+
+The receiver does not listen on TCP. `RestrictAddressFamilies=AF_UNIX` (§9.2) is unchanged by this
+section, and no new listener appears on the host. The browser reaches the socket through machinery that
+already exists on the deployment side:
+
+```
+browser → http://127.0.0.1:PORT
+socat TCP-LISTEN:PORT → UNIX-CONNECT:<tunnel socket>
+  iroh-uds-connect ══ iroh QUIC ══> iroh-uds-listen (on the host)
+    → /run/monitoring-platform/monitoring-platform.sock
+```
+
+That the origin is plain `http://` on loopback is what §14.2 turns on. Serving this over TLS instead
+would mean a reverse proxy or a TCP listener, and either is a change to §9.2's sandbox — a reviewed
+edit, not a consequence of this section.
+
+### 14.6 Rendering
+
+Hand-written HTML in `format!`, with inline CSS and no static-file route. A templating crate would be a
+dependency, a build-time asset path and a second language to debug, for string interpolation `format!`
+already does — the same trade §4.1.1 makes in declaring one protobuf message by hand rather than
+pulling in `tonic-types`. A `/static/` route would be a path-handling surface (traversal, content
+types, caching) for a page whose entire styling is a monospace font and some borders.
+
+The cost is that escaping is the application's job, so `web::html::escape` is the load-bearing function
+and is unit-tested as such — the same reasoning as §7.1's JSON path builder. It escapes all five of
+`& < > " '`, so one function is correct in element content *and* in an attribute value; a function safe
+in only one position is an invitation to use it in the other.
+
+This is not hypothetical. A device is free to send `<script>` as an `event_name` or an attribute key,
+and §5.2 stores both verbatim by design — nothing upstream of the rendering rejects it.
+
+### 14.7 Passwords
+
+Stored as `blake3(password domain ‖ password)`. §13.2's argument for a fast hash carries over, **but
+only because of how the password is chosen**: it is one operator's own high-entropy secret, not a
+human-memorable string, so there is no small space to search and nothing a slow KDF would buy. The
+moment a second user picks a password they can remember that stops being true, and `auth::hash_password`
+is where argon2 belongs. Written down rather than left as an inherited assumption.
+
+Hashed as exactly the bytes supplied — no trimming, no Unicode normalization. A trailing space is part
+of the secret. A hash that silently disagreed with what was typed would be unrecoverable, since only
+the hash is kept.
+
+`create-user` reads the password from **stdin, never from a flag or an environment variable**:
+`/proc/<pid>/cmdline` and `/proc/<pid>/environ` are world-readable, so either would publish it to every
+process on the host for as long as the command runs, and land it in shell history besides. The same
+reasoning as the collector's `apiKeyFile` (§13.4).
+
+```sh
+printf %s "$PASSWORD" | monitoring-platform create-user --db <path> --username sashee
+```
+
+There is no terminal echo suppression: that needs `termios` raw-mode handling with a restore-on-signal
+path, or a Ctrl-C leaves the operator's shell echo-less, and piping is the documented usage precisely so
+the password need not be typed where it can be seen.
+
+### 14.8 Schema
+
+Version **3.1** — the first minor bump under §6.2, and the reason that scheme was introduced before this
+section was written. Two new tables and one index; nothing that a 3.0 binary reads or writes is touched,
+so a receiver reverted to 3.0 by the nightly upgrade starts against this database, ignores both tables,
+and serves measurements exactly as before.
+
+```sql
+CREATE TABLE web_user (
+  username      TEXT    PRIMARY KEY,
+  password_hash BLOB    NOT NULL,
+  created_at    INTEGER NOT NULL
+) STRICT;
+
+CREATE TABLE web_session (
+  id          TEXT    PRIMARY KEY,
+  secret_hash BLOB    NOT NULL,
+  username    TEXT    NOT NULL,
+  created_at  INTEGER NOT NULL,
+  expires_at  INTEGER NOT NULL
+) STRICT;
+
+CREATE INDEX web_session_expires_at_idx ON web_session (expires_at);
+```
+
+`web_`-prefixed rather than `user`/`session` because §6.5 keeps a Postgres migration open and `user` is
+reserved there. No `revoked_at` on `web_session`: logging out deletes the row, exactly as revoking a key
+does (§13). No foreign key from `web_session.username`, because §6.1 sets no `foreign_keys` pragma — the
+constraint would be parsed and never enforced, which is worse than not declaring it, so `delete-user`
+does the cascade by hand and says so.
+
+Sessions are created and deleted on the request path, not through the storage writer: they are single
+statements on their own tables rather than measurement batches, so teaching the writer a second kind of
+work would buy nothing. A second writer against a live receiver is already established as safe — §13.3's
+`create-api-key` does exactly this — because WAL admits one and `busy_timeout` covers the overlap. Those
+writes use a connection that **does not migrate**, so a login can never be the thing that discovers the
+schema needs upgrading.

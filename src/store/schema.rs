@@ -81,7 +81,21 @@ impl std::fmt::Display for Version {
 }
 
 /// Schema version this binary understands. Tracked in `PRAGMA user_version`.
-pub const SCHEMA_VERSION: Version = Version::new(3, 0);
+pub const SCHEMA_VERSION: Version = Version::new(3, 1);
+
+/// A compile-time guard, not a test, because it is an invariant about a constant and a build is the right
+/// place to lose an argument with one.
+///
+/// The deployed receiver runs 3.0, and only a *minor* is survivable by it (see [`Version`]) — so as long as
+/// this project's schema changes stay additive, this stays major 3. **Bumping the major is what breaks a
+/// reverted deployment**, reintroducing the permanent-startup-failure class the major/minor split was
+/// introduced to remove, so it needs a deliberate plan and not merely an edit: get the new major deployed
+/// through the pipeline before anything writes a database at it. Changing this line is that decision, and
+/// this assertion is what makes it a visible one.
+const _: () = assert!(
+    SCHEMA_VERSION.major == 3 && SCHEMA_VERSION.minor >= 1,
+    "a major bump strands every receiver still running the previous one; see SPEC.md §6.2"
+);
 
 /// One forward migration and the version it produces.
 struct Migration {
@@ -187,10 +201,65 @@ const MIGRATIONS: &[Migration] = &[
     ) STRICT;
     "#,
     },
+    // → version 3.1: the web interface's users and sessions (SPEC §14).
+    //
+    // **A minor bump, and it has to stay one.** Two new tables and one new index, and nothing touched
+    // that a 3.0 binary reads or writes — so a receiver reverted to 3.0 starts against this database,
+    // ignores both tables, and serves measurements exactly as before. That is the property the
+    // major/minor split was introduced for, and this is its first use; adding a column to
+    // `measurement` here instead would have made it a 4.0 and reintroduced the outage.
+    //
+    // `web_` prefixed rather than `user`/`session`, because §6.5 keeps a Postgres migration open and
+    // `user` is reserved there. Prefixing both keeps them named as a pair.
+    //
+    // `web_user` holds no email, no roles and no display name: there is one operator, and a column
+    // nothing reads is a thing to explain later rather than a feature (the same argument as
+    // `api_key`'s absent `revoked_at`). `password_hash` is 32 bytes of domain-separated blake3 — see
+    // crate::auth for why a fast hash is the right choice for a high-entropy secret.
+    //
+    // `web_session` mirrors `api_key` deliberately: `id` is the public half of the token verbatim, so
+    // an unissued id costs one index probe and no hashing, and `secret_hash` is the only record of
+    // the secret half. A stolen database therefore yields nothing that can log in.
+    //
+    // No `last_seen_at`. Touching it would make every page load a write, for information nothing
+    // acts on; `expires_at` is absolute, so the read path never writes at all.
+    //
+    // No `revoked_at` either: logging out deletes the row, exactly as revoking a key does.
+    //
+    // No foreign key from `web_session.username` to `web_user.username` — this schema sets no
+    // `foreign_keys` pragma (see `apply_pragmas`), so the constraint would be declared and not
+    // enforced, which is worse than not declaring it. Deleting a user deletes their sessions in
+    // `store::users::delete` instead, and says so.
+    //
+    // The index is on `expires_at` alone: the only query that scans rather than probing by id is the
+    // opportunistic sweep of expired sessions.
+    Migration {
+        version: Version::new(3, 1),
+        sql: r#"
+    CREATE TABLE web_user (
+      username      TEXT    PRIMARY KEY,
+      password_hash BLOB    NOT NULL,
+      created_at    INTEGER NOT NULL
+    ) STRICT;
+
+    CREATE TABLE web_session (
+      id          TEXT    PRIMARY KEY,
+      secret_hash BLOB    NOT NULL,
+      username    TEXT    NOT NULL,
+      created_at  INTEGER NOT NULL,
+      expires_at  INTEGER NOT NULL
+    ) STRICT;
+
+    CREATE INDEX web_session_expires_at_idx ON web_session (expires_at);
+    "#,
+    },
 ];
 
-/// No `foreign_keys` pragma: `measurement` and `api_key` are independent — a key is not an owner of
-/// the rows ingested with it — so enabling it would imply a constraint that does not exist.
+/// No `foreign_keys` pragma. `measurement` and `api_key` are independent — a key is not an owner of
+/// the rows ingested with it — so enabling it would imply a constraint that does not exist. The 3.1
+/// tables inherit that decision: `web_session.username` is not declared a foreign key, because a
+/// pragma left off means SQLite would parse the constraint and never enforce it, and a constraint that
+/// looks enforced but is not is worse than none. `store::users::delete` does the cascade by hand.
 fn apply_pragmas(conn: &Connection) -> Result<()> {
     // journal_mode returns a row, so it needs query_row rather than execute.
     let mode: String = conn
@@ -210,6 +279,33 @@ pub fn open_write(path: &Path) -> Result<Connection> {
         .with_context(|| format!("opening database {}", path.display()))?;
     apply_pragmas(&conn)?;
     migrate(&conn)?;
+    Ok(conn)
+}
+
+/// Opens a short-lived read-write connection to an **already-migrated** database.
+///
+/// For the handful of writes that do not go through the storage writer: creating a session at login,
+/// deleting one at logout (SPEC §14). Those are single statements on their own tables, not measurement
+/// batches, so routing them through the writer's channel would mean teaching it a second kind of work
+/// for no gain.
+///
+/// A second writer against a live receiver is already established as safe — `create-api-key` does
+/// exactly this against a running server (see `main.rs`): WAL admits one, and `busy_timeout` covers the
+/// overlap.
+///
+/// **Deliberately does not migrate**, which is the whole reason this exists rather than reusing
+/// [`open_write`]. A login is not a plausible moment to discover the schema needs upgrading, and on a
+/// receiver whose database is a newer minor than the binary (§6.2) re-running [`migrate`] per request
+/// would re-log its warning on every page load.
+pub fn open_write_existing(path: &Path) -> Result<Connection> {
+    let conn = Connection::open_with_flags(
+        path,
+        OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_URI | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .with_context(|| format!("opening database {} for writing", path.display()))?;
+    // No journal_mode: WAL is a property of the file and was set when it was created. busy_timeout is
+    // per-connection and is what makes concurrent writers wait rather than fail.
+    conn.pragma_update(None, "busy_timeout", 5_000)?;
     Ok(conn)
 }
 
@@ -342,10 +438,11 @@ mod tests {
     /// promise.
     #[test]
     fn a_zero_minor_is_stored_as_the_bare_major() {
+        // 3 is what was deployed before major.minor existed, and what a 3.0 database still holds.
         assert_eq!(Version::new(3, 0).encode(), 3);
         assert_eq!(Version::new(4, 0).encode(), 4);
-        assert_eq!(SCHEMA_VERSION.encode(), 3, "the version in the field must not move");
     }
+
 
     /// `decode` has to be total: `user_version` can be hand-edited to anything. The packed form of a
     /// zero minor is never written, but reading it must still give the same version.
@@ -493,21 +590,90 @@ mod tests {
         assert!(has_table(&conn, "api_key"));
     }
 
-    /// A database already at our exact version must not be written to at all. That is what keeps a
-    /// deployed 3.0 database readable by a binary from before major.minor existed, and therefore what
-    /// makes introducing the scheme a no-op on disk.
+    /// A database already at our exact version must not be written to at all.
     #[test]
     fn a_current_database_is_not_rewritten() {
         let conn = Connection::open_in_memory().unwrap();
-        conn.execute_batch(MIGRATIONS[0].sql).unwrap();
-        conn.execute_batch(MIGRATIONS[1].sql).unwrap();
-        conn.execute_batch(MIGRATIONS[2].sql).unwrap();
-        // The legacy form, exactly as every deployed database has it.
-        conn.pragma_update(None, "user_version", 3i64).unwrap();
+        migrate(&conn).unwrap();
+        let after_first = stored_version(&conn);
 
         migrate(&conn).unwrap();
 
-        assert_eq!(stored_version(&conn), 3, "a bare 3 must stay a bare 3");
+        assert_eq!(stored_version(&conn), after_first);
+        assert_eq!(after_first, SCHEMA_VERSION.encode());
+    }
+
+    /// The upgrade every deployed receiver actually performs: a database at the legacy bare `3` — 3.0,
+    /// with measurements and issued keys in it — gaining the §14 web tables. Nothing beside them may
+    /// be disturbed, since this runs against live data.
+    #[test]
+    fn migrating_from_version_3_0_adds_the_web_tables_and_keeps_everything_else() {
+        let conn = Connection::open_in_memory().unwrap();
+        for migration in MIGRATIONS.iter().filter(|m| m.version <= Version::new(3, 0)) {
+            conn.execute_batch(migration.sql).unwrap();
+        }
+        // The legacy form, exactly as every deployed database has it.
+        conn.pragma_update(None, "user_version", 3i64).unwrap();
+        conn.execute(
+            "INSERT INTO measurement (id, event_time, processed_time, type, attributes) \
+             VALUES (x'01', 1, 2, 'cpu', '{}')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO api_key (id, secret_hash, label, created_at) \
+             VALUES ('0000000000000001', x'00', 'pi-7', 1)",
+            [],
+        )
+        .unwrap();
+
+        migrate(&conn).unwrap();
+
+        assert!(has_table(&conn, "web_user"));
+        assert!(has_table(&conn, "web_session"));
+        assert_eq!(stored_version(&conn), Version::new(3, 1).encode());
+
+        let rows: i64 =
+            conn.query_row("SELECT count(*) FROM measurement", [], |r| r.get(0)).unwrap();
+        assert_eq!(rows, 1, "an existing measurement must survive the upgrade");
+        let keys: i64 = conn.query_row("SELECT count(*) FROM api_key", [], |r| r.get(0)).unwrap();
+        assert_eq!(keys, 1, "and so must an issued key");
+    }
+
+    /// The 3.1 migration must be additive, because [`migrate`] lets a 3.0 binary run against a 3.1
+    /// database and that is only sound while it is. Asserted structurally rather than trusted: the
+    /// tables a 3.0 binary reads and writes must be untouched by it.
+    #[test]
+    fn the_web_tables_migration_does_not_touch_the_pre_existing_schema() {
+        let columns = |conn: &Connection, table: &str| -> Vec<(String, String)> {
+            let mut stmt = conn
+                .prepare(&format!(
+                    "SELECT name, type FROM pragma_table_info('{table}') ORDER BY cid"
+                ))
+                .unwrap();
+            stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap()
+        };
+
+        // At 3.0...
+        let before = Connection::open_in_memory().unwrap();
+        for migration in MIGRATIONS.iter().filter(|m| m.version <= Version::new(3, 0)) {
+            before.execute_batch(migration.sql).unwrap();
+        }
+        // ...and at 3.1.
+        let after = Connection::open_in_memory().unwrap();
+        migrate(&after).unwrap();
+
+        for table in ["measurement", "api_key"] {
+            assert_eq!(
+                columns(&before, table),
+                columns(&after, table),
+                "3.1 changed the shape of `{table}`, which a 3.0 binary reads and writes — that makes \
+                 it a major bump, not a minor one"
+            );
+        }
     }
 
     /// STRICT is what makes the column types enforced rather than advisory.

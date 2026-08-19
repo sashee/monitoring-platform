@@ -47,6 +47,30 @@ pub enum Command {
     /// Never prints a secret, because none is stored — this answers "which keys exist" and "was mine
     /// created", not "what was the token".
     ListApiKeys(ApiKeyArgs),
+
+    /// Create a web interface user, reading the password from stdin (SPEC §14).
+    ///
+    /// The password is never a flag and never an argument. `/proc/<pid>/cmdline` is world-readable, so a
+    /// password on the command line is visible to every process on the host for as long as this one runs —
+    /// and lands in the shell history besides. This is the same reason the collector takes an
+    /// `apiKeyFile` rather than a key.
+    CreateUser(CreateUserArgs),
+
+    /// List the web interface users, by name and creation time.
+    ///
+    /// Never prints a password, because none is stored.
+    ListUsers(ApiKeyArgs),
+
+    /// List the browser sessions that exist, by public id, user and expiry.
+    ///
+    /// Never prints a session secret, because none is stored — so nothing here can be replayed as a login.
+    ListSessions(ApiKeyArgs),
+
+    /// Delete a web interface user, and every session they hold.
+    ///
+    /// The sessions go too, deliberately: without that, a cookie issued before the deletion would keep
+    /// working against a username that no longer exists.
+    DeleteUser(DeleteUserArgs),
 }
 
 #[derive(Debug, Parser, Default)]
@@ -92,6 +116,26 @@ pub struct CreateApiKeyArgs {
     /// Who or what this key is for. Operator-facing only; it is never checked against anything.
     #[arg(long)]
     pub label: String,
+}
+
+#[derive(Debug, Parser, Default)]
+pub struct CreateUserArgs {
+    #[command(flatten)]
+    pub common: ApiKeyArgs,
+
+    /// The username to log in with. Compared exactly as given, so it is case-sensitive.
+    #[arg(long)]
+    pub username: String,
+}
+
+#[derive(Debug, Parser, Default)]
+pub struct DeleteUserArgs {
+    #[command(flatten)]
+    pub common: ApiKeyArgs,
+
+    /// The user to remove, along with every session they hold.
+    #[arg(long)]
+    pub username: String,
 }
 
 #[derive(Debug, Parser, Default)]

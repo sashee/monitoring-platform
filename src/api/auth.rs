@@ -1,9 +1,14 @@
-//! API key verification for every endpoint except `/healthz` (SPEC §13).
+//! API key verification for the `/v1` endpoints (SPEC §13).
 //!
 //! Requests without a valid key are refused. There is no switch: a flag that could turn
 //! authentication off would be one more thing that has to be right, and the rollout it would have
 //! served is already over — the previous release verified without enforcing, which is what made this
 //! one safe to ship.
+//!
+//! **This layer is for machine clients only, and knows nothing about browsers.** It reads
+//! `Authorization` and never `Cookie`, so a browser session (SPEC §14) cannot authenticate an OTLP or
+//! read-API request through it — which is half of the separation [`crate::api::app`] tabulates. The
+//! endpoints outside it are `/healthz` (below) and the §14 pages, which carry their own session layer.
 //!
 //! [`evaluate`] and [`refuse`] stay separate all the same, because they answer different questions:
 //! what a request *is*, and what to tell it. Only the second is route-shaped.

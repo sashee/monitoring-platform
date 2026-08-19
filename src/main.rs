@@ -2,7 +2,9 @@
 
 use anyhow::{Context, Result};
 use clap::Parser;
-use monitoring_platform::config::{ApiKeyArgs, Cli, Command, CreateApiKeyArgs, ServeArgs};
+use monitoring_platform::config::{
+    ApiKeyArgs, Cli, Command, CreateApiKeyArgs, CreateUserArgs, DeleteUserArgs, ServeArgs,
+};
 use monitoring_platform::{
     AppState, Config, api, auth, clock, now_unix_nanos, store, transport,
 };
@@ -34,6 +36,23 @@ fn main() -> Result<()> {
             init_tracing_on_stderr(&args.log_level);
             list_api_keys(&args)
         }
+        // The §14 commands, all one SQLite transaction and some printing, so no runtime here either.
+        Command::CreateUser(args) => {
+            init_tracing_on_stderr(&args.common.log_level);
+            create_user(&args)
+        }
+        Command::ListUsers(args) => {
+            init_tracing_on_stderr(&args.log_level);
+            list_users(&args)
+        }
+        Command::ListSessions(args) => {
+            init_tracing_on_stderr(&args.log_level);
+            list_sessions(&args)
+        }
+        Command::DeleteUser(args) => {
+            init_tracing_on_stderr(&args.common.log_level);
+            delete_user(&args)
+        }
     }
 }
 
@@ -59,7 +78,7 @@ fn create_api_key(args: &CreateApiKeyArgs) -> Result<()> {
 
     let conn = store::open_write(&path)?;
 
-    let token = auth::Token::from_random(&random_token_bytes()?);
+    let token = auth::Token::from_random(&monitoring_platform::random_bytes()?);
     store::keys::insert(
         &conn,
         token.id(),
@@ -95,21 +114,118 @@ fn list_api_keys(args: &ApiKeyArgs) -> Result<()> {
     Ok(())
 }
 
-/// The secret's entropy, straight from the kernel.
+/// Creates a web interface user (SPEC §14).
 ///
-/// `/dev/urandom` rather than a `rand`/`getrandom` dependency: it is the same CSPRNG, this service is
-/// Linux-only by construction (adjtimex, /proc, systemd credentials), and a credential is a poor
-/// reason to widen the dependency graph. `read_exact` because a short read must be an error, never a
-/// key with predictable tail bytes.
-fn random_token_bytes() -> Result<[u8; auth::TOKEN_BYTES]> {
-    use std::io::Read;
+/// `open_write` rather than `open_read` for the same reason `create_api_key` uses it: on a receiver upgraded
+/// but not yet restarted, this is what applies the 3.1 migration that creates the table.
+fn create_user(args: &CreateUserArgs) -> Result<()> {
+    let path = args.common.database_path();
 
-    let mut bytes = [0u8; auth::TOKEN_BYTES];
-    std::fs::File::open("/dev/urandom")
-        .context("opening /dev/urandom")?
-        .read_exact(&mut bytes)
-        .context("reading from /dev/urandom")?;
-    Ok(bytes)
+    // Same warning, and same reasoning, as create-api-key: a mistyped `--db` would otherwise create a
+    // second database, store the user in it, and report success — leaving a login the receiver has never
+    // heard of.
+    if !path.exists() {
+        tracing::warn!(
+            path = %path.display(),
+            "no database there yet; creating one. If the receiver already has a database, \
+             check --db or STATE_DIRECTORY — a user stored here would be invisible to it"
+        );
+    }
+
+    let password = read_password()?;
+
+    let conn = store::open_write(&path)?;
+    store::users::insert(&conn, &args.username, &auth::hash_password(&password), now_unix_nanos())?;
+
+    // stderr, not stdout: unlike a token, there is nothing here worth capturing into a variable, and the
+    // command's whole output being diagnostic keeps it consistent with the key commands' split.
+    eprintln!("stored user {:?} in {}", args.username, path.display());
+    Ok(())
+}
+
+/// The password, from stdin.
+///
+/// **Never from argv**, for the reason on `Command::CreateUser`. Not from an environment variable either:
+/// `/proc/<pid>/environ` is readable by the same processes, and an exported variable outlives the command.
+///
+/// No terminal echo suppression, deliberately: that needs `termios` handling — a raw-mode dance with a
+/// restore-on-signal path to avoid leaving the operator's shell echo-less after a Ctrl-C — for a command run
+/// once per host. Piping is the documented usage precisely so the password need not be typed where it can be
+/// seen:
+///
+/// ```sh
+/// printf %s "$PASSWORD" | monitoring-platform create-user --username sashee
+/// ```
+///
+/// The prompt goes to stderr so it is visible even when stdout is redirected.
+fn read_password() -> Result<String> {
+    use std::io::{BufRead, IsTerminal};
+
+    let stdin = std::io::stdin();
+    if stdin.is_terminal() {
+        eprint!("password (will be visible as you type): ");
+    }
+
+    let mut password = String::new();
+    stdin.lock().read_line(&mut password).context("reading the password from stdin")?;
+    if stdin.is_terminal() {
+        eprintln!();
+    }
+
+    // Only the line ending is stripped, and only from the end. A password may legitimately begin or end with
+    // a space, and `trim()` would quietly store something other than what was supplied — unrecoverably, since
+    // only the hash is kept.
+    let password = password.strip_suffix('\n').unwrap_or(&password);
+    let password = password.strip_suffix('\r').unwrap_or(password);
+
+    if password.is_empty() {
+        anyhow::bail!(
+            "the password was empty. Pipe one in, e.g. \
+             `printf %s \"$PASSWORD\" | monitoring-platform create-user --username <name>`"
+        );
+    }
+    Ok(password.to_owned())
+}
+
+fn list_users(args: &ApiKeyArgs) -> Result<()> {
+    let conn = store::open_read(&args.database_path())?;
+    for user in store::users::list(&conn)? {
+        println!("{}  {}", api::query::format_nanos(user.created_at), user.username);
+    }
+    Ok(())
+}
+
+fn list_sessions(args: &ApiKeyArgs) -> Result<()> {
+    let conn = store::open_read(&args.database_path())?;
+    let now = now_unix_nanos();
+    for session in store::sessions::list(&conn)? {
+        // Marked rather than filtered out: an expired session is inert but still on disk until the next
+        // login sweeps it, and a listing that hid them would make the table look empty when it is not.
+        let state = if session.expires_at <= now { "expired" } else { "live" };
+        println!(
+            "{}  {}  {}  expires {}  {}",
+            session.id,
+            api::query::format_nanos(session.created_at),
+            session.username,
+            api::query::format_nanos(session.expires_at),
+            state
+        );
+    }
+    Ok(())
+}
+
+fn delete_user(args: &DeleteUserArgs) -> Result<()> {
+    let path = args.common.database_path();
+    let conn = store::open_write(&path)?;
+
+    // Reported rather than an error: `delete-user` on a name that is already gone has achieved what was
+    // asked, and failing would make the command awkward to re-run.
+    if store::users::delete(&conn, &args.username)? {
+        eprintln!("deleted user {:?} and their sessions from {}", args.username, path.display());
+    } else {
+        eprintln!("no user {:?} in {}", args.username, path.display());
+    }
+    Ok(())
 }
 
 fn env_filter(filter: &str) -> EnvFilter {

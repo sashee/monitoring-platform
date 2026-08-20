@@ -62,8 +62,8 @@
         # Scoped like row_count: a producer on the machine under test posts straight to the
         # receiver, never through this collector, so its rows can only dilute the count here.
         sql = (
-            "select count(*) from measurement where "
-            f"attributes like '%mp.clock.uncertain%' and {sample_scope()};"
+            f"select count(*) from {MEASUREMENTS} where "
+            f"s.attributes like '%mp.clock.uncertain%' and {sample_scope()};"
         )
         out = machine.succeed(
             "sqlite3 " + shlex.quote(f"file:{DB}?mode=ro") + " " + shlex.quote(sql)
@@ -189,7 +189,7 @@
             # no device.id and the type is already the narrower filter — nothing but this
             # collector writes mp.collector.health.
             out = machine.succeed(
-                f"""sqlite3 'file:{DB}?mode=ro' "select body from measurement """
+                f"""sqlite3 'file:{DB}?mode=ro' "select m.body from {MEASUREMENTS} """
                 f"""where type = 'mp.collector.health' order by rowid desc limit 1;" """
             ).strip()
             return json.loads(out) if out else None

@@ -141,10 +141,32 @@ mod tests {
     use super::*;
     use crate::auth::{SessionToken, TOKEN_BYTES};
 
+    /// The users these sessions belong to have to exist: since 4.0 `web_session.username` is a foreign
+    /// key into `web_user`, so a session for nobody is refused rather than stored. That is the point of
+    /// the constraint, and it means a fixture cannot conjure a session out of nothing any more.
     fn db() -> Connection {
         let conn = Connection::open_in_memory().unwrap();
         crate::store::schema::migrate(&conn).unwrap();
+        for username in ["sashee", "irrelevant"] {
+            crate::store::users::insert(&conn, username, &crate::auth::hash_password("pw"), 1)
+                .expect("seeding the owner of the test sessions");
+        }
         conn
+    }
+
+    /// The constraint itself: a session can only exist for a user that does. Before 4.0 nothing stopped
+    /// this, and an orphan session stayed valid until it expired.
+    #[test]
+    fn a_session_cannot_be_created_for_a_user_who_does_not_exist() {
+        let conn = db();
+        let session = token(9);
+        // `{:#}` rather than `to_string()`: the store wraps errors in context, so the constraint that
+        // actually fired is in the source chain, not the outermost message.
+        let err = format!(
+            "{:#}",
+            insert(&conn, session.id(), &session.secret_hash(), "ghost", 10, 100).unwrap_err()
+        );
+        assert!(err.to_lowercase().contains("foreign key"), "unexpected error: {err}");
     }
 
     fn token(first: u8) -> SessionToken {

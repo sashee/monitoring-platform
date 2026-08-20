@@ -536,41 +536,6 @@ async fn device_supplied_text_cannot_become_markup() {
     );
 }
 
-/// The backfill readiness note (SPEC §6.7). It has to appear while rows are unassigned, because it is
-/// what tells the operator when the 4.0 migration is safe — and it has to disappear once they are not,
-/// since a permanent banner about a finished job is noise.
-#[tokio::test]
-async fn the_series_backfill_note_shows_only_while_rows_are_unassigned() {
-    let harness = harness();
-    let cookie = harness.login().await;
-
-    // A measurement as a 3.1 binary writes it: no `series_id`, so it is still in the work queue.
-    let mut conn = store::open_write_existing(&harness.db).unwrap();
-    conn.execute(
-        "INSERT INTO measurement (id, event_time, processed_time, type, body, attributes) \
-         VALUES (x'0102030405060708090a0b0c0d0e0f10', ?1, ?1, 'cpu', '{}', '{}')",
-        rusqlite::params![T],
-    )
-    .unwrap();
-
-    let reply = harness.get("/", Some(&cookie)).await;
-    assert!(
-        reply.body.contains("still being assigned to a series"),
-        "the note must appear while the sweep has work: {}",
-        reply.body
-    );
-
-    monitoring_platform::store::series::backfill(&mut conn).unwrap();
-    drop(conn);
-
-    let reply = harness.get("/", Some(&cookie)).await;
-    assert!(
-        !reply.body.contains("still being assigned to a series"),
-        "the note must disappear once the sweep has converged: {}",
-        reply.body
-    );
-}
-
 // ------------------------------------------------------- the origin check (SPEC §14.3)
 
 /// **The case the origin check exists for.** `SameSite` ignores the port, so another server on loopback

@@ -59,7 +59,7 @@
         # a row landed, which says nothing about who wrote it, so a foreign producer's rows
         # would be counted as this case's evidence either side of the line.
         sql = (
-            f"select count(*) from measurement where type = '{kind}' "
+            f"select count(*) from {MEASUREMENTS} where s.type = '{kind}' "
             f"and event_time {comparison} strftime('%s','{CUTOFF}') * 1000000000 "
             f"and {sample_scope()};"
         )

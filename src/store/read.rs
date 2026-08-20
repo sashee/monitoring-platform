@@ -839,73 +839,67 @@ mod tests {
         }
     }
 
-    // --------------------------------------------------- the read path reads `series`, not the row
+    // --------------------------------------------------- the read path reads `series`, and only `series`
 
-    /// Overwrites a measurement's *own* `type` and `attributes` with something the `series` row does not
-    /// say, which nothing in the receiver ever does. It is the only way to tell the two sources apart:
-    /// while both hold identical text, a query reading the wrong one is indistinguishable from a query
-    /// reading the right one — and it is the wrong one that 4.0 deletes.
-    fn desync_the_measurement_copies(conn: &Connection, kind: &str, attributes: &str) {
-        let changed = conn
-            .execute(
-                "UPDATE measurement SET type = ?1, attributes = ?2",
-                rusqlite::params![kind, attributes],
-            )
+    /// **The de-synchronisation test that used to live here cannot be written any more, and that is the
+    /// point.** Through 3.3 it overwrote `measurement.type` and `measurement.attributes` with values the
+    /// `series` row did not say, then demanded the `series` answer from every read — the only way to tell
+    /// the two sources apart while both existed. 4.0 deleted the columns, so the guard it provided is now
+    /// structural. This asserts that structure directly, so a future migration cannot quietly put a
+    /// second copy back and let reads drift onto it.
+    #[test]
+    fn measurement_has_no_type_or_attributes_of_its_own() {
+        let conn = db_with(vec![m("gps", 10, json!({"record.attributes.unit": "wgs84"}))]);
+
+        let columns: Vec<String> = conn
+            .prepare("SELECT name FROM pragma_table_info('measurement') ORDER BY cid")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
             .unwrap();
-        assert!(changed > 0, "nothing to de-synchronise");
+
+        assert_eq!(columns, vec!["id", "event_time", "processed_time", "body", "series_id"]);
+        for gone in ["type", "attributes"] {
+            assert!(!columns.iter().any(|c| c == gone), "`{gone}` came back on measurement");
+        }
     }
 
-    /// **The guard on 4.0.** Every one of these reads must come from `series`, because 4.0 drops
-    /// `measurement.type` and `measurement.attributes` as pure DDL with no accompanying code change — so
-    /// anything still reading them would break on a migration that cannot be rehearsed or reverted
-    /// (SPEC §6.7). Asserted by making the two copies disagree and demanding the `series` answer.
+    /// Every read still resolves both fields, now necessarily through the join. Kept as a whole-surface
+    /// sweep rather than trusting the column check above: these are the seven shapes that would have to
+    /// be rewritten if the source ever moved again.
     #[test]
-    fn every_read_of_type_and_attributes_comes_from_the_series_table() {
+    fn every_read_resolves_type_and_attributes_through_the_join() {
         let conn = db_with(vec![m("gps", 10, json!({"record.attributes.unit": "wgs84"}))]);
-        desync_the_measurement_copies(&conn, "STALE", r#"{"record.attributes.unit":"stale"}"#);
 
-        // Row reads: the projected columns.
         let rows = query(&conn, &QuerySpec { limit: 10, ..Default::default() }).unwrap();
         assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].kind, "gps", "type must come from series");
+        assert_eq!(rows[0].kind, "gps");
         assert_eq!(rows[0].attributes["record.attributes.unit"], json!("wgs84"));
 
-        // The type listing.
-        assert_eq!(
-            types(&conn).unwrap(),
-            vec![TypeCount { kind: "gps".into(), count: 1 }],
-            "the type list must come from series"
-        );
+        assert_eq!(types(&conn).unwrap(), vec![TypeCount { kind: "gps".into(), count: 1 }]);
 
-        // The type filter, in both directions.
-        let by_series = QuerySpec { types: vec!["gps".into()], limit: 10, ..Default::default() };
-        assert_eq!(query(&conn, &by_series).unwrap().len(), 1, "filtering must use series.type");
-        let by_row = QuerySpec { types: vec!["STALE".into()], limit: 10, ..Default::default() };
+        let by_type = QuerySpec { types: vec!["gps".into()], limit: 10, ..Default::default() };
+        assert_eq!(query(&conn, &by_type).unwrap().len(), 1);
         assert!(
-            query(&conn, &by_row).unwrap().is_empty(),
-            "the measurement's own type must not be filterable"
+            query(&conn, &QuerySpec { types: vec!["nope".into()], limit: 10, ..Default::default() })
+                .unwrap()
+                .is_empty()
         );
 
-        // The attribute filter, in both directions.
         let attr_hit = QuerySpec {
             attrs: vec![("record.attributes.unit".into(), "wgs84".into())],
             limit: 10,
             ..Default::default()
         };
         assert_eq!(query(&conn, &attr_hit).unwrap().len(), 1);
-        let attr_stale = QuerySpec {
-            attrs: vec![("record.attributes.unit".into(), "stale".into())],
-            limit: 10,
-            ..Default::default()
-        };
-        assert!(query(&conn, &attr_stale).unwrap().is_empty());
 
-        // Facet discovery.
         let facets = facets(&conn, &QuerySpec { limit: 10, ..Default::default() }).unwrap();
         let unit = facets.attrs.iter().find(|f| f.key == "record.attributes.unit").unwrap();
-        assert_eq!(unit.values, vec!["wgs84".to_owned()], "facets must come from series");
+        assert_eq!(unit.values, vec!["wgs84".to_owned()]);
 
-        // And the aggregated chart query, which groups by an attribute.
+        assert_eq!(extent(&conn, &by_type).unwrap(), Some((10, 10)));
+
         let grouped = series(
             &conn,
             &SeriesSpec {
@@ -918,92 +912,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(grouped.len(), 1);
-        assert_eq!(grouped[0].group.as_deref(), Some("wgs84"), "grouping must use series");
-    }
-
-    /// The extent query too — it is the one that decides the `all` window, so a stale read there would
-    /// rescale every axis.
-    #[test]
-    fn the_extent_query_filters_through_the_series_table() {
-        let conn = db_with(vec![m("gps", 10, json!({}))]);
-        desync_the_measurement_copies(&conn, "STALE", "{}");
-
-        let spec = QuerySpec { types: vec!["gps".into()], ..Default::default() };
-        assert_eq!(extent(&conn, &spec).unwrap(), Some((10, 10)));
-        let stale = QuerySpec { types: vec!["STALE".into()], ..Default::default() };
-        assert_eq!(extent(&conn, &stale).unwrap(), None);
-    }
-
-    /// The join is omitted exactly when nothing reads `series`, which is what keeps `min`/`max` on an
-    /// index probe instead of a scan. Asserted on the generated SQL, because the cost is invisible in the
-    /// result: both forms return the same numbers, and the difference only shows as `O(n)` growth.
-    #[test]
-    fn the_series_join_is_omitted_only_when_nothing_reads_it() {
-        let joined = |sql: &str| sql.contains("JOIN series");
-
-        assert!(
-            !joined(&build_extent_query(&QuerySpec::default()).0),
-            "an unfiltered extent reads no series column, so it must not pay for the join"
-        );
-        assert!(
-            joined(&build_extent_query(&QuerySpec {
-                types: vec!["gps".into()],
-                ..Default::default()
-            })
-            .0),
-            "a type filter is a series predicate"
-        );
-        assert!(
-            joined(&build_extent_query(&QuerySpec {
-                attrs: vec![("k".into(), "v".into())],
-                ..Default::default()
-            })
-            .0),
-            "an attribute filter is a series predicate"
-        );
-        assert!(
-            !joined(&build_extent_query(&QuerySpec {
-                body: vec![("k".into(), "v".into())],
-                ..Default::default()
-            })
-            .0),
-            "the body is still a measurement column"
-        );
-
-        // The aggregated query has one more way to need it: grouping by an attribute.
-        let series_spec = |group: Option<FieldRef>| SeriesSpec {
-            filter: QuerySpec::default(),
-            field: None,
-            group,
-            groups: Vec::new(),
-            bucket_nanos: 1_000,
-        };
-        assert!(!joined(&build_series_query(&series_spec(None)).0), "the plain timeline");
-        assert!(
-            joined(&build_series_query(&series_spec(Some(FieldRef::Attribute("k".into())))).0),
-            "grouping by an attribute reads series"
-        );
-        assert!(
-            !joined(&build_series_query(&series_spec(Some(FieldRef::Body("k".into())))).0),
-            "grouping by a body leaf does not"
-        );
-
-        // The row query always projects both, so it can never skip it.
-        assert!(joined(&build_query(&QuerySpec::default()).0));
-    }
-
-    /// **The precondition the inner join rests on, stated as a test.** A measurement with no `series_id`
-    /// is invisible to every read. That is why `store::series::backfill` is a hard startup requirement
-    /// rather than a best-effort one (see `main.rs`): the alternative to being loudly down is silently
-    /// under-reporting, which for a monitoring system is worse.
-    #[test]
-    fn a_measurement_with_no_series_is_invisible_to_reads() {
-        let conn = db_with(vec![m("gps", 10, json!({}))]);
-        conn.execute("UPDATE measurement SET series_id = NULL", []).unwrap();
-
-        assert!(query(&conn, &QuerySpec { limit: 10, ..Default::default() }).unwrap().is_empty());
-        assert!(types(&conn).unwrap().is_empty());
-        assert_eq!(crate::store::series::pending(&conn).unwrap(), 1, "and it is counted as pending");
+        assert_eq!(grouped[0].group.as_deref(), Some("wgs84"));
     }
 
     /// SPEC §7.1: every awkward character must round-trip through the path builder into a match.

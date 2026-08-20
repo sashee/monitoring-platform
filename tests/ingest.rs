@@ -127,7 +127,8 @@ async fn stores_a_batch_and_reports_full_success() {
     let (kind, event_time, body, attributes): (String, i64, String, String) = h
         .conn()
         .query_row(
-            "SELECT type, event_time, body, attributes FROM measurement",
+            "SELECT s.type, m.event_time, m.body, s.attributes \
+             FROM measurement m JOIN series s ON s.id = m.series_id",
             [],
             |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
         )
@@ -326,7 +327,11 @@ async fn gzip_and_identity_produce_identical_rows() {
 
     let read = |h: &Harness| -> (String, String) {
         h.conn()
-            .query_row("SELECT body, attributes FROM measurement", [], |r| Ok((r.get(0)?, r.get(1)?)))
+            .query_row(
+                "SELECT m.body, s.attributes FROM measurement m JOIN series s ON s.id = m.series_id",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
             .unwrap()
     };
     assert_eq!(read(&plain), read(&compressed), "compression must not alter stored rows");
@@ -505,9 +510,9 @@ async fn large_integers_survive_the_full_ingest_path() {
     let (body_n, attr_serial): (i64, i64) = h
         .conn()
         .query_row(
-            "SELECT json_extract(body,'$.n'), \
-                    json_extract(attributes,'$.\"record.attributes.device.serial\"') \
-             FROM measurement",
+            "SELECT json_extract(m.body,'$.n'), \
+                    json_extract(s.attributes,'$.\"record.attributes.device.serial\"') \
+             FROM measurement m JOIN series s ON s.id = m.series_id",
             [],
             |r| Ok((r.get(0)?, r.get(1)?)),
         )

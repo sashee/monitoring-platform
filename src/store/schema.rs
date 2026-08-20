@@ -81,19 +81,30 @@ impl std::fmt::Display for Version {
 }
 
 /// Schema version this binary understands. Tracked in `PRAGMA user_version`.
-pub const SCHEMA_VERSION: Version = Version::new(3, 3);
+pub const SCHEMA_VERSION: Version = Version::new(4, 0);
 
 /// A compile-time guard, not a test, because it is an invariant about a constant and a build is the right
 /// place to lose an argument with one.
 ///
-/// The deployed receiver runs 3.0, and only a *minor* is survivable by it (see [`Version`]) — so as long as
-/// this project's schema changes stay additive, this stays major 3. **Bumping the major is what breaks a
-/// reverted deployment**, reintroducing the permanent-startup-failure class the major/minor split was
-/// introduced to remove, so it needs a deliberate plan and not merely an edit: get the new major deployed
-/// through the pipeline before anything writes a database at it. Changing this line is that decision, and
-/// this assertion is what makes it a visible one.
+/// **Bumping the major is what breaks a reverted deployment**, reintroducing the permanent-startup-failure
+/// class the major/minor split was introduced to remove. So it needs a deliberate plan and not merely an
+/// edit: get the new major deployed through the pipeline before anything writes a database at it. Changing
+/// this line is that decision, and this assertion is what makes it a visible one.
+///
+/// **It has been changed once, from 3 to 4**, and the plan it required is worth recording because the next
+/// major will need the same one:
+///
+/// 1. 3.2 added `series` and dual-wrote it, so nothing read it yet.
+/// 2. 3.3 moved every *read* onto the join, leaving `measurement.type` and `measurement.attributes` written
+///    but unread. Both minors, so both were revertible and both were exercised on the deployed host.
+/// 3. 3.3 was merged and delivered **through the pipeline**, which is what made every binary in
+///    circulation one that writes a `series_id`. Only then could 4.0 assume a fully-assigned table and
+///    drop the backfill machinery entirely rather than carrying a fill it could not express in SQL.
+///
+/// The ordering was the whole point: it left 4.0 as a table rebuild with no read-path changes, which is the
+/// only shape worth having in a migration that cannot be rehearsed on the host or reverted once applied.
 const _: () = assert!(
-    SCHEMA_VERSION.major == 3 && SCHEMA_VERSION.minor >= 1,
+    SCHEMA_VERSION.major == 4 && SCHEMA_VERSION.minor == 0,
     "a major bump strands every receiver still running the previous one; see SPEC.md §6.2"
 );
 
@@ -336,13 +347,110 @@ const MIGRATIONS: &[Migration] = &[
       ON measurement (series_id, event_time DESC, id DESC);
     "#,
     },
+    // → version 4.0: `measurement` loses `type` and `attributes` (SPEC §6.7). The payoff for 3.2 and 3.3.
+    //
+    // **A major bump, and the second one in this project's life.** Everything that made it safe happened
+    // earlier: 3.2 wrote `series`, 3.3 moved every read onto the join, and 3.3 reached the host through
+    // the pipeline — so by the time this runs, no binary in circulation writes an unassigned measurement
+    // and the table is fully assigned. See the compile-time guard above for why that ordering was
+    // required rather than merely tidy.
+    //
+    // **A rebuild, not `DROP COLUMN`, for three reasons.** SQLite cannot `ALTER TABLE … ADD NOT NULL`; it
+    // cannot add a foreign key to an existing table at all; and `DROP COLUMN` rewrites every row without
+    // producing a compact table. A rebuild gets all three in the one pass the data has to make anyway,
+    // and migration 2.0 is the precedent.
+    //
+    // **`NOT NULL` is the precondition check.** A database that never passed through 3.3 has unassigned
+    // rows, and this `INSERT … SELECT` fails on them — rolling the whole migration back, leaving
+    // `user_version` at 3.3 and the previous generation bootable. Nothing here could fill them anyway:
+    // minting a series row needs blake3, and SQL cannot hash. So "upgrade through 3.3" is a real
+    // constraint on any restored backup, enforced rather than documented.
+    //
+    // **The foreign key is what makes the read path's inner join total.** `NOT NULL` forbids a NULL
+    // `series_id`; only this forbids a *dangling* one, which a write-path bug could otherwise produce and
+    // which would make those measurements silently invisible. `DEFERRABLE INITIALLY DEFERRED` is
+    // load-bearing: `store::write::insert_batch` inserts each measurement *before* upserting its series
+    // row, because `added_measurements` may only count rows the `INSERT OR IGNORE` actually stored.
+    // Reversing that order to satisfy an immediate constraint would let a retried batch inflate the count.
+    // Deferred checks at `COMMIT`, so the order stays free and the guarantee is the same. It also makes
+    // this migration self-verifying: all 120k rows are checked against `series` before it commits.
+    //
+    // `ON DELETE RESTRICT` by omission, which is wanted: a series with measurements cannot be deleted.
+    // That becomes load-bearing when retention arrives.
+    //
+    // `web_session.username` gains its own key, immediate rather than deferred — a session is only ever
+    // created for a user that was just authenticated. Orphans are filtered rather than allowed to fail the
+    // migration: a session whose user no longer exists is a credential that should already be invalid, so
+    // dropping it is the same repair `store::users::delete` performs by hand.
+    //
+    // `measurement_type_event_time_idx` and `measurement_backfill_idx` die with the old table and are not
+    // recreated. `series_type_attributes_idx` is left alone — the read path's type filter uses it.
+    //
+    // No `VACUUM`: it cannot run inside a transaction. The ~62 MB of duplicated text is freed *within* the
+    // file and reused by later rows; returning it to the filesystem is a one-off manual step.
+    Migration {
+        version: Version::new(4, 0),
+        sql: r#"
+    CREATE TABLE measurement_new (
+      id             BLOB    PRIMARY KEY,
+      event_time     INTEGER NOT NULL,
+      processed_time INTEGER NOT NULL,
+      body           TEXT,
+      series_id      BLOB    NOT NULL REFERENCES series(id) DEFERRABLE INITIALLY DEFERRED
+    ) STRICT;
+
+    INSERT INTO measurement_new (id, event_time, processed_time, body, series_id)
+      SELECT id, event_time, processed_time, body, series_id FROM measurement;
+
+    DROP TABLE measurement;
+    ALTER TABLE measurement_new RENAME TO measurement;
+
+    CREATE INDEX measurement_event_time_idx        ON measurement (event_time DESC, id DESC);
+    CREATE INDEX measurement_series_event_time_idx ON measurement (series_id, event_time DESC, id DESC);
+
+    CREATE TABLE web_session_new (
+      id          TEXT    PRIMARY KEY,
+      secret_hash BLOB    NOT NULL,
+      username    TEXT    NOT NULL REFERENCES web_user(username) ON DELETE CASCADE,
+      created_at  INTEGER NOT NULL,
+      expires_at  INTEGER NOT NULL
+    ) STRICT;
+
+    INSERT INTO web_session_new (id, secret_hash, username, created_at, expires_at)
+      SELECT id, secret_hash, username, created_at, expires_at FROM web_session
+      WHERE username IN (SELECT username FROM web_user);
+
+    DROP TABLE web_session;
+    ALTER TABLE web_session_new RENAME TO web_session;
+
+    CREATE INDEX web_session_expires_at_idx ON web_session (expires_at);
+    "#,
+    },
 ];
 
-/// No `foreign_keys` pragma. `measurement` and `api_key` are independent — a key is not an owner of
-/// the rows ingested with it — so enabling it would imply a constraint that does not exist. The 3.1
-/// tables inherit that decision: `web_session.username` is not declared a foreign key, because a
-/// pragma left off means SQLite would parse the constraint and never enforce it, and a constraint that
-/// looks enforced but is not is worse than none. `store::users::delete` does the cascade by hand.
+/// Enables foreign keys, which this schema did **not** do before 4.0.
+///
+/// The earlier reasoning was that no genuine referential relationship existed — `api_key` does not own the
+/// measurements ingested with it — so declaring one would imply a constraint that was not real, and a
+/// pragma left off means SQLite parses a constraint and never enforces it. That reasoning expired when
+/// `measurement.series_id` arrived: it is a real reference, and since 3.3 the read path's inner join
+/// *depends* on it resolving, so a dangling value makes measurements silently invisible.
+///
+/// **The pragma is per-connection and not stored in the file**, which is the hazard the old comment
+/// feared and it does not go away — a write path that forgets it is silently unenforced. So it lives here,
+/// [`open_write_existing`] calls the same thing, and `tests` asserts a dangling insert is refused on each.
+/// [`open_read`] deliberately does not: a read-only connection cannot violate a constraint.
+fn apply_foreign_keys(conn: &Connection) -> Result<()> {
+    conn.pragma_update(None, "foreign_keys", "ON")?;
+    // Asserted rather than assumed: `PRAGMA foreign_keys` is a silent no-op inside a transaction, so a
+    // caller that had one open would otherwise get an unenforced connection and no indication of it.
+    let on: i64 = conn.pragma_query_value(None, "foreign_keys", |r| r.get(0))?;
+    if on != 1 {
+        bail!("could not enable foreign keys (is a transaction open on this connection?)");
+    }
+    Ok(())
+}
+
 fn apply_pragmas(conn: &Connection) -> Result<()> {
     // journal_mode returns a row, so it needs query_row rather than execute.
     let mode: String = conn
@@ -353,6 +461,7 @@ fn apply_pragmas(conn: &Connection) -> Result<()> {
     }
     conn.pragma_update(None, "synchronous", "NORMAL")?;
     conn.pragma_update(None, "busy_timeout", 5_000)?;
+    apply_foreign_keys(conn)?;
     Ok(())
 }
 
@@ -386,9 +495,11 @@ pub fn open_write_existing(path: &Path) -> Result<Connection> {
         OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_URI | OpenFlags::SQLITE_OPEN_NO_MUTEX,
     )
     .with_context(|| format!("opening database {} for writing", path.display()))?;
-    // No journal_mode: WAL is a property of the file and was set when it was created. busy_timeout is
-    // per-connection and is what makes concurrent writers wait rather than fail.
+    // No journal_mode: WAL is a property of the file and was set when it was created. busy_timeout and
+    // foreign_keys are per-connection, and the latter is why this cannot simply skip pragmas: this
+    // connection writes `web_session`, whose key to `web_user` would otherwise be parsed and ignored.
     conn.pragma_update(None, "busy_timeout", 5_000)?;
+    apply_foreign_keys(&conn)?;
     Ok(conn)
 }
 
@@ -416,6 +527,13 @@ pub fn open_read(path: &Path) -> Result<Connection> {
 ///   ignoring what it has never heard of. This is the case the major/minor split exists for.
 /// - Anything older is migrated forward.
 pub fn migrate(conn: &Connection) -> Result<()> {
+    // Enforcement is per-connection, so a declared foreign key is only real on a connection that asked
+    // for it — and the connection that just built or upgraded the schema is precisely the one that must.
+    // Doing it here rather than only in [`apply_pragmas`] means every path that reaches a current schema
+    // has the constraints live, including callers that open a connection directly. Must precede the
+    // `BEGIN` below: the pragma is a silent no-op inside a transaction.
+    apply_foreign_keys(conn)?;
+
     let raw: i64 = conn.pragma_query_value(None, "user_version", |r| r.get(0))?;
     let current = Version::decode(raw);
 
@@ -461,10 +579,17 @@ pub fn migrate(conn: &Connection) -> Result<()> {
     })();
 
     match result {
-        Ok(()) => {
-            conn.execute_batch("COMMIT")?;
-            Ok(())
-        }
+        // A failing COMMIT has to roll back explicitly. Since 4.0 the schema has a *deferred* foreign
+        // key, and a deferred violation is reported by `COMMIT` itself — at which point SQLite leaves the
+        // transaction open rather than unwinding it. Returning here without the rollback would leave the
+        // connection inside a live transaction holding the write lock.
+        Ok(()) => match conn.execute_batch("COMMIT") {
+            Ok(()) => Ok(()),
+            Err(e) => {
+                let _ = conn.execute_batch("ROLLBACK");
+                Err(anyhow::Error::from(e).context("committing the migration"))
+            }
+        },
         Err(e) => {
             let _ = conn.execute_batch("ROLLBACK");
             Err(e)
@@ -566,10 +691,15 @@ mod tests {
 
     // ------------------------------------------------------------------------------- migrating
 
-    /// A database that stopped at version 2 is what every already-deployed receiver has. The
-    /// upgrade must add the key table without touching the measurements beside it.
+    /// **A database with measurements cannot skip 3.3, and this is what that looks like.**
+    ///
+    /// 3.2 adds `series_id` as all-NULL; 4.0 requires it `NOT NULL`. Nothing in 4.0 can fill the gap —
+    /// minting a series row needs blake3 and SQL cannot hash — so the migration refuses, rolls back
+    /// whole, and leaves the database exactly as it was. That is a real constraint on restoring an old
+    /// backup, enforced rather than merely documented: the upgrade path runs a 3.3 binary first, which
+    /// assigns every row, and only then a 4.0 one.
     #[test]
-    fn migrating_from_version_2_adds_keys_and_keeps_the_measurements() {
+    fn a_pre_3_2_database_with_rows_refuses_to_reach_4_0() {
         let conn = Connection::open_in_memory().unwrap();
         conn.execute_batch(MIGRATIONS[0].sql).unwrap();
         conn.execute_batch(MIGRATIONS[1].sql).unwrap();
@@ -581,12 +711,29 @@ mod tests {
         )
         .unwrap();
 
-        migrate(&conn).unwrap();
+        let err = format!("{:#}", migrate(&conn).unwrap_err());
+        assert!(err.contains("NOT NULL"), "the refusal must name the constraint: {err}");
 
-        assert!(has_table(&conn, "api_key"));
+        // Rolled back whole: the version is untouched, so the previous generation still runs against it.
+        assert_eq!(stored_version(&conn), 2, "a partial migration would be unrecoverable");
         let rows: i64 =
             conn.query_row("SELECT count(*) FROM measurement", [], |r| r.get(0)).unwrap();
-        assert_eq!(rows, 1, "an existing measurement must survive the upgrade");
+        assert_eq!(rows, 1, "and the measurement is still there");
+    }
+
+    /// The same database *without* rows migrates all the way, which is what a fresh deployment does.
+    #[test]
+    fn a_pre_3_2_database_with_no_rows_migrates_all_the_way() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(MIGRATIONS[0].sql).unwrap();
+        conn.execute_batch(MIGRATIONS[1].sql).unwrap();
+        conn.pragma_update(None, "user_version", 2i64).unwrap();
+
+        migrate(&conn).unwrap();
+
+        assert_eq!(stored_version(&conn), SCHEMA_VERSION.encode());
+        assert!(has_table(&conn, "series"));
+        assert!(has_table(&conn, "api_key"));
     }
 
     #[test]
@@ -686,23 +833,17 @@ mod tests {
         assert_eq!(after_first, SCHEMA_VERSION.encode());
     }
 
-    /// The upgrade every deployed receiver actually performs: a database at the legacy bare `3` — 3.0,
-    /// with measurements and issued keys in it — gaining the §14 web tables. Nothing beside them may
-    /// be disturbed, since this runs against live data.
+    /// A 3.0 database's *other* tables survive the whole way to 4.0. Measurements are covered by
+    /// `a_pre_3_2_database_with_rows_refuses_to_reach_4_0`; what matters here is that everything beside
+    /// them is carried through untouched, including across 4.0's two table rebuilds.
     #[test]
-    fn migrating_from_version_3_0_adds_the_web_tables_and_keeps_everything_else() {
+    fn migrating_from_version_3_0_keeps_the_tables_beside_the_measurements() {
         let conn = Connection::open_in_memory().unwrap();
         for migration in MIGRATIONS.iter().filter(|m| m.version <= Version::new(3, 0)) {
             conn.execute_batch(migration.sql).unwrap();
         }
-        // The legacy form, exactly as every deployed database has it.
+        // The legacy form, exactly as every deployed database had it.
         conn.pragma_update(None, "user_version", 3i64).unwrap();
-        conn.execute(
-            "INSERT INTO measurement (id, event_time, processed_time, type, attributes) \
-             VALUES (x'01', 1, 2, 'cpu', '{}')",
-            [],
-        )
-        .unwrap();
         conn.execute(
             "INSERT INTO api_key (id, secret_hash, label, created_at) \
              VALUES ('0000000000000001', x'00', 'pi-7', 1)",
@@ -714,69 +855,63 @@ mod tests {
 
         assert!(has_table(&conn, "web_user"));
         assert!(has_table(&conn, "web_session"));
-        assert!(has_table(&conn, "series"), "3.2 must have run too");
+        assert!(has_table(&conn, "series"));
         assert_eq!(stored_version(&conn), SCHEMA_VERSION.encode());
-
-        let rows: i64 =
-            conn.query_row("SELECT count(*) FROM measurement", [], |r| r.get(0)).unwrap();
-        assert_eq!(rows, 1, "an existing measurement must survive the upgrade");
         let keys: i64 = conn.query_row("SELECT count(*) FROM api_key", [], |r| r.get(0)).unwrap();
-        assert_eq!(keys, 1, "and so must an issued key");
-        // The new column exists and is NULL on the pre-existing row, which is what `store::series`
-        // sweeps up afterwards. Filling it here would make the migration a one-shot with a hole in it
-        // — see that module's header.
-        let series: Option<Vec<u8>> =
-            conn.query_row("SELECT series_id FROM measurement", [], |r| r.get(0)).unwrap();
-        assert_eq!(series, None, "the migration adds the column; the sweep fills it");
+        assert_eq!(keys, 1, "an issued key must survive the upgrade");
     }
 
-    /// **Every migration since 3.0 must leave an older binary able to write.** That is what makes
-    /// [`migrate`]'s acceptance of a newer minor sound, and it is the property — not any structural
-    /// one — that the rule on [`MIGRATIONS`] is really about.
+    /// **4.0 is where an older binary's writes stop working, and that is the definition of a major.**
     ///
-    /// Asserted behaviourally, by running the *verbatim* `INSERT` a 3.0/3.1 binary issues. An earlier
-    /// version of this test compared `pragma_table_info` between versions instead, which was a proxy
-    /// that failed the moment 3.2 added a nullable column — an addition that binary survives perfectly
-    /// well, since its `INSERT` never names the column and the column does not require it. Comparing
-    /// shapes would have forced a needless major bump; comparing behaviour permits exactly the
-    /// additions that are safe and no others.
+    /// The inverse of the test this replaces. Through 3.3 the property asserted was that the verbatim
+    /// pre-3.2 `INSERT` still succeeded — which is what made every one of those bumps a minor, and what
+    /// kept the nightly auto-upgrade's revert survivable. 4.0 deliberately ends it: `type` and
+    /// `attributes` are gone, so that `INSERT` names columns that do not exist. Asserting the refusal
+    /// keeps the boundary explicit rather than implied by a deleted test.
     #[test]
-    fn an_older_binarys_writes_still_work_against_the_current_schema() {
+    fn an_older_binarys_writes_are_refused_by_the_4_0_schema() {
         let conn = Connection::open_in_memory().unwrap();
         migrate(&conn).unwrap();
 
-        // The measurement insert as it was written before `series_id` existed.
-        conn.execute(
-            "INSERT OR IGNORE INTO measurement \
-             (id, event_time, processed_time, type, body, attributes) \
-             VALUES (x'0102030405060708090a0b0c0d0e0f10', 1, 2, 'cpu', '{}', '{}')",
-            [],
-        )
-        .expect("a 3.1-era measurement insert must still be accepted");
+        let err = conn
+            .execute(
+                "INSERT OR IGNORE INTO measurement \
+                 (id, event_time, processed_time, type, body, attributes) \
+                 VALUES (x'0102030405060708090a0b0c0d0e0f10', 1, 2, 'cpu', '{}', '{}')",
+                [],
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("no column named type") || err.contains("has no column named"),
+            "a pre-4.0 insert must be refused for naming dropped columns; got: {err}"
+        );
 
-        // And the other tables an older binary writes, unchanged since they were introduced.
+        // The tables 4.0 did not touch still take the same writes they always did.
         conn.execute(
             "INSERT INTO api_key (id, secret_hash, label, created_at) \
              VALUES ('0000000000000001', x'00', 'pi-7', 1)",
             [],
         )
-        .expect("a 3.0-era api_key insert must still be accepted");
+        .expect("api_key is unchanged");
         conn.execute(
             "INSERT INTO web_user (username, password_hash, created_at) VALUES ('op', x'00', 1)",
             [],
         )
-        .expect("a 3.1-era web_user insert must still be accepted");
+        .expect("web_user is unchanged");
     }
 
-    /// STRICT is what makes the column types enforced rather than advisory.
+    /// STRICT is what makes the column types enforced rather than advisory. Survives the 4.0 rebuild,
+    /// which is worth checking: a rebuilt table that forgot `STRICT` would silently start accepting
+    /// anything.
     #[test]
     fn schema_is_strict() {
         let conn = Connection::open_in_memory().unwrap();
         migrate(&conn).unwrap();
         let err = conn
             .execute(
-                "INSERT INTO measurement (id, event_time, processed_time, type, attributes) \
-                 VALUES (x'00', 'not-a-number', 1, 't', '{}')",
+                "INSERT INTO measurement (id, event_time, processed_time, body, series_id) \
+                 VALUES (x'00', 'not-a-number', 1, '{}', x'00')",
                 [],
             )
             .unwrap_err();

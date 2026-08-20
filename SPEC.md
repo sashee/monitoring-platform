@@ -556,6 +556,8 @@ The versions that exist:
 | 2.0 | content-addressed ids (§6.6): `measurement` dropped and recreated | major, and the illustration of why majors exist |
 | 3.0 | `api_key` (§13) | additive, but shipped as a single number |
 | 3.1 | `web_user`, `web_session` (§14) | **minor** — the first under this scheme |
+| 3.2 | `series` + a nullable `measurement.series_id` + the backfill index (§6.7) | **minor**, and phase one of a two-phase change |
+| 3.3 | `measurement_series_event_time_idx`, for the read path's move onto the join (§6.7) | **minor** — the risky half of 4.0, done where it can be reverted |
 
 ### 6.3 Write path
 
@@ -652,6 +654,178 @@ Two consequences to accept:
   and attributes collapse into one. Only reachable when a device's clock resolution is coarser than
   its sampling rate — a 1 kHz sensor with a 1-second clock repeating a value. Safe for any device
   whose clock ticks faster than it samples.
+
+### 6.7 The `series` table
+
+`measurement` carries `type` and `attributes` on every row, and those two columns identify *the time
+series* rather than describing what was measured. Measured on the deployed database:
+
+| | |
+|---|---|
+| rows | 117,952 |
+| distinct `(type, attributes)` | **1,458** |
+| replication | **81×** overall; 428× for `bms.status.cell` (47,904 rows over 112 series) |
+| `attributes` text | 60.85 MB — **50.1% of the file** |
+
+So half the database is 1,458 distinct strings written out 81 times each, growing at ~516 bytes of
+duplicated JSON per row against a projected ~8.9M rows/year (§9.3).
+
+`series` holds each combination once, keyed by a hash of it, and `measurement.series_id` points at it.
+
+**Identity.** `series_id` is the 128-bit blake3 prefix of a canonical encoding of `type` +
+`attributes`, under the domain `monitoring-platform/series/v1`. It shares the encoder in
+`crate::content_id` with §6.6's measurement id rather than copying it, so it inherits the explicit key
+sort — a device sending the same attributes in a different order lands in the same series — and the
+length prefixing and type tagging. A distinct domain prefix means a series id and a measurement id
+cannot coincide. 128 bits for the same reason as §6.6: a collision under `INSERT OR IGNORE` silently
+merges two distinct series, which is worse than an error.
+
+Timestamps and the body are **not** in the key. They are what a measurement measured; including
+either would mint a new series per measurement, which is the failure this table exists to prevent.
+
+**Bookkeeping, and why every one of those columns is named `added_*`.**
+
+| column | means |
+|---|---|
+| `added_measurements` | rows this database has ever *stored* for this series |
+| `added_event_time_min` / `_max` | the device-time extent of those rows |
+| `added_processed_time_min` / `_max` | the arrival-time extent of those rows |
+
+The prefix scopes all five to the **insert stream**: monotonic, never revised downward, explicitly not
+a description of what the table currently holds. Today they happen to agree with `count(*)` and
+`min(event_time)` over `measurement`. The day something starts deleting rows — expiration, retention —
+they stop agreeing, and only these columns still know what the series ever carried. A column called
+`num_measurements` or `min_event_time` would quietly become a lie at that point, and a stale timestamp
+reads as data in a way a stale count does not. So the naming carries the guarantee, and nothing ever
+recomputes these from the table: a recompute would replace "ever added" with "currently present",
+which is the exact substitution the names rule out.
+
+`added_measurements` counts rows **stored, not presented**. §6.6 makes a re-upload a no-op, so the
+write path folds a measurement into the bookkeeping only after its `INSERT OR IGNORE` reports a row —
+otherwise a device retrying after a lost acknowledgement would inflate the count. Both writes share
+one transaction, so a measurement can never be stored uncounted or counted unstored.
+
+**This is deliberately a two-phase change.**
+
+- **Phase one, 3.2.** Add `series`, add a *nullable* `measurement.series_id`, write both. Nothing is
+  dropped and nothing reads `series` yet, so a 3.1 binary works against the result unchanged.
+- **Phase one and a half, 3.3.** Point the **read** path at the join, and add the index it needs. Still a
+  minor: `measurement.type` and `measurement.attributes` are still written and still present, so a
+  reverted binary reads them exactly as before.
+- **Phase two, 4.0 (later).** Rebuild `measurement` without `type` and `attributes` and with
+  `series_id NOT NULL`, and delete the backfill machinery entirely. This is what reclaims the ~62 MB, and
+  it cannot be a minor: dropping a column a running 3.2 binary selects is precisely what §6.2's majors are
+  for. It requires 3.3 to have reached the host through the pipeline first — see below.
+
+**Why the read path moves in 3.3 rather than in 4.0.** 4.0 is the only migration that cannot be
+rehearsed on the deployed host: it must arrive through the pipeline, and once applied there is no
+reverting to a binary that expects the dropped columns. Rewriting every read *and* dropping the columns
+in that one step would put the risky half — a hundred lines of query construction — where it can neither
+be tested live nor rolled back. Doing the reads first, in a revertible minor, leaves 4.0 as pure DDL
+with **no accompanying code change at all**.
+
+That is also why `read.rs` has exactly one `FROM` constant. `measurement` still carries both columns, so
+the only thing keeping a query off the stale copy is that no query names it — and one constant is what
+makes that checkable rather than hoped for. A test de-synchronises the two copies and demands the
+`series` answer from every read: rows, the type list, both filter halves, facet discovery, the extent
+query and the aggregated chart query.
+
+The rollback story still holds, and it is what makes 3.3 safe: a revert takes the *code* back too, so a
+3.2 binary reads `measurement.type` as it always did. A revert followed by an update is fine as well —
+the older binary leaves rows with no `series_id`, and the next 3.3 startup's sweep assigns them before
+the socket is bound.
+
+**The join is inner, so an unassigned row is invisible** — which turns the sweep from a tidiness concern
+into a correctness precondition, and is why a failed backfill is **fatal** from 3.3 on (§6.7 below, and
+`main.rs`). It is skipped entirely for queries that read neither `type` nor `attributes`: the join cannot
+remove a row, so omitting it is result-preserving, and it saves ~85 ms on a landing-page render.
+
+**The fill is a convergence sweep, not a migration step**, and that is the load-bearing decision. A
+one-shot fill inside the 3.2 migration would leave a hole, and not at the head of the table where it
+would be noticed:
+
+1. 3.2 migrates and fills every row.
+2. The nightly `system.autoUpgrade` reverts to the 3.1 binary. It *starts fine* — the entire point of
+   a minor version — but its `INSERT` does not name `series_id`, so every row it writes gets NULL and
+   no `series` row.
+3. Rolling forward leaves an arbitrary interior range unfilled, with nothing marking it.
+
+So the invariant is not "the migration filled it" but **a 3.2 binary running drives the gap to zero**.
+`store::series::backfill` runs on **every startup**.
+
+`measurement_backfill_idx`, partial on `series_id IS NULL`, **is the work queue**. It costs
+O(unfilled) rather than O(table), collapses to nothing once the fill converges, makes "how many are
+left" an index probe cheap enough for a page render, and — the point — a row written by a reverted 3.1
+binary enters it automatically. It is deliberately temporary; 4.0 drops it.
+
+**The fill is per-series, not per-measurement**, and that is what makes it affordable. One grouped scan
+(`GROUP BY type, attributes` over the queue) yields the 1,458 distinct pairs with their `count`/`min`/
+`max` computed by SQL; the hashing and the upserts then run 1,458 times rather than 118,718. A single
+set-wise `UPDATE`, correlated on `(type, attributes)` through `series_type_attributes_idx`, assigns
+every row in one statement.
+
+The first implementation did it the obvious way — read each row, hash it, update it, in resumable
+2,000-row chunks — and took **168 s** on the deployed database against **19 s** for the form above:
+118,718 single-row updates across 60 committing transactions, with a WAL checkpoint every few. That
+does not fit the startup budget, so the whole fill is now **one transaction**. The failure mode
+chunking protected against — a power cut mid-fill — now costs a clean rollback and a repeat on the next
+start, which at ~20 s is a better trade than three minutes of startup every time.
+
+Because the fill is one transaction, its bookkeeping is atomic with its assignment by construction: a
+row is counted and leaves the queue in the same commit, or neither happens. No row can be filled twice,
+and nothing sets `series_id` back to NULL.
+
+**One case is refused rather than half-done.** SQL must group by the attribute *text*, since it cannot
+compute the hash — so two spellings of the same object (differing key order) arrive as two groups,
+share a series id, and the second finds no matching `series.attributes` and stays NULL. The fill
+re-checks the queue inside the transaction and rolls back with an error naming the count. Nothing the
+write path emits can produce this: it serialises from a sorted map. So it is a report that something
+else wrote the column, and leaving those rows queued is the honest outcome.
+
+The unit allows `TimeoutStartSec = maxPolls × pollIntervalSecs + 120` = 420 s, of which the clock gate
+claims 300, so the fill has 120 s of slack. Measured at **41.7 s** on the deployed database, once; every
+startup after is one index probe (`starting` → `ready` in 1.1 ms). It logs `filled` and `elapsed`, and if
+that ever approaches the slack it moves behind `sd_notify(READY)`. It runs in `serve` rather than in
+`migrate` or `open_write`, because `create-api-key` and `create-user` open the database the same way and
+have no business running a backfill.
+
+**A failed fill is fatal**, and the contrast with the api-key count two paragraphs up is deliberate. A
+missing key degrades a *feature*: requests are refused, loudly, and nothing reported is wrong. An
+unassigned measurement is different — since 3.3 the read path joins `series`, so such a row is invisible
+to `/v1/measurements` and to every chart. Quietly under-reporting is the worst failure available to a
+monitoring system: an empty chart reads as "nothing happened", which is the one answer it must never give
+wrongly. Being down and saying so is strictly better.
+
+The precondition is exact rather than approximate, because the fill is one transaction that re-checks the
+queue before committing: **`backfill` returning `Ok` means the queue is empty.** Nothing can refill it
+afterwards — only the writer stores measurements, it is spawned after, and it always sets `series_id`.
+Reachable only from data this receiver did not write, or from I/O failure; both need a human, and
+`Restart=on-failure` retries every 60 s meanwhile.
+
+**Phase two needs no fill at all, provided 3.3 reaches the host through the pipeline first.** Once the
+pipeline delivers 3.3, every binary that can run writes a `series_id`: the nightly upgrade can only
+revert to 3.3, and a locally-switched generation is 3.3 or newer. So the queue converges once and stays
+empty, and 4.0 arrives at a database where every row is already assigned. The sweep, `pending`, the
+partial index and the UI note are then **pure deletion** — no fill logic survives into 4.0, and none is
+needed there.
+
+That ordering is a real precondition, not a hope, so 4.0 **checks rather than assumes**: one probe of
+`measurement_backfill_idx` before dropping it, refusing to migrate if anything is unassigned. Cheap, and
+the alternative is silently discarding the only source those rows have. It is recoverable, since the
+generation being replaced is still bootable and still converges. The only way to reach it is booting an
+older generation from the bootloader by hand, which is a deliberate act.
+
+Getting the fill *out* of 4.0 matters because a fill cannot be expressed in the migration's SQL: minting
+a series row for a combination never seen before needs blake3, and a reverted binary crossing a reboot
+produces exactly that — `resource.attributes.boot_id` is a dimension, so a new boot is a new series. A
+4.0 that had to fill would need a Rust step ordered before its own DDL, in the one migration that cannot
+be rehearsed on the deployed host. Shipping the read path in 3.3 is what removes that requirement.
+
+4.0 is therefore a **table rebuild**, the way 2.0 was: `CREATE` the new shape, `INSERT … SELECT`, `DROP`,
+`RENAME`. A rebuild rather than `DROP COLUMN` for two reasons — SQLite cannot `ALTER TABLE … ADD NOT
+NULL`, and `DROP COLUMN` rewrites every row without shrinking the file. Measured on the deployed
+database, 3.2 left **+9.2 MB** of page-split slack from widening every row in place; a rebuild reclaims
+that together with the ~62 MB of duplicated text, with no `VACUUM` and no second pass.
 
 ## 7. Read API
 
@@ -1112,6 +1286,7 @@ src/
     schema.rs          version encoding, migrations, pragmas
     write.rs           writer task, insert_batch
     read.rs            query building, JSON path builder, row mapping
+    series.rs          the series table (§6.7): the fold, the upsert, the backfill sweep
     keys.rs            the api_key table (§13)
     users.rs           the web_user table (§14)
     sessions.rs        the web_session table (§14)
@@ -1296,6 +1471,53 @@ Unit tests (pure functions, no I/O):
   leaves the newer binary's extra table intact. A database already at the current version is not
   written to at all, which is what keeps a deployed 3.0 database readable by a binary from before
   major.minor existed.
+- **An older binary's writes still work against the current schema** (§6.2). Asserted behaviourally,
+  by executing the verbatim pre-3.2 `INSERT` — the one that does not name `series_id` — plus the
+  `api_key` and `web_user` inserts. This replaced a test that compared `pragma_table_info` between
+  versions, which was a proxy that failed the moment 3.2 added a nullable column an older binary
+  survives perfectly well. Comparing shapes would have forced a needless major bump; comparing
+  behaviour permits exactly the additions §6.2 allows and no others.
+- Series identity (§6.7): attribute order and nested-object order do not change a `series_id`; both
+  halves of the key do; a series id is domain-separated from the measurement id of the same inputs;
+  field boundaries are unambiguous, so `("ab", {"c":…})` and `("a", {"bc":…})` differ; and the encoding
+  is pinned to a fixed hex value, because changing it invalidates every stored `series_id`.
+- The series fold (§6.7): rows of one series collapse into one delta; the extents are `min`/`max`, so
+  they do not depend on the order rows are folded — neither a batch nor the backfill scan is
+  time-ordered.
+- Series bookkeeping through the write path (§6.7). **A re-uploaded batch does not inflate
+  `added_measurements`** — the regression test for folding before the insert rather than after it,
+  which is the specific untruth the `added_` naming promises against. A partly-overlapping batch
+  counts only what it stored. Extents widen in both directions and are never narrowed, which is what a
+  spool drained after a reboot requires. `added_processed_time_*` tracks `processed_time` and not
+  `event_time`, catching a transposed parameter that is otherwise invisible. Timestamps are **not**
+  part of the key, so two measurements differing only in time share a series. A 16-series batch
+  attributes each row to its own series. And `series.type`/`series.attributes` are byte-identical to
+  the measurement's, which is what makes phase two's column drop lossless.
+- The backfill sweep (§6.7). **The rollback scenario as a test**: a row written the way a 3.1 binary
+  writes it leaves `series_id` NULL, and the sweep then fills it. **The sweep and the write path derive
+  the same id** — the sweep is the one place a series id comes from *stored JSON* rather than from the
+  measurement the ingest path built, and §6.2's version-2 note treats a second encoding path as a
+  hazard, so it is pinned rather than assumed. Five rows of one series fill into a single `series` row
+  carrying all five and the extents SQL computed for the group; twelve rows over four series fill in one
+  pass without cross-assigning. Re-running fills nothing and changes no count, which is what lets it run
+  on every startup, and a *later* sweep accumulates onto what an earlier one left rather than replacing
+  it — the case a reverted 3.1 binary produces twice. Rows written by the write path and rows swept
+  accumulate into *one* series whose count and extents span both. **Two spellings of one object are
+  refused and rolled back whole**, asserting that neither row was assigned and no `series` row survives,
+  because a partial commit would be worse than the error. Plus an empty table, a row with no attributes
+  and a NULL body, and that the partial index is empty — not merely unused — once the fill converges.
+- **Every read of `type` and `attributes` comes from `series`** (§6.7) — the guard on 4.0, since that
+  migration drops the old columns as pure DDL with no code change, so anything still reading them would
+  break unrehearsably. Asserted by de-synchronising the two copies, which nothing in the receiver ever
+  does, and demanding the `series` answer from: the projected row columns, the type list, the type filter
+  in *both* directions, the attribute filter in both directions, facet discovery, the extent query and the
+  aggregated chart query.
+- A measurement with no `series_id` is invisible to reads and counted as pending — the precondition
+  stated as a test, and the reason a failed backfill is fatal.
+- The join is omitted exactly when nothing reads it (§6.7): asserted on the generated SQL, since both
+  forms return identical results and only the cost differs. An unfiltered extent and a plain timeline skip
+  it; a type filter, an attribute filter and grouping by an attribute require it; a body filter and
+  grouping by a body leaf do not; the row query can never skip it.
 - The JSON path builder (§7.1): keys containing `"`, `\`, `.`, `[`, `]`, `$` and `*` all produce paths
   that match the intended key. Verified that unquoted/unescaped variants fail *silently* in SQLite
   (`NULL`, not an error), which is why this is a unit-tested function rather than inline formatting.
@@ -1338,6 +1560,12 @@ Integration tests:
   assert the socket file is gone.
 - Stale-socket handling: leave a dead socket file behind and assert startup reclaims it; leave a
   regular file and assert startup fails without deleting it.
+- **Startup refuses to serve when a measurement cannot be assigned a series** (§6.7), asserting the exit
+  is non-zero, that the message names the cause, and that the rows are still queued — the fill is one
+  transaction, so a refusal changes nothing. Forced with the only input that can do it: two spellings of
+  one attribute object.
+- Startup **assigns** a series to rows that have none, which is the wiring a unit test on `backfill`
+  cannot reach: unwired, every unit test still passes and the deployed receiver never converges.
 - Schema compatibility, against the spawned binary rather than only `migrate` (§6.2): a database at a
   newer **major** exits non-zero with the reason on stderr; one at a newer **minor** starts, serves
   `/healthz` *and* `/v1/measurements`, and leaves `user_version` untouched. The end-to-end shape is
@@ -1428,6 +1656,8 @@ The explorer (§14.9):
   data's extent dropped the last row every time — invisible at a thousand rows, which is why it is pinned.
 - **The `all` window does not depend on the value filters**, so the axis does not rescale as filters change
   and widening a facet still has rows in range to offer.
+- The backfill note (§6.7) appears while measurements are unassigned and **disappears** once the sweep
+  has converged — a permanent banner about a finished job is noise.
 - API keys (§13, §14.1): the page lists and issues; an issued token is rendered **once** and is absent from
   the next load; a key issued from the page authenticates on `/v1`; revoking one stops it working; a label
   is required; the pages are behind the session guard and the origin check.

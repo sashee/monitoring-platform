@@ -6,10 +6,12 @@
 
 use anyhow::{Context, Result};
 use rusqlite::Connection;
+use std::collections::BTreeMap;
 use tokio::sync::{mpsc, oneshot};
 
 use crate::content_id::content_id;
 use crate::model::Measurement;
+use crate::store::series;
 
 pub struct WriteRequest {
     pub measurements: Vec<Measurement>,
@@ -66,19 +68,26 @@ pub fn spawn(conn: Connection) -> (Writer, tokio::task::JoinHandle<()>) {
 /// Returns the number of rows actually stored, which is *not* the batch length when the batch
 /// contains measurements already present: `id` is a content hash, so `INSERT OR IGNORE` makes a
 /// re-upload a no-op (SPEC §6.6).
+///
+/// Also maintains `series` (SPEC §6.7). A row is folded into the series bookkeeping **only if the
+/// insert actually stored it** — counting before the insert would let a retried batch inflate
+/// `added_measurements`, which is precisely the kind of untruth those column names exist to prevent.
+/// Both writes share this one transaction, so a measurement can never be stored uncounted or counted
+/// unstored.
 pub fn insert_batch(conn: &mut Connection, measurements: &[Measurement]) -> Result<usize> {
     if measurements.is_empty() {
         return Ok(0);
     }
 
     let mut stored = 0usize;
+    let mut deltas = BTreeMap::new();
     let tx = conn.transaction().context("beginning write transaction")?;
     {
         let mut stmt = tx
             .prepare_cached(
                 "INSERT OR IGNORE INTO measurement \
-                 (id, event_time, processed_time, type, body, attributes) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                 (id, event_time, processed_time, type, body, attributes, series_id) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
             )
             .context("preparing insert")?;
 
@@ -97,18 +106,37 @@ pub fn insert_batch(conn: &mut Connection, measurements: &[Measurement]) -> Resu
             // Derived from the measurement's own canonical encoding, not from the JSON written
             // above — the two must never be allowed to drift apart (SPEC §6.6).
             let id = content_id(m);
+            let series = series::id_of(m);
 
-            stored += stmt
+            let inserted = stmt
                 .execute(rusqlite::params![
                     &id[..],
                     m.event_time,
                     m.processed_time,
                     m.kind,
                     body,
-                    attributes
+                    attributes,
+                    &series[..]
                 ])
                 .context("inserting measurement")?;
+            stored += inserted;
+
+            if inserted > 0 {
+                // The same `attributes` string the column got, so `series.attributes` is
+                // byte-identical to `measurement.attributes` by construction rather than by
+                // coincidence — which is what makes phase two's column drop lossless.
+                series::accumulate(
+                    &mut deltas,
+                    &m.kind,
+                    &attributes,
+                    &m.attributes,
+                    m.event_time,
+                    m.processed_time,
+                );
+            }
         }
+
+        series::upsert(&tx, &deltas)?;
     }
     tx.commit().context("committing write transaction")?;
 
@@ -218,6 +246,203 @@ mod tests {
 
         let id: Vec<u8> = c.query_row("SELECT id FROM measurement", [], |r| r.get(0)).unwrap();
         assert_eq!(id, content_id(&m).to_vec());
+    }
+
+    // ------------------------------------------------------------------------------- series (§6.7)
+
+    fn series_row(c: &Connection, id: &crate::content_id::ContentId) -> (i64, i64, i64, i64, i64) {
+        c.query_row(
+            "SELECT added_measurements, added_event_time_min, added_event_time_max, \
+             added_processed_time_min, added_processed_time_max FROM series WHERE id = ?1",
+            [&id[..]],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+        )
+        .unwrap()
+    }
+
+    fn series_count(c: &Connection) -> i64 {
+        c.query_row("SELECT count(*) FROM series", [], |r| r.get(0)).unwrap()
+    }
+
+    #[test]
+    fn measurements_of_one_series_share_one_series_row() {
+        let mut c = conn();
+        insert_batch(&mut c, &[measurement("a", 1), measurement("a", 2)]).unwrap();
+
+        assert_eq!(series_count(&c), 1);
+        let distinct: i64 = c
+            .query_row("SELECT count(DISTINCT series_id) FROM measurement", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(distinct, 1, "both rows must point at it");
+    }
+
+    #[test]
+    fn differing_attributes_make_separate_series() {
+        let mut c = conn();
+        let mut other = measurement("a", 2);
+        other.attributes = json!({"record.attributes.unit": "f"}).as_object().unwrap().clone();
+        insert_batch(&mut c, &[measurement("a", 1), other]).unwrap();
+        assert_eq!(series_count(&c), 2);
+    }
+
+    #[test]
+    fn differing_types_make_separate_series() {
+        let mut c = conn();
+        insert_batch(&mut c, &[measurement("a", 1), measurement("b", 1)]).unwrap();
+        assert_eq!(series_count(&c), 2);
+    }
+
+    /// Phase two drops `measurement.type` and `measurement.attributes` and reads them from `series`
+    /// instead. That is only lossless if the two carry the same bytes, so it is asserted rather than
+    /// assumed — and asserted on the text, because a JSON-equal but differently-serialised string
+    /// would still make the column drop a change in what is stored.
+    #[test]
+    fn a_series_carries_the_same_type_and_attributes_text_as_its_measurements() {
+        let mut c = conn();
+        let mut m = measurement("gps", 1);
+        m.attributes = json!({"z.last": 1, "a.first": 2, "record.attributes.unit": "wgs84"})
+            .as_object()
+            .unwrap()
+            .clone();
+        insert_batch(&mut c, std::slice::from_ref(&m)).unwrap();
+
+        let mismatched: i64 = c
+            .query_row(
+                "SELECT count(*) FROM measurement m JOIN series s ON s.id = m.series_id \
+                 WHERE m.type <> s.type OR m.attributes <> s.attributes",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(mismatched, 0);
+    }
+
+    #[test]
+    fn the_stored_series_id_is_the_one_the_pure_function_derives() {
+        let mut c = conn();
+        let m = measurement("a", 1);
+        insert_batch(&mut c, std::slice::from_ref(&m)).unwrap();
+
+        let stored: Vec<u8> =
+            c.query_row("SELECT series_id FROM measurement", [], |r| r.get(0)).unwrap();
+        assert_eq!(stored, series::id_of(&m).to_vec());
+    }
+
+    /// **The count must not be inflatable by a retry.** `id` is a content hash so a re-upload stores
+    /// nothing (SPEC §6.6); if the series fold ran before the insert rather than after it, this batch
+    /// would report six measurements where three arrived. That is exactly the untruth the `added_`
+    /// naming promises against.
+    #[test]
+    fn a_reuploaded_batch_does_not_inflate_the_count() {
+        let mut c = conn();
+        let batch = [measurement("a", 1), measurement("a", 2), measurement("a", 3)];
+
+        insert_batch(&mut c, &batch).unwrap();
+        insert_batch(&mut c, &batch).unwrap();
+
+        let id = series::id_of(&batch[0]);
+        assert_eq!(series_row(&c, &id).0, 3, "a retry must not be counted");
+    }
+
+    /// A partly-new batch must count exactly the new part.
+    #[test]
+    fn an_overlapping_batch_counts_only_what_was_stored() {
+        let mut c = conn();
+        insert_batch(&mut c, &[measurement("a", 1)]).unwrap();
+        insert_batch(&mut c, &[measurement("a", 1), measurement("a", 2)]).unwrap();
+
+        assert_eq!(series_row(&c, &series::id_of(&measurement("a", 1))).0, 2);
+    }
+
+    /// The extents accumulate rather than overwrite, in both directions. A later batch carrying older
+    /// measurements — a spool drained after a reboot, which this collector does — must widen the
+    /// minimum and leave the maximum alone.
+    #[test]
+    fn extents_widen_and_are_never_narrowed() {
+        let mut c = conn();
+        // Both stamps move together here, so the assertions cover all four columns at once.
+        let at = |event: i64| {
+            let mut m = measurement("a", event);
+            m.processed_time = event + 1_000;
+            m
+        };
+        let id = series::id_of(&at(5_000));
+
+        insert_batch(&mut c, &[at(5_000)]).unwrap();
+        assert_eq!(series_row(&c, &id), (1, 5_000, 5_000, 6_000, 6_000));
+
+        insert_batch(&mut c, &[at(9_000)]).unwrap();
+        assert_eq!(series_row(&c, &id), (2, 5_000, 9_000, 6_000, 10_000), "max must extend");
+
+        insert_batch(&mut c, &[at(1_000)]).unwrap();
+        assert_eq!(series_row(&c, &id), (3, 1_000, 9_000, 2_000, 10_000), "min must extend");
+    }
+
+    /// `added_processed_time_*` must track `processed_time` and not `event_time`. A transposed
+    /// parameter is otherwise invisible, since the two are usually close together.
+    #[test]
+    fn the_arrival_extents_track_processed_time_not_event_time() {
+        let mut c = conn();
+        let mut m = measurement("a", 1_000);
+        m.processed_time = 999_000_000;
+        insert_batch(&mut c, std::slice::from_ref(&m)).unwrap();
+
+        let (_, emin, emax, pmin, pmax) = series_row(&c, &series::id_of(&m));
+        assert_eq!((emin, emax), (1_000, 1_000));
+        assert_eq!((pmin, pmax), (999_000_000, 999_000_000));
+    }
+
+    /// The bookkeeping is not part of the key — otherwise every measurement would mint its own series
+    /// and the table would be worse than the duplication it replaces.
+    #[test]
+    fn timestamps_are_not_part_of_the_series_key() {
+        let mut c = conn();
+        let mut later = measurement("a", 90_000);
+        later.processed_time = 500_000;
+        insert_batch(&mut c, &[measurement("a", 1), later]).unwrap();
+        assert_eq!(series_count(&c), 1);
+    }
+
+    /// A batch spanning many series — the `bms.status.cell` shape, 16 cells per flush — must attribute
+    /// each row to its own series.
+    #[test]
+    fn a_batch_spanning_many_series_attributes_each_row_correctly() {
+        let mut c = conn();
+        let batch: Vec<_> = (0..16)
+            .map(|cell| {
+                let mut m = measurement("bms.status.cell", 1_000 + cell);
+                m.attributes =
+                    json!({"record.attributes.cell": cell}).as_object().unwrap().clone();
+                m
+            })
+            .collect();
+        insert_batch(&mut c, &batch).unwrap();
+
+        assert_eq!(series_count(&c), 16);
+        for m in &batch {
+            assert_eq!(series_row(&c, &series::id_of(m)).0, 1);
+        }
+    }
+
+    /// The invariant phase two rests on, and the one that holds only until something starts deleting
+    /// rows — which is the entire reason these columns are named `added_*`.
+    #[test]
+    fn every_series_count_matches_the_rows_pointing_at_it() {
+        let mut c = conn();
+        let mut batch = vec![measurement("a", 1), measurement("a", 2), measurement("b", 3)];
+        batch[2].attributes = json!({"record.attributes.unit": "k"}).as_object().unwrap().clone();
+        insert_batch(&mut c, &batch).unwrap();
+
+        let disagreeing: i64 = c
+            .query_row(
+                "SELECT count(*) FROM series s JOIN \
+                 (SELECT series_id, count(*) n FROM measurement GROUP BY series_id) m \
+                 ON m.series_id = s.id WHERE s.added_measurements <> m.n",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(disagreeing, 0);
     }
 
     #[test]

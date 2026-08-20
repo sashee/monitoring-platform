@@ -1,6 +1,7 @@
 pub mod keys;
 pub mod read;
 pub mod schema;
+pub mod series;
 pub mod sessions;
 pub mod users;
 pub mod write;

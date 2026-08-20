@@ -374,6 +374,124 @@ fn refuses_to_start_against_a_newer_major_schema() {
     assert!(stderr.contains("newer than this binary"), "unexpected stderr: {stderr}");
 }
 
+/// SPEC §6.7: **startup fills in the series of measurements written without one.**
+///
+/// The end-to-end shape is the point, and a unit test on `backfill` cannot reach it: what is being
+/// asserted is that `serve` actually *calls* the sweep. Unwired, every unit test still passes and the
+/// deployed receiver quietly never converges.
+///
+/// The rows are inserted the way a 3.1 binary writes them — no `series_id` — which is exactly what a
+/// nightly `system.autoUpgrade` revert leaves behind, and the reason the fill is a sweep rather than a
+/// step in the migration.
+#[test]
+fn startup_assigns_a_series_to_measurements_that_have_none() {
+    let dir = tempfile::tempdir().unwrap();
+    let socket = dir.path().join("mp.sock");
+    let db = dir.path().join("mp.db");
+
+    // Migrates, so `series` and the column exist — then rows arrive as an older binary writes them.
+    let authorization = common::issue_key(&db);
+    {
+        let conn = rusqlite::Connection::open(&db).unwrap();
+        for row in 0..3u8 {
+            let mut id = [0u8; 16];
+            id[0] = row;
+            conn.execute(
+                "INSERT INTO measurement (id, event_time, processed_time, type, body, attributes) \
+                 VALUES (?1, ?2, ?2, 'cpu', '{}', '{\"record.attributes.core\":0}')",
+                rusqlite::params![&id[..], 1_000 + i64::from(row)],
+            )
+            .unwrap();
+        }
+        let unassigned: i64 = conn
+            .query_row("SELECT count(*) FROM measurement WHERE series_id IS NULL", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(unassigned, 3, "the older binary's insert must leave the column NULL");
+    }
+
+    let child = Command::new(env!("CARGO_BIN_EXE_monitoring-platform"))
+        .args(["serve", "--socket"])
+        .arg(&socket)
+        .arg("--db")
+        .arg(&db)
+        .args(["--log-level", "warn"])
+        .spawn()
+        .unwrap();
+
+    let mut server = Server { child, socket, db: db.clone(), authorization, _dir: dir };
+    server.wait_until_ready();
+    assert!(server.terminate());
+
+    let conn = rusqlite::Connection::open(&db).unwrap();
+    let unassigned: i64 = conn
+        .query_row("SELECT count(*) FROM measurement WHERE series_id IS NULL", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(unassigned, 0, "startup must have filled them in");
+
+    // One series for three rows of the same type and attributes, and its count is the three — the
+    // property phase two's join depends on.
+    let (series, added): (i64, i64) = conn
+        .query_row("SELECT count(*), sum(added_measurements) FROM series", [], |r| {
+            Ok((r.get(0)?, r.get(1)?))
+        })
+        .unwrap();
+    assert_eq!((series, added), (1, 3));
+}
+
+/// SPEC §6.7: **a measurement that cannot be assigned a series stops the process**, rather than being
+/// quietly omitted from every read.
+///
+/// The read path joins `series` for `type` and `attributes`, so an unassigned row is invisible. Being
+/// loudly down beats under-reporting: an empty chart looks like "nothing happened", which is the one
+/// answer a monitoring system must never give wrongly.
+///
+/// Forced with the only input that can do it — two spellings of one attribute object, which share a
+/// series id so the second matches no `series.attributes`. Nothing this receiver writes can produce
+/// that, which is why it is fatal rather than handled.
+#[test]
+fn refuses_to_start_when_a_measurement_cannot_be_assigned_a_series() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("mp.db");
+
+    common::issue_key(&db);
+    {
+        let conn = rusqlite::Connection::open(&db).unwrap();
+        for (row, attributes) in [(1u8, r#"{"a":1,"b":2}"#), (2u8, r#"{"b":2,"a":1}"#)] {
+            let mut id = [0u8; 16];
+            id[0] = row;
+            conn.execute(
+                "INSERT INTO measurement (id, event_time, processed_time, type, body, attributes) \
+                 VALUES (?1, ?2, ?2, 'cpu', '{}', ?3)",
+                rusqlite::params![&id[..], 1_000 + i64::from(row), attributes],
+            )
+            .unwrap();
+        }
+    }
+
+    let output = Command::new(env!("CARGO_BIN_EXE_monitoring-platform"))
+        .args(["serve", "--socket"])
+        .arg(dir.path().join("mp.sock"))
+        .arg("--db")
+        .arg(&db)
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success(), "should have refused to start");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("could not be matched to a series"),
+        "the refusal must name the cause: {stderr}"
+    );
+
+    // And it changed nothing: the fill is one transaction, so the rows are still queued for a retry
+    // once whatever wrote them is dealt with.
+    let conn = rusqlite::Connection::open(&db).unwrap();
+    let unassigned: i64 = conn
+        .query_row("SELECT count(*) FROM measurement WHERE series_id IS NULL", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(unassigned, 2);
+}
+
 /// SPEC §6.2: a newer *minor* must start, because a minor version only adds tables, indexes and
 /// defaulted columns — so everything this binary knows about is still where it expects it.
 ///

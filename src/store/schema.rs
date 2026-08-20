@@ -81,7 +81,7 @@ impl std::fmt::Display for Version {
 }
 
 /// Schema version this binary understands. Tracked in `PRAGMA user_version`.
-pub const SCHEMA_VERSION: Version = Version::new(3, 1);
+pub const SCHEMA_VERSION: Version = Version::new(3, 3);
 
 /// A compile-time guard, not a test, because it is an invariant about a constant and a build is the right
 /// place to lose an argument with one.
@@ -251,6 +251,89 @@ const MIGRATIONS: &[Migration] = &[
     ) STRICT;
 
     CREATE INDEX web_session_expires_at_idx ON web_session (expires_at);
+    "#,
+    },
+    // → version 3.2: the series dimension table (SPEC §6.7), phase one of two.
+    //
+    // `measurement` carries `type` and `attributes` on every row, and those two columns identify the
+    // time series rather than describing what was measured. On the deployed database that is 1,458
+    // distinct pairs written out across 117,952 rows — 81× replication, and 50% of the file.
+    //
+    // **A minor bump, and every line here is chosen to keep it one.** `series` is a new table, which a
+    // 3.1 binary neither reads nor writes. `series_id` is a *nullable* added column, because a 3.1
+    // binary's INSERT does not name it and so the column has to be satisfiable without it — declaring
+    // it NOT NULL is the single edit that would turn this into a 4.0 and strand every receiver the
+    // nightly auto-upgrade reverts.
+    //
+    // Phase two (4.0) makes `series_id` NOT NULL and drops `type` and `attributes`, which is what
+    // actually reclaims the space. It cannot happen here: dropping a column a running 3.1 binary
+    // selects is precisely the case the majors exist for.
+    //
+    // The partial index **is the backfill work queue** — see `store::series`. It costs O(unfilled)
+    // rather than O(table), collapses to nothing once the fill completes, and a row written by a
+    // reverted 3.1 binary enters it automatically, which is what makes the fill self-healing rather
+    // than a one-shot with a hole in it. Deliberately temporary: 4.0 drops it.
+    //
+    // `series_type_attributes_idx` exists for one statement: the backfill assigns every unfilled row
+    // its series with a single set-wise `UPDATE` correlated on `(type, attributes)`, and without this
+    // index that correlation is a scan of `series` per measurement. Measured: assigning row-by-row from
+    // Rust instead took 168 s on the deployed database against 19 s for the set-wise form, which is the
+    // difference between fitting inside `TimeoutStartSec` and not. Also temporary — at 4.0 the columns
+    // it indexes are gone from `measurement` and the correlation with them.
+    //
+    // No index on `measurement (series_id, …)`. Nothing reads `series` in phase one, and an index over
+    // 118k rows costs space and write throughput now for a query that does not exist yet. Additive, so
+    // it stays available as a later minor.
+    //
+    // The `added_*` columns are bookkeeping over the **insert stream**: monotonic, never revised
+    // downward, and deliberately not a description of what the table currently holds. Once expiration
+    // exists and rows are deleted, `count(*)` and `min(event_time)` over `measurement` stop answering
+    // "what did this series ever carry" — and only these columns still know. That is the whole reason
+    // for the prefix: a column called `num_measurements` or `min_event_time` would quietly become a
+    // lie, and a stale timestamp reads as data in a way a stale count does not. They are NOT part of
+    // `series_id`; the key is type + attributes alone.
+    Migration {
+        version: Version::new(3, 2),
+        sql: r#"
+    CREATE TABLE series (
+      id                       BLOB    PRIMARY KEY,
+      type                     TEXT    NOT NULL,
+      attributes               TEXT    NOT NULL,
+      added_measurements       INTEGER NOT NULL,
+      added_event_time_min     INTEGER NOT NULL,
+      added_event_time_max     INTEGER NOT NULL,
+      added_processed_time_min INTEGER NOT NULL,
+      added_processed_time_max INTEGER NOT NULL
+    ) STRICT;
+
+    ALTER TABLE measurement ADD COLUMN series_id BLOB;
+
+    CREATE INDEX measurement_backfill_idx ON measurement (id) WHERE series_id IS NULL;
+    CREATE INDEX series_type_attributes_idx ON series (type, attributes);
+    "#,
+    },
+    // → version 3.3: the index the *read* path needs now that it joins `series` (SPEC §6.7, §7.1).
+    //
+    // 3.2 wrote `series` and read nothing from it. This is the other half: every read of a
+    // measurement's `type` or `attributes` now comes from the join, which is what lets 4.0 be nothing
+    // but `DROP COLUMN` — no read-path rewrite in the one migration that cannot be rehearsed on the
+    // deployed host, because it has to arrive through the pipeline and cannot be reverted.
+    //
+    // Why a separate minor rather than an edit to 3.2: 3.2 is already applied on the deployed database
+    // (`user_version = 3002`), so editing its SQL would silently skip this index there. That is the
+    // migration list working as designed, not an inconvenience.
+    //
+    // The index replaces what `measurement_type_event_time_idx` used to do. That one leads with `type`,
+    // which the read path no longer filters on — the predicate is `series.type` now — so a type filter
+    // would otherwise have no index to stand on. `measurement_type_event_time_idx` is deliberately
+    // *kept*: a 3.2 binary the nightly reverts to still filters on `measurement.type` and would be slow
+    // without it. 4.0 drops both it and the column it covers, in that order, since SQLite refuses to
+    // drop an indexed column.
+    Migration {
+        version: Version::new(3, 3),
+        sql: r#"
+    CREATE INDEX measurement_series_event_time_idx
+      ON measurement (series_id, event_time DESC, id DESC);
     "#,
     },
 ];
@@ -631,49 +714,58 @@ mod tests {
 
         assert!(has_table(&conn, "web_user"));
         assert!(has_table(&conn, "web_session"));
-        assert_eq!(stored_version(&conn), Version::new(3, 1).encode());
+        assert!(has_table(&conn, "series"), "3.2 must have run too");
+        assert_eq!(stored_version(&conn), SCHEMA_VERSION.encode());
 
         let rows: i64 =
             conn.query_row("SELECT count(*) FROM measurement", [], |r| r.get(0)).unwrap();
         assert_eq!(rows, 1, "an existing measurement must survive the upgrade");
         let keys: i64 = conn.query_row("SELECT count(*) FROM api_key", [], |r| r.get(0)).unwrap();
         assert_eq!(keys, 1, "and so must an issued key");
+        // The new column exists and is NULL on the pre-existing row, which is what `store::series`
+        // sweeps up afterwards. Filling it here would make the migration a one-shot with a hole in it
+        // — see that module's header.
+        let series: Option<Vec<u8>> =
+            conn.query_row("SELECT series_id FROM measurement", [], |r| r.get(0)).unwrap();
+        assert_eq!(series, None, "the migration adds the column; the sweep fills it");
     }
 
-    /// The 3.1 migration must be additive, because [`migrate`] lets a 3.0 binary run against a 3.1
-    /// database and that is only sound while it is. Asserted structurally rather than trusted: the
-    /// tables a 3.0 binary reads and writes must be untouched by it.
+    /// **Every migration since 3.0 must leave an older binary able to write.** That is what makes
+    /// [`migrate`]'s acceptance of a newer minor sound, and it is the property — not any structural
+    /// one — that the rule on [`MIGRATIONS`] is really about.
+    ///
+    /// Asserted behaviourally, by running the *verbatim* `INSERT` a 3.0/3.1 binary issues. An earlier
+    /// version of this test compared `pragma_table_info` between versions instead, which was a proxy
+    /// that failed the moment 3.2 added a nullable column — an addition that binary survives perfectly
+    /// well, since its `INSERT` never names the column and the column does not require it. Comparing
+    /// shapes would have forced a needless major bump; comparing behaviour permits exactly the
+    /// additions that are safe and no others.
     #[test]
-    fn the_web_tables_migration_does_not_touch_the_pre_existing_schema() {
-        let columns = |conn: &Connection, table: &str| -> Vec<(String, String)> {
-            let mut stmt = conn
-                .prepare(&format!(
-                    "SELECT name, type FROM pragma_table_info('{table}') ORDER BY cid"
-                ))
-                .unwrap();
-            stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
-                .unwrap()
-                .collect::<rusqlite::Result<Vec<_>>>()
-                .unwrap()
-        };
+    fn an_older_binarys_writes_still_work_against_the_current_schema() {
+        let conn = Connection::open_in_memory().unwrap();
+        migrate(&conn).unwrap();
 
-        // At 3.0...
-        let before = Connection::open_in_memory().unwrap();
-        for migration in MIGRATIONS.iter().filter(|m| m.version <= Version::new(3, 0)) {
-            before.execute_batch(migration.sql).unwrap();
-        }
-        // ...and at 3.1.
-        let after = Connection::open_in_memory().unwrap();
-        migrate(&after).unwrap();
+        // The measurement insert as it was written before `series_id` existed.
+        conn.execute(
+            "INSERT OR IGNORE INTO measurement \
+             (id, event_time, processed_time, type, body, attributes) \
+             VALUES (x'0102030405060708090a0b0c0d0e0f10', 1, 2, 'cpu', '{}', '{}')",
+            [],
+        )
+        .expect("a 3.1-era measurement insert must still be accepted");
 
-        for table in ["measurement", "api_key"] {
-            assert_eq!(
-                columns(&before, table),
-                columns(&after, table),
-                "3.1 changed the shape of `{table}`, which a 3.0 binary reads and writes — that makes \
-                 it a major bump, not a minor one"
-            );
-        }
+        // And the other tables an older binary writes, unchanged since they were introduced.
+        conn.execute(
+            "INSERT INTO api_key (id, secret_hash, label, created_at) \
+             VALUES ('0000000000000001', x'00', 'pi-7', 1)",
+            [],
+        )
+        .expect("a 3.0-era api_key insert must still be accepted");
+        conn.execute(
+            "INSERT INTO web_user (username, password_hash, created_at) VALUES ('op', x'00', 1)",
+            [],
+        )
+        .expect("a 3.1-era web_user insert must still be accepted");
     }
 
     /// STRICT is what makes the column types enforced rather than advisory.

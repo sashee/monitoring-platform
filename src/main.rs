@@ -243,7 +243,46 @@ async fn serve(args: ServeArgs) -> Result<()> {
 
     // Migrations run before the socket is bound, so a schema failure is a clean startup failure
     // rather than a service that accepts requests it cannot store.
-    let conn = store::open_write(&config.database_path)?;
+    let mut conn = store::open_write(&config.database_path)?;
+
+    // Every startup, not once (SPEC §6.7). A revert to a 3.1 binary — routine here, since
+    // `system.autoUpgrade` runs nightly — writes measurements with no `series_id`, so the fill has to
+    // be a convergence sweep rather than a migration step. Idempotent: with nothing to do it is a
+    // single probe of a partial index, measured at ~0 ms against the deployed database.
+    //
+    // Not inside `migrate`, and not inside `open_write`: `create-api-key` and `create-user` open the
+    // database the same way and have no business running a backfill.
+    //
+    // Before readiness rather than behind it, because it must not race the writer for the connection.
+    // That is only defensible while the fill is fast, so the duration is logged and the budget is
+    // explicit: `TimeoutStartSec` is 420 s, of which the clock gate claims 300, leaving 120 s. The
+    // first attempt at this backfill spent 168 s of that and had to be rewritten — see
+    // `store::series::backfill`. If the logged duration approaches the slack again, this is the call
+    // that moves behind `sd_notify`.
+    // **Fatal on failure, unlike the key count below**, and the difference is worth being explicit
+    // about. A missing API key degrades a *feature*: the receiver refuses requests, loudly, and nothing
+    // it does report is wrong. An unassigned measurement is different — since §6.7 the read path joins
+    // `series` for every `type` and `attributes`, so a row without one is **invisible**: `/v1/measurements`
+    // and every chart would silently omit it. For a monitoring system, quietly under-reporting is the
+    // worst available failure, strictly worse than being down and saying so.
+    //
+    // `backfill` is one transaction that re-checks the queue before committing, so `Ok` means the queue
+    // is empty — the precondition the inner join rests on is exactly "this returned Ok". Nothing can
+    // refill it afterwards: only the writer stores measurements, it is spawned below, and it always sets
+    // `series_id`.
+    //
+    // Reachable only from data this receiver did not write, or from I/O failure. Both need a human, and
+    // `Restart=on-failure` retries every 60 s meanwhile.
+    let started = std::time::Instant::now();
+    let filled = store::series::backfill(&mut conn)
+        .context("assigning series to measurements; refusing to serve reads that would omit them")?;
+    if filled > 0 {
+        tracing::info!(
+            filled,
+            elapsed_ms = started.elapsed().as_millis(),
+            "series backfill finished"
+        );
+    }
 
     // Loud, but not fatal. Refusing to start would take `/healthz` down with it — the one endpoint
     // that needs no key and that a readiness probe depends on — and turn a recoverable state into a

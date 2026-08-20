@@ -26,6 +26,11 @@ pub type ContentId = [u8; ID_LEN];
 /// written by an older version.
 const DOMAIN: &[u8] = b"monitoring-platform/measurement/v1";
 
+/// The same idea for series identity (SPEC §6.7), and a *different* namespace so a series id and a
+/// measurement id can never coincide — they live in different tables and mean different things, and
+/// two 16-byte blobs that could be equal by construction would be a trap for anyone joining them.
+const SERIES_DOMAIN: &[u8] = b"monitoring-platform/series/v1";
+
 // Every node is type-tagged, so `1`, `1.0`, `"1"` and `[1]` cannot hash alike.
 const TAG_NULL: u8 = 0;
 const TAG_BOOL: u8 = 1;
@@ -59,6 +64,31 @@ pub fn content_id(m: &Measurement) -> ContentId {
 
     put_map(&mut h, &m.attributes);
 
+    finish(h)
+}
+
+/// The identity of a *series*: the type and the attributes, and nothing else (SPEC §6.7).
+///
+/// Deliberately excludes both timestamps and the body — those are what a measurement *measured*,
+/// while these two are what identifies the thing being measured. Including either would mint a new
+/// series per measurement, which is the failure this whole table exists to avoid.
+///
+/// Shares [`put_bytes`] and [`put_map`] with [`content_id`] rather than re-deriving them, because a
+/// second copy of the canonical encoding is exactly the drift this module's header warns about. In
+/// particular it inherits the explicit key sort, so a device sending the same attributes in a
+/// different order maps to the same series.
+pub fn series_id(kind: &str, attributes: &Map<String, Value>) -> ContentId {
+    let mut h = Hasher::new();
+    h.update(SERIES_DOMAIN);
+
+    put_bytes(&mut h, kind.as_bytes());
+    put_map(&mut h, attributes);
+
+    finish(h)
+}
+
+/// The 128-bit prefix of a finished hash. Shared so the two ids cannot end up truncated differently.
+fn finish(h: Hasher) -> ContentId {
     let mut id = [0u8; ID_LEN];
     id.copy_from_slice(&h.finalize().as_bytes()[..ID_LEN]);
     id
@@ -317,6 +347,85 @@ mod tests {
         // this only together with the DOMAIN version.
         let m = measurement("gps", 42, Some(json!({"v": 1})), json!({"a": "b"}));
         assert_eq!(to_hex(&content_id(&m)), "039041fb15b6a5539cc42c9bd709363e");
+    }
+
+    // ------------------------------------------------------------------------------- series ids
+
+    fn attrs(v: Value) -> Map<String, Value> {
+        v.as_object().cloned().unwrap_or_default()
+    }
+
+    /// The property the series table rests on, inherited from `put_map`'s explicit sort: a device may
+    /// serialise its attributes in any order and must still land in one series, not two.
+    #[test]
+    fn attribute_order_does_not_change_the_series_id() {
+        let mut a = Map::new();
+        a.insert("z.last".into(), json!(1));
+        a.insert("a.first".into(), json!(2));
+
+        let mut b = Map::new();
+        b.insert("a.first".into(), json!(2));
+        b.insert("z.last".into(), json!(1));
+
+        assert_eq!(series_id("gps", &a), series_id("gps", &b));
+    }
+
+    #[test]
+    fn nested_attribute_order_does_not_change_the_series_id() {
+        let a = attrs(json!({"record.attributes.cfg": {"x": 1, "y": 2}}));
+        let b = attrs(json!({"record.attributes.cfg": {"y": 2, "x": 1}}));
+        assert_eq!(series_id("t", &a), series_id("t", &b));
+    }
+
+    #[test]
+    fn both_halves_of_the_series_key_matter() {
+        let base = attrs(json!({"record.attributes.cell": 3}));
+        let id = series_id("bms.status.cell", &base);
+
+        assert_ne!(series_id("bms.status", &base), id, "type must matter");
+        assert_ne!(
+            series_id("bms.status.cell", &attrs(json!({"record.attributes.cell": 4}))),
+            id,
+            "an attribute value must matter"
+        );
+        assert_ne!(
+            series_id("bms.status.cell", &attrs(json!({}))),
+            id,
+            "dropping an attribute must matter"
+        );
+    }
+
+    /// A measurement id and a series id must never coincide, so the domain prefixes have to differ.
+    /// Constructed so that every *hashed* input is identical: same type, same attributes, and a body
+    /// that is absent — leaving only the domain to tell them apart.
+    #[test]
+    fn a_series_id_is_domain_separated_from_a_measurement_id() {
+        let a = attrs(json!({"record.attributes.unit": "c"}));
+        let m = measurement("gps", 0, None, json!({"record.attributes.unit": "c"}));
+        assert_ne!(series_id("gps", &a), content_id(&m));
+    }
+
+    /// The regression test for length prefixing, which `put_bytes` provides: without it a type of
+    /// `"ab"` with a key `"c"` would hash as a type of `"a"` with a key `"bc"`.
+    #[test]
+    fn series_field_boundaries_are_unambiguous() {
+        assert_ne!(
+            series_id("ab", &attrs(json!({"c": 1}))),
+            series_id("a", &attrs(json!({"bc": 1})))
+        );
+        assert_ne!(
+            series_id("t", &attrs(json!({"ab": "c"}))),
+            series_id("t", &attrs(json!({"a": "bc"})))
+        );
+    }
+
+    /// Pinned so an accidental change to the encoding is visible rather than silent — the same
+    /// reasoning as `ids_are_stable_across_runs`, and with the same consequence: changing this means
+    /// every stored `series_id` is wrong, so update it only together with SERIES_DOMAIN.
+    #[test]
+    fn series_ids_are_stable_across_runs() {
+        let a = attrs(json!({"record.attributes.cell": 3, "resource.attributes.device.id": "dev-7"}));
+        assert_eq!(to_hex(&series_id("bms.status.cell", &a)), "d690ad5dfa714bff87284484056268b2");
     }
 
     #[test]

@@ -11,6 +11,47 @@ use crate::model::StoredMeasurement;
 pub const DEFAULT_LIMIT: i64 = 100;
 pub const MAX_LIMIT: i64 = 1000;
 
+/// Where a measurement's `type` and `attributes` come from (SPEC §6.7).
+///
+/// **One constant, deliberately.** `measurement` still carries both columns and will until 4.0, so the
+/// only thing stopping a query from reading the stale copy is that no query names it. Having exactly one
+/// FROM clause is what makes that checkable — and it is what lets 4.0 be nothing but `DROP COLUMN`,
+/// which matters because 4.0 is the one migration that cannot be rehearsed here: it has to arrive
+/// through the pipeline, and once applied there is no reverting to a binary that expects the columns.
+///
+/// The join is **inner**, so a measurement with no `series_id` is invisible. That is only safe because
+/// `store::series::backfill` runs to completion before the socket is bound and refuses to let the
+/// process start if it cannot — see `main.rs`. A `LEFT JOIN … coalesce(sr.type, m.type)` would tolerate
+/// unassigned rows, but `coalesce(…) IN (?)` cannot use an index, so it would trade a provable
+/// precondition for a slow one.
+const FROM_MEASUREMENT: &str = "FROM measurement m JOIN series sr ON sr.id = m.series_id";
+
+/// The same table without the join, for queries that read neither `type` nor `attributes`.
+///
+/// **Sound because the join can never remove a row.** Every measurement has a `series_id` — that is the
+/// startup precondition above — so an inner join to a primary key matches exactly once, and dropping it
+/// when nothing reads `sr` changes no result.
+///
+/// Worth the branch on measured cost, not on principle. On the deployed database the unfiltered
+/// `all`-range extent goes 51.6 ms joined → 15.8 ms bare, and the unfiltered timeline 126 ms → 77 ms:
+/// together about 85 ms off a landing-page render, on two queries that read nothing from `series` at all.
+/// Both remain a covering-index scan either way — SQLite applies its min/max index shortcut only to a
+/// single aggregate, never to `min(x), max(x)` in one select — so this is a constant factor on an already
+/// linear scan, not a change in growth.
+///
+/// A *filtered* extent is a different shape and stays joined: driven from the 1,460-row `series` table it
+/// costs 9.0 ms, less than the bare scan it replaces.
+const FROM_MEASUREMENT_ONLY: &str = "FROM measurement m";
+
+/// Whether a filter set reads `series`. `body` is still a `measurement` column, so it does not count.
+fn filters_need_series(spec: &QuerySpec) -> bool {
+    !spec.types.is_empty() || !spec.attrs.is_empty()
+}
+
+fn from_clause(needs_series: bool) -> &'static str {
+    if needs_series { FROM_MEASUREMENT } else { FROM_MEASUREMENT_ONLY }
+}
+
 /// Which half of a measurement a field lives in.
 ///
 /// **The distinction is an OTLP artifact, not something a reader should have to know.** An attribute and a
@@ -53,11 +94,21 @@ impl FieldRef {
         }
     }
 
-    /// The SQL column the field is extracted from.
+    /// The bare column name, for use inside the facet CTE, which projects both halves under its own
+    /// alias.
     fn column(&self) -> &'static str {
         match self {
             FieldRef::Attribute(_) => "attributes",
             FieldRef::Body(_) => "body",
+        }
+    }
+
+    /// The column qualified by the table it now lives in: attributes moved to `series`, the body did
+    /// not. Used everywhere the join itself is in scope (see [`FROM_MEASUREMENT`]).
+    fn qualified(&self) -> &'static str {
+        match self {
+            FieldRef::Attribute(_) => "sr.attributes",
+            FieldRef::Body(_) => "m.body",
         }
     }
 }
@@ -122,21 +173,22 @@ fn push_filters(spec: &QuerySpec, where_clauses: &mut Vec<String>, params: &mut 
             })
             .collect::<Vec<_>>()
             .join(", ");
-        where_clauses.push(format!("type IN ({placeholders})"));
+        where_clauses.push(format!("sr.type IN ({placeholders})"));
     }
 
     if let Some(from) = spec.from {
         params.push(SqlValue::Integer(from));
-        where_clauses.push(format!("event_time >= ?{}", params.len()));
+        where_clauses.push(format!("m.event_time >= ?{}", params.len()));
     }
     if let Some(to) = spec.to {
         params.push(SqlValue::Integer(to));
-        where_clauses.push(format!("event_time < ?{}", params.len()));
+        where_clauses.push(format!("m.event_time < ?{}", params.len()));
     }
 
     // Attributes and body leaves are the same predicate against different columns (see `FieldRef`), so
-    // they share one builder rather than two that could drift in their guards.
-    for (column, filters) in [("attributes", &spec.attrs), ("body", &spec.body)] {
+    // they share one builder rather than two that could drift in their guards. They now sit in
+    // different *tables* too, which changes nothing about the predicate.
+    for (column, filters) in [("sr.attributes", &spec.attrs), ("m.body", &spec.body)] {
         for (key, value) in filters {
             params.push(SqlValue::Text(json_path(key)));
             let path_idx = params.len();
@@ -164,8 +216,9 @@ fn push_filters(spec: &QuerySpec, where_clauses: &mut Vec<String>, params: &mut 
 /// Ordering is always `event_time DESC, id DESC`, matching both indexes, with `id` breaking ties so
 /// pagination stays stable when timestamps collide.
 pub fn build_query(spec: &QuerySpec) -> (String, Vec<SqlValue>) {
-    let mut sql = String::from(
-        "SELECT id, event_time, processed_time, type, body, attributes FROM measurement",
+    let mut sql = format!(
+        "SELECT m.id, m.event_time, m.processed_time, sr.type, m.body, sr.attributes \
+         {FROM_MEASUREMENT}"
     );
     let mut where_clauses: Vec<String> = Vec::new();
     let mut params: Vec<SqlValue> = Vec::new();
@@ -182,7 +235,7 @@ pub fn build_query(spec: &QuerySpec) -> (String, Vec<SqlValue>) {
         params.push(SqlValue::Blob(id.to_vec()));
         let id_idx = params.len();
         where_clauses.push(format!(
-            "(event_time < ?{t_idx} OR (event_time = ?{t_idx} AND id < ?{id_idx}))"
+            "(m.event_time < ?{t_idx} OR (m.event_time = ?{t_idx} AND m.id < ?{id_idx}))"
         ));
     }
 
@@ -191,7 +244,7 @@ pub fn build_query(spec: &QuerySpec) -> (String, Vec<SqlValue>) {
         sql.push_str(&where_clauses.join(" AND "));
     }
 
-    sql.push_str(" ORDER BY event_time DESC, id DESC LIMIT ?");
+    sql.push_str(" ORDER BY m.event_time DESC, m.id DESC LIMIT ?");
     params.push(SqlValue::Integer(spec.limit.clamp(1, MAX_LIMIT)));
     sql.push_str(&params.len().to_string());
 
@@ -275,11 +328,18 @@ pub struct Facets {
 /// how these names are actually structured. The count stays in the label, where it is information rather
 /// than a sort key.
 ///
-/// Exact rather than sampled: measured at 30 ms over 95k rows, because `type` is the leading column
-/// of an index and this never has to touch the JSON.
+/// Exact rather than sampled, and it stays that way through the join: `measurement_series_event_time_idx`
+/// lets this be driven from the 1,458-row `series` table with one index range per series, so it never
+/// visits a table page or touches JSON.
+///
+/// Counts come from `measurement`, not from `series.added_measurements`. The two agree today and will
+/// stop agreeing the moment anything deletes rows — this list describes what is *in* the table, which is
+/// the whole reason those columns are named `added_*` (SPEC §6.7).
 pub fn types(conn: &Connection) -> Result<Vec<TypeCount>> {
     let mut stmt = conn
-        .prepare("SELECT type, count(*) FROM measurement GROUP BY type ORDER BY type")
+        .prepare(&format!(
+            "SELECT sr.type, count(*) {FROM_MEASUREMENT} GROUP BY sr.type ORDER BY sr.type"
+        ))
         .context("preparing the type listing")?;
     let out = stmt
         .query_map([], |row| Ok(TypeCount { kind: row.get(0)?, count: row.get(1)? }))
@@ -295,13 +355,17 @@ fn build_facet_sample(spec: &QuerySpec) -> (String, Vec<SqlValue>) {
     let mut params = Vec::new();
     push_filters(spec, &mut where_clauses, &mut params);
 
-    let mut sql = String::from("WITH sample AS (SELECT attributes, body FROM measurement");
+    // The CTE projects both halves under its own alias, so everything downstream of it keeps reading
+    // `s.attributes` and `s.body` and does not need to know which table they came from.
+    let mut sql = format!(
+        "WITH sample AS (SELECT sr.attributes AS attributes, m.body AS body {FROM_MEASUREMENT}"
+    );
     if !where_clauses.is_empty() {
         sql.push_str(" WHERE ");
         sql.push_str(&where_clauses.join(" AND "));
     }
     params.push(SqlValue::Integer(FACET_SCAN_LIMIT));
-    sql.push_str(&format!(" ORDER BY event_time DESC, id DESC LIMIT ?{})", params.len()));
+    sql.push_str(&format!(" ORDER BY m.event_time DESC, m.id DESC LIMIT ?{})", params.len()));
     (sql, params)
 }
 
@@ -487,7 +551,10 @@ pub fn build_extent_query(spec: &QuerySpec) -> (String, Vec<SqlValue>) {
     let mut params = Vec::new();
     push_filters(spec, &mut where_clauses, &mut params);
 
-    let mut sql = String::from("SELECT min(event_time), max(event_time) FROM measurement");
+    let mut sql = format!(
+        "SELECT min(m.event_time), max(m.event_time) {}",
+        from_clause(filters_need_series(spec))
+    );
     if !where_clauses.is_empty() {
         sql.push_str(" WHERE ");
         sql.push_str(&where_clauses.join(" AND "));
@@ -583,7 +650,7 @@ pub fn build_series_query(spec: &SeriesSpec) -> (String, Vec<SqlValue>) {
     // SQLite's serialization would be an accidental API.
     let group_expr = match &spec.group {
         Some(field) => {
-            let column = field.column();
+            let column = field.qualified();
             params.push(SqlValue::Text(json_path(field.name())));
             let p = params.len();
             if !spec.groups.is_empty() {
@@ -613,8 +680,8 @@ pub fn build_series_query(spec: &SeriesSpec) -> (String, Vec<SqlValue>) {
             params.push(SqlValue::Text(json_path(field)));
             let p = params.len();
             format!(
-                "CASE WHEN json_type(body, ?{p}) IN ('integer','real') \
-                 THEN json_extract(body, ?{p}) END"
+                "CASE WHEN json_type(m.body, ?{p}) IN ('integer','real') \
+                 THEN json_extract(m.body, ?{p}) END"
             )
         }
         None => "NULL".to_owned(),
@@ -625,9 +692,13 @@ pub fn build_series_query(spec: &SeriesSpec) -> (String, Vec<SqlValue>) {
 
     let mut sql = format!(
         "SELECT {group_expr} AS g, \
-         (event_time / ?{bucket_param}) * ?{bucket_param} AS bucket_start, \
+         (m.event_time / ?{bucket_param}) * ?{bucket_param} AS bucket_start, \
          count(*), count({value_expr}), avg({value_expr}), min({value_expr}), max({value_expr}) \
-         FROM measurement"
+         {from}",
+        from = from_clause(
+            filters_need_series(&spec.filter)
+                || matches!(spec.group, Some(FieldRef::Attribute(_)))
+        )
     );
     if !where_clauses.is_empty() {
         sql.push_str(" WHERE ");
@@ -766,6 +837,173 @@ mod tests {
             body: Some(json!({"v": event_time})),
             attributes: attrs.as_object().unwrap().clone(),
         }
+    }
+
+    // --------------------------------------------------- the read path reads `series`, not the row
+
+    /// Overwrites a measurement's *own* `type` and `attributes` with something the `series` row does not
+    /// say, which nothing in the receiver ever does. It is the only way to tell the two sources apart:
+    /// while both hold identical text, a query reading the wrong one is indistinguishable from a query
+    /// reading the right one — and it is the wrong one that 4.0 deletes.
+    fn desync_the_measurement_copies(conn: &Connection, kind: &str, attributes: &str) {
+        let changed = conn
+            .execute(
+                "UPDATE measurement SET type = ?1, attributes = ?2",
+                rusqlite::params![kind, attributes],
+            )
+            .unwrap();
+        assert!(changed > 0, "nothing to de-synchronise");
+    }
+
+    /// **The guard on 4.0.** Every one of these reads must come from `series`, because 4.0 drops
+    /// `measurement.type` and `measurement.attributes` as pure DDL with no accompanying code change — so
+    /// anything still reading them would break on a migration that cannot be rehearsed or reverted
+    /// (SPEC §6.7). Asserted by making the two copies disagree and demanding the `series` answer.
+    #[test]
+    fn every_read_of_type_and_attributes_comes_from_the_series_table() {
+        let conn = db_with(vec![m("gps", 10, json!({"record.attributes.unit": "wgs84"}))]);
+        desync_the_measurement_copies(&conn, "STALE", r#"{"record.attributes.unit":"stale"}"#);
+
+        // Row reads: the projected columns.
+        let rows = query(&conn, &QuerySpec { limit: 10, ..Default::default() }).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].kind, "gps", "type must come from series");
+        assert_eq!(rows[0].attributes["record.attributes.unit"], json!("wgs84"));
+
+        // The type listing.
+        assert_eq!(
+            types(&conn).unwrap(),
+            vec![TypeCount { kind: "gps".into(), count: 1 }],
+            "the type list must come from series"
+        );
+
+        // The type filter, in both directions.
+        let by_series = QuerySpec { types: vec!["gps".into()], limit: 10, ..Default::default() };
+        assert_eq!(query(&conn, &by_series).unwrap().len(), 1, "filtering must use series.type");
+        let by_row = QuerySpec { types: vec!["STALE".into()], limit: 10, ..Default::default() };
+        assert!(
+            query(&conn, &by_row).unwrap().is_empty(),
+            "the measurement's own type must not be filterable"
+        );
+
+        // The attribute filter, in both directions.
+        let attr_hit = QuerySpec {
+            attrs: vec![("record.attributes.unit".into(), "wgs84".into())],
+            limit: 10,
+            ..Default::default()
+        };
+        assert_eq!(query(&conn, &attr_hit).unwrap().len(), 1);
+        let attr_stale = QuerySpec {
+            attrs: vec![("record.attributes.unit".into(), "stale".into())],
+            limit: 10,
+            ..Default::default()
+        };
+        assert!(query(&conn, &attr_stale).unwrap().is_empty());
+
+        // Facet discovery.
+        let facets = facets(&conn, &QuerySpec { limit: 10, ..Default::default() }).unwrap();
+        let unit = facets.attrs.iter().find(|f| f.key == "record.attributes.unit").unwrap();
+        assert_eq!(unit.values, vec!["wgs84".to_owned()], "facets must come from series");
+
+        // And the aggregated chart query, which groups by an attribute.
+        let grouped = series(
+            &conn,
+            &SeriesSpec {
+                filter: QuerySpec { limit: 10, ..Default::default() },
+                field: None,
+                group: Some(FieldRef::Attribute("record.attributes.unit".into())),
+                groups: vec!["wgs84".to_owned()],
+                bucket_nanos: 1_000,
+            },
+        )
+        .unwrap();
+        assert_eq!(grouped.len(), 1);
+        assert_eq!(grouped[0].group.as_deref(), Some("wgs84"), "grouping must use series");
+    }
+
+    /// The extent query too — it is the one that decides the `all` window, so a stale read there would
+    /// rescale every axis.
+    #[test]
+    fn the_extent_query_filters_through_the_series_table() {
+        let conn = db_with(vec![m("gps", 10, json!({}))]);
+        desync_the_measurement_copies(&conn, "STALE", "{}");
+
+        let spec = QuerySpec { types: vec!["gps".into()], ..Default::default() };
+        assert_eq!(extent(&conn, &spec).unwrap(), Some((10, 10)));
+        let stale = QuerySpec { types: vec!["STALE".into()], ..Default::default() };
+        assert_eq!(extent(&conn, &stale).unwrap(), None);
+    }
+
+    /// The join is omitted exactly when nothing reads `series`, which is what keeps `min`/`max` on an
+    /// index probe instead of a scan. Asserted on the generated SQL, because the cost is invisible in the
+    /// result: both forms return the same numbers, and the difference only shows as `O(n)` growth.
+    #[test]
+    fn the_series_join_is_omitted_only_when_nothing_reads_it() {
+        let joined = |sql: &str| sql.contains("JOIN series");
+
+        assert!(
+            !joined(&build_extent_query(&QuerySpec::default()).0),
+            "an unfiltered extent reads no series column, so it must not pay for the join"
+        );
+        assert!(
+            joined(&build_extent_query(&QuerySpec {
+                types: vec!["gps".into()],
+                ..Default::default()
+            })
+            .0),
+            "a type filter is a series predicate"
+        );
+        assert!(
+            joined(&build_extent_query(&QuerySpec {
+                attrs: vec![("k".into(), "v".into())],
+                ..Default::default()
+            })
+            .0),
+            "an attribute filter is a series predicate"
+        );
+        assert!(
+            !joined(&build_extent_query(&QuerySpec {
+                body: vec![("k".into(), "v".into())],
+                ..Default::default()
+            })
+            .0),
+            "the body is still a measurement column"
+        );
+
+        // The aggregated query has one more way to need it: grouping by an attribute.
+        let series_spec = |group: Option<FieldRef>| SeriesSpec {
+            filter: QuerySpec::default(),
+            field: None,
+            group,
+            groups: Vec::new(),
+            bucket_nanos: 1_000,
+        };
+        assert!(!joined(&build_series_query(&series_spec(None)).0), "the plain timeline");
+        assert!(
+            joined(&build_series_query(&series_spec(Some(FieldRef::Attribute("k".into())))).0),
+            "grouping by an attribute reads series"
+        );
+        assert!(
+            !joined(&build_series_query(&series_spec(Some(FieldRef::Body("k".into())))).0),
+            "grouping by a body leaf does not"
+        );
+
+        // The row query always projects both, so it can never skip it.
+        assert!(joined(&build_query(&QuerySpec::default()).0));
+    }
+
+    /// **The precondition the inner join rests on, stated as a test.** A measurement with no `series_id`
+    /// is invisible to every read. That is why `store::series::backfill` is a hard startup requirement
+    /// rather than a best-effort one (see `main.rs`): the alternative to being loudly down is silently
+    /// under-reporting, which for a monitoring system is worse.
+    #[test]
+    fn a_measurement_with_no_series_is_invisible_to_reads() {
+        let conn = db_with(vec![m("gps", 10, json!({}))]);
+        conn.execute("UPDATE measurement SET series_id = NULL", []).unwrap();
+
+        assert!(query(&conn, &QuerySpec { limit: 10, ..Default::default() }).unwrap().is_empty());
+        assert!(types(&conn).unwrap().is_empty());
+        assert_eq!(crate::store::series::pending(&conn).unwrap(), 1, "and it is counted as pending");
     }
 
     /// SPEC §7.1: every awkward character must round-trip through the path builder into a match.

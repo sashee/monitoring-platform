@@ -507,14 +507,20 @@ async fn device_supplied_text_cannot_become_markup() {
     let cookie = harness.login().await;
 
     let hostile = "<script>alert('x')</script>";
-    let conn = store::open_write_existing(&harness.db).unwrap();
-    // A full-width content id: the read path parses this column into a `ContentId` and errors on anything
-    // that is not exactly `content_id::ID_LEN` bytes, so a token blob would fail the query rather than the
-    // escaping.
-    conn.execute(
-        "INSERT INTO measurement (id, event_time, processed_time, type, body, attributes) \
-         VALUES (x'0102030405060708090a0b0c0d0e0f10', ?1, ?2, ?3, ?4, ?5)",
-        rusqlite::params![T, T, hostile, format!("\"{hostile}\""), format!("{{\"{hostile}\":1}}")],
+    // Through the write path rather than raw SQL, which since §6.7 is the only way the row is visible at
+    // all — the read path joins `series`, so a hand-inserted row with no `series_id` renders as nothing
+    // and the test would pass by vacuum. It also puts the hostile text where the page now reads it
+    // from: `series.type` and `series.attributes`, not the measurement's own copies.
+    let mut conn = store::open_write_existing(&harness.db).unwrap();
+    store::write::insert_batch(
+        &mut conn,
+        &[monitoring_platform::model::Measurement {
+            event_time: T,
+            processed_time: T,
+            kind: hostile.to_owned(),
+            body: Some(serde_json::json!(hostile)),
+            attributes: serde_json::json!({ hostile: 1 }).as_object().unwrap().clone(),
+        }],
     )
     .unwrap();
     drop(conn);
@@ -526,6 +532,41 @@ async fn device_supplied_text_cannot_become_markup() {
     assert!(
         !reply.body.contains("<script>"),
         "an unescaped script tag reached the page: {}",
+        reply.body
+    );
+}
+
+/// The backfill readiness note (SPEC §6.7). It has to appear while rows are unassigned, because it is
+/// what tells the operator when the 4.0 migration is safe — and it has to disappear once they are not,
+/// since a permanent banner about a finished job is noise.
+#[tokio::test]
+async fn the_series_backfill_note_shows_only_while_rows_are_unassigned() {
+    let harness = harness();
+    let cookie = harness.login().await;
+
+    // A measurement as a 3.1 binary writes it: no `series_id`, so it is still in the work queue.
+    let mut conn = store::open_write_existing(&harness.db).unwrap();
+    conn.execute(
+        "INSERT INTO measurement (id, event_time, processed_time, type, body, attributes) \
+         VALUES (x'0102030405060708090a0b0c0d0e0f10', ?1, ?1, 'cpu', '{}', '{}')",
+        rusqlite::params![T],
+    )
+    .unwrap();
+
+    let reply = harness.get("/", Some(&cookie)).await;
+    assert!(
+        reply.body.contains("still being assigned to a series"),
+        "the note must appear while the sweep has work: {}",
+        reply.body
+    );
+
+    monitoring_platform::store::series::backfill(&mut conn).unwrap();
+    drop(conn);
+
+    let reply = harness.get("/", Some(&cookie)).await;
+    assert!(
+        !reply.body.contains("still being assigned to a series"),
+        "the note must disappear once the sweep has converged: {}",
         reply.body
     );
 }

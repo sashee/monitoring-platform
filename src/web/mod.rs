@@ -263,6 +263,10 @@ struct ExploreData {
     charts: Vec<Chart>,
     rows: Vec<StoredMeasurement>,
     more: bool,
+    /// Measurements still waiting for a `series_id` (SPEC §6.7). Surfaced only while non-zero, because
+    /// it is the signal that decides when the 4.0 migration is safe to deploy — and once the sweep has
+    /// converged there is nothing to say. An index probe, so it costs nothing per render.
+    series_pending: i64,
 }
 
 struct Chart {
@@ -446,7 +450,9 @@ let types = crate::store::read::types(conn)?;
     let more = rows.len() as i64 > PAGE_LIMIT;
     rows.truncate(PAGE_LIMIT as usize);
 
-    Ok(ExploreData { types, facets, window, bucket, timeline, charts, rows, more })
+    let series_pending = crate::store::series::pending(conn)?;
+
+    Ok(ExploreData { types, facets, window, bucket, timeline, charts, rows, more, series_pending })
 }
 
 async fn explore(State(state): State<AppState>, Query(raw): Query<Vec<(String, String)>>) -> Response {
@@ -610,6 +616,15 @@ fn filter_row(params: &Explore, data: &ExploreData) -> String {
 fn render_explore(params: &Explore, data: &ExploreData) -> String {
     let mut body = filter_row(params, data);
 
+    // Self-removing: it says something only while the sweep still has work, and the fill is what makes
+    // that condition temporary. Nothing here is wrong while it shows — measurements are stored and
+    // served normally — so it reports rather than warns.
+    if data.series_pending > 0 {
+        body.push_str(&html::note(&format!(
+            "{} measurements are still being assigned to a series; this finishes on its own.",
+            data.series_pending
+        )));
+    }
     if params.kind.is_none() {
         body.push_str(&html::note("Choose a type to filter by its attributes and chart its values."));
     }

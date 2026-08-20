@@ -1,0 +1,5 @@
+Error: opening database /tmp/mpdata/mp.db
+
+Caused by:
+    0: unable to open database file: /tmp/mpdata/mp.db
+    1: Error code 14: unable to open database file

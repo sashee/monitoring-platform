@@ -11,6 +11,57 @@ use crate::model::StoredMeasurement;
 pub const DEFAULT_LIMIT: i64 = 100;
 pub const MAX_LIMIT: i64 = 1000;
 
+/// Which half of a measurement a field lives in.
+///
+/// **The distinction is an OTLP artifact, not something a reader should have to know.** An attribute and a
+/// body leaf are both just properties of the measurement — `detected-devices.wifi_bss` keeps `bssid` in its
+/// attributes and `ssid` in its body, and there is no sense in which one of those is more of a field than
+/// the other. But they live in different columns, so a query has to say which, and the two namespaces can
+/// legitimately collide. Hence one type that names the half explicitly, rather than a bare string whose
+/// meaning depends on where it was found.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FieldRef {
+    /// A key in the `attributes` column, structurally prefixed as §5.2 stores it.
+    Attribute(String),
+    /// A top-level leaf of the `body` column.
+    Body(String),
+}
+
+impl FieldRef {
+    /// Parses the URL form. `b:` marks a body leaf; anything else is an attribute key.
+    ///
+    /// Bare means attribute so that links and bookmarks made before body fields existed keep working —
+    /// they carry a raw attribute key with no prefix.
+    pub fn parse(raw: &str) -> Self {
+        match raw.strip_prefix("b:") {
+            Some(leaf) => FieldRef::Body(leaf.to_owned()),
+            None => FieldRef::Attribute(raw.to_owned()),
+        }
+    }
+
+    pub fn encode(&self) -> String {
+        match self {
+            FieldRef::Attribute(key) => key.clone(),
+            FieldRef::Body(leaf) => format!("b:{leaf}"),
+        }
+    }
+
+    pub fn name(&self) -> &str {
+        match self {
+            FieldRef::Attribute(key) => key,
+            FieldRef::Body(leaf) => leaf,
+        }
+    }
+
+    /// The SQL column the field is extracted from.
+    fn column(&self) -> &'static str {
+        match self {
+            FieldRef::Attribute(_) => "attributes",
+            FieldRef::Body(_) => "body",
+        }
+    }
+}
+
 /// A validated query. Produced by the HTTP layer, consumed here.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct QuerySpec {
@@ -22,6 +73,9 @@ pub struct QuerySpec {
     pub to: Option<i64>,
     /// Attribute equality filters, ANDed. Keys are full attribute keys, not JSON paths.
     pub attrs: Vec<(String, String)>,
+    /// Body-leaf equality filters, ANDed with each other and with `attrs`. Same semantics, other column —
+    /// see [`FieldRef`] for why both exist.
+    pub body: Vec<(String, String)>,
     pub limit: i64,
     /// Keyset position: `(event_time, id)` of the last row of the previous page.
     pub cursor: Option<(i64, ContentId)>,
@@ -80,24 +134,28 @@ fn push_filters(spec: &QuerySpec, where_clauses: &mut Vec<String>, params: &mut 
         where_clauses.push(format!("event_time < ?{}", params.len()));
     }
 
-    for (key, value) in &spec.attrs {
-        params.push(SqlValue::Text(json_path(key)));
-        let path_idx = params.len();
-        params.push(SqlValue::Text(value.clone()));
-        let value_idx = params.len();
-        // Two things are load-bearing here:
-        //
-        // The json_type guard keeps nested values out. Without it, json_extract on an object
-        // returns its serialized text, which would match if a caller typed that exact text — an
-        // accidental API resting on SQLite's serialization, and one Postgres would break (SPEC §7.1).
-        //
-        // The CAST is required for the documented "compares as a string" semantics to hold at all:
-        // json_extract yields an INTEGER for `2`, and SQLite never compares an INTEGER equal to the
-        // TEXT parameter '2', so `attr...index=2` would silently match nothing without it.
-        where_clauses.push(format!(
-            "json_type(attributes, ?{path_idx}) NOT IN ('object','array') \
-             AND CAST(json_extract(attributes, ?{path_idx}) AS TEXT) = ?{value_idx}"
-        ));
+    // Attributes and body leaves are the same predicate against different columns (see `FieldRef`), so
+    // they share one builder rather than two that could drift in their guards.
+    for (column, filters) in [("attributes", &spec.attrs), ("body", &spec.body)] {
+        for (key, value) in filters {
+            params.push(SqlValue::Text(json_path(key)));
+            let path_idx = params.len();
+            params.push(SqlValue::Text(value.clone()));
+            let value_idx = params.len();
+            // Two things are load-bearing here:
+            //
+            // The json_type guard keeps nested values out. Without it, json_extract on an object
+            // returns its serialized text, which would match if a caller typed that exact text — an
+            // accidental API resting on SQLite's serialization, and one Postgres would break (SPEC §7.1).
+            //
+            // The CAST is required for the documented "compares as a string" semantics to hold at all:
+            // json_extract yields an INTEGER for `2`, and SQLite never compares an INTEGER equal to the
+            // TEXT parameter '2', so `attr...index=2` would silently match nothing without it.
+            where_clauses.push(format!(
+                "json_type({column}, ?{path_idx}) NOT IN ('object','array') \
+                 AND CAST(json_extract({column}, ?{path_idx}) AS TEXT) = ?{value_idx}"
+            ));
+        }
     }
 }
 
@@ -152,9 +210,20 @@ pub const FACET_SCAN_LIMIT: i64 = 2_000;
 /// than a text box. Past this, [`AttrFacet::truncated`] tells the UI to offer free text instead.
 pub const MAX_FACET_VALUES: usize = 40;
 
-/// The most series a chart will draw. Past this the reader cannot tell the colours apart, so the UI
-/// plots the first `MAX_SERIES` by sorted group value and says how many it left out.
-pub const MAX_SERIES: usize = 8;
+/// Validated categorical hues. The palette's separation guarantees hold for these eight and stop holding
+/// past them, which is why a ninth is never invented — see `web::svg::series_style`.
+pub const PALETTE_SLOTS: usize = 8;
+
+/// The most series one plot will draw.
+///
+/// Eight hues × three line patterns (solid, dashed, dotted). Past eight, identity is carried by **hue and
+/// pattern together** rather than by a ninth generated hue, which is the one sanctioned way to exceed the
+/// palette on a single plot: within each pattern the eight hues clear their gates, and two series sharing a
+/// hue never share a pattern.
+///
+/// A bound is still needed — a scan finding four hundred networks is not a chart — and past this the UI
+/// says how many it left out rather than truncating silently.
+pub const MAX_SERIES: usize = PALETTE_SLOTS * 3;
 
 /// One measurement type and how many rows carry it.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -173,7 +242,7 @@ pub struct AttrFacet {
     pub truncated: bool,
 }
 
-/// One body leaf, and whether it is worth offering as a chartable field.
+/// One body leaf: whether it can be charted as a value, and what values it takes.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FieldFacet {
     pub name: String,
@@ -181,6 +250,11 @@ pub struct FieldFacet {
     /// sometimes null and sometimes a number (`system.unit.active_enter_seconds_ago` is null on over
     /// half its rows) is still chartable — the nulls are skipped, not read as zero.
     pub numeric: bool,
+    /// Sorted, at most [`MAX_FACET_VALUES`] long. Populated for the same reason attributes have values:
+    /// a body leaf is filterable and groupable, so its options have to be discoverable. `ssid` is the
+    /// motivating case — it is the interesting identity of a wifi measurement and lives in the body.
+    pub values: Vec<String>,
+    pub truncated: bool,
 }
 
 /// What can be filtered and charted within one slice of the data.
@@ -282,19 +356,37 @@ pub fn facets(conn: &Connection, spec: &QuerySpec) -> Result<Facets> {
     // Body leaves. `json_type(s.body) = 'object'` guards both a NULL body and the scalar case: every
     // type on this host has an object body today, but json_each over a scalar yields one keyless row
     // that would show up as a field named nothing.
+    // Body leaves, with their values, exactly as the attributes above: same grouping, same cap, same
+    // reason. The `numeric` flag rides along because it decides what can be *plotted* rather than what can
+    // be filtered.
     let field_sql = format!(
-        "{prefix} SELECT j.key, max(j.type IN ('integer','real')) \
+        "{prefix} SELECT j.key, CAST(j.value AS TEXT), max(j.type IN ('integer','real')) \
          FROM sample s, json_each(s.body) j \
-         WHERE json_type(s.body) = 'object' GROUP BY 1 ORDER BY 1"
+         WHERE json_type(s.body) = 'object' AND j.type NOT IN ('object','array') \
+         GROUP BY 1, 2 ORDER BY 1, 2"
     );
     let mut stmt = conn.prepare(&field_sql).context("preparing the field facet query")?;
-    let fields = stmt
+    let rows = stmt
         .query_map(rusqlite::params_from_iter(base_params.clone()), |row| {
-            Ok(FieldFacet { name: row.get(0)?, numeric: row.get::<_, i64>(1)? != 0 })
+            Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?, row.get::<_, i64>(2)? != 0))
         })
-        .context("running the field facet query")?
-        .collect::<rusqlite::Result<Vec<_>>>()
-        .context("reading the field facets")?;
+        .context("running the field facet query")?;
+
+    let mut fields: Vec<FieldFacet> = Vec::new();
+    for row in rows {
+        let (name, value, numeric) = row?;
+        if fields.last().map(|f| f.name.as_str()) != Some(name.as_str()) {
+            fields.push(FieldFacet { name, numeric: false, values: Vec::new(), truncated: false });
+        }
+        let facet = fields.last_mut().expect("just pushed");
+        // Numeric if it was numeric in *any* sampled row: a leaf that is sometimes null is still chartable.
+        facet.numeric |= numeric;
+        match value {
+            Some(v) if facet.values.len() < MAX_FACET_VALUES => facet.values.push(v),
+            Some(_) => facet.truncated = true,
+            None => {}
+        }
+    }
 
     // How much was actually looked at, so the UI can say whether the options are complete.
     let count_sql = format!("{prefix} SELECT count(*) FROM sample");
@@ -319,17 +411,28 @@ pub fn facets(conn: &Connection, spec: &QuerySpec) -> Result<Facets> {
 pub fn facet_values_excluding(
     conn: &Connection,
     spec: &QuerySpec,
-    key: &str,
+    field: &FieldRef,
 ) -> Result<AttrFacet> {
-    // The same slice, minus this key's own constraint.
-    let widened =
-        QuerySpec { attrs: spec.attrs.iter().filter(|(k, _)| k != key).cloned().collect(), ..spec.clone() };
+    let key = field.name();
+    // The same slice, minus this field's own constraint — and only its own: the other half's filters still
+    // apply, as do the other keys in this half.
+    let widened = match field {
+        FieldRef::Attribute(_) => QuerySpec {
+            attrs: spec.attrs.iter().filter(|(k, _)| k != key).cloned().collect(),
+            ..spec.clone()
+        },
+        FieldRef::Body(_) => QuerySpec {
+            body: spec.body.iter().filter(|(k, _)| k != key).cloned().collect(),
+            ..spec.clone()
+        },
+    };
     let (prefix, mut params) = build_facet_sample(&widened);
 
     params.push(SqlValue::Text(key.to_owned()));
     let key_param = params.len();
+    let column = field.column();
     let sql = format!(
-        "{prefix} SELECT CAST(j.value AS TEXT) FROM sample s, json_each(s.attributes) j \
+        "{prefix} SELECT CAST(j.value AS TEXT) FROM sample s, json_each(s.{column}) j \
          WHERE j.key = ?{key_param} AND j.type NOT IN ('object','array') GROUP BY 1 ORDER BY 1"
     );
 
@@ -413,8 +516,8 @@ pub struct SeriesSpec {
     pub filter: QuerySpec,
     /// Body leaf to aggregate. `None` yields counts only, which is the timeline.
     pub field: Option<String>,
-    /// Attribute key to split into series by.
-    pub group: Option<String>,
+    /// Field to split into series by — either half of the measurement (see [`FieldRef`]).
+    pub group: Option<FieldRef>,
     /// The group values to plot, at most [`MAX_SERIES`]. Empty means do not split.
     ///
     /// Passed in explicitly rather than discovered here, so the caller's sorted order is what decides
@@ -479,8 +582,9 @@ pub fn build_series_query(spec: &SeriesSpec) -> (String, Vec<SqlValue>) {
     // NULL rather than to their serialized text, for the reason `push_filters` gives: matching on
     // SQLite's serialization would be an accidental API.
     let group_expr = match &spec.group {
-        Some(key) => {
-            params.push(SqlValue::Text(json_path(key)));
+        Some(field) => {
+            let column = field.column();
+            params.push(SqlValue::Text(json_path(field.name())));
             let p = params.len();
             if !spec.groups.is_empty() {
                 let placeholders = spec
@@ -493,12 +597,12 @@ pub fn build_series_query(spec: &SeriesSpec) -> (String, Vec<SqlValue>) {
                     .collect::<Vec<_>>()
                     .join(", ");
                 where_clauses.push(format!(
-                    "CAST(json_extract(attributes, ?{p}) AS TEXT) IN ({placeholders})"
+                    "CAST(json_extract({column}, ?{p}) AS TEXT) IN ({placeholders})"
                 ));
             }
             format!(
-                "CASE WHEN json_type(attributes, ?{p}) IN ('object','array') THEN NULL \
-                 ELSE CAST(json_extract(attributes, ?{p}) AS TEXT) END"
+                "CASE WHEN json_type({column}, ?{p}) IN ('object','array') THEN NULL \
+                 ELSE CAST(json_extract({column}, ?{p}) AS TEXT) END"
             )
         }
         None => "NULL".to_owned(),
@@ -830,6 +934,122 @@ mod tests {
 
     // ------------------------------------------------------------------------------- facets
 
+    // ------------------------------------------------------------------------- fields in either half
+
+    /// Bare means attribute, so links made before body fields existed keep working.
+    #[test]
+    fn a_field_reference_round_trips_and_defaults_to_an_attribute() {
+        assert_eq!(FieldRef::parse("record.attributes.bssid"),
+                   FieldRef::Attribute("record.attributes.bssid".into()));
+        assert_eq!(FieldRef::parse("b:ssid"), FieldRef::Body("ssid".into()));
+        for field in [FieldRef::Attribute("a.b".into()), FieldRef::Body("ssid".into())] {
+            assert_eq!(FieldRef::parse(&field.encode()), field, "must round trip");
+        }
+        assert_eq!(FieldRef::Body("ssid".into()).name(), "ssid");
+    }
+
+    /// The motivating case: `detected-devices.wifi_bss` keeps `bssid` in its attributes and `ssid` in its
+    /// body, and the body one is the interesting identity. Both must be groupable.
+    #[test]
+    fn a_body_leaf_can_split_a_chart_into_series() {
+        let conn = db_with(vec![
+            mb("wifi", 10, json!({"signal_dbm": -60.0, "ssid": "home"}), json!({"bssid": "aa"})),
+            mb("wifi", 11, json!({"signal_dbm": -70.0, "ssid": "cafe"}), json!({"bssid": "bb"})),
+            mb("wifi", 12, json!({"signal_dbm": -50.0, "ssid": "home"}), json!({"bssid": "cc"})),
+        ]);
+        let spec = SeriesSpec {
+            filter: QuerySpec { types: vec!["wifi".into()], ..Default::default() },
+            field: Some("signal_dbm".into()),
+            group: Some(FieldRef::Body("ssid".into())),
+            groups: vec!["home".into(), "cafe".into()],
+            bucket_nanos: 100,
+        };
+        let got = series(&conn, &spec).unwrap();
+
+        assert_eq!(
+            got.iter().map(|s| s.group.clone()).collect::<Vec<_>>(),
+            vec![Some("home".to_owned()), Some("cafe".to_owned())]
+        );
+        // "home" averages -60 and -50; grouping by the body leaf really did group.
+        assert_eq!(got[0].points[0].avg, Some(-55.0));
+        assert_eq!(got[1].points[0].avg, Some(-70.0));
+    }
+
+    /// A body leaf must filter exactly as an attribute does — otherwise grouping by one has no escape
+    /// hatch when there are more groups than the chart's cap.
+    #[test]
+    fn a_body_leaf_can_filter_rows() {
+        let conn = db_with(vec![
+            mb("wifi", 10, json!({"ssid": "home", "signal_dbm": -60.0}), json!({})),
+            mb("wifi", 11, json!({"ssid": "cafe", "signal_dbm": -70.0}), json!({})),
+        ]);
+        let spec = QuerySpec {
+            body: vec![("ssid".to_owned(), "home".to_owned())],
+            limit: DEFAULT_LIMIT,
+            ..Default::default()
+        };
+        let got = query(&conn, &spec).unwrap();
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].body.as_ref().unwrap()["ssid"], json!("home"));
+    }
+
+    /// Both halves AND together, and each keeps its own column — a name present in both must not cross.
+    #[test]
+    fn the_two_halves_and_together_without_crossing() {
+        let conn = db_with(vec![
+            // `channel` exists in both halves, with different values.
+            mb("t", 10, json!({"channel": "body-1"}), json!({"channel": "attr-1"})),
+            mb("t", 11, json!({"channel": "body-2"}), json!({"channel": "attr-1"})),
+        ]);
+
+        let spec = QuerySpec {
+            attrs: vec![("channel".to_owned(), "attr-1".to_owned())],
+            body: vec![("channel".to_owned(), "body-2".to_owned())],
+            limit: DEFAULT_LIMIT,
+            ..Default::default()
+        };
+        assert_eq!(query(&conn, &spec).unwrap().len(), 1, "both must apply, to their own column");
+
+        // And a value from the wrong half matches nothing.
+        let crossed = QuerySpec {
+            body: vec![("channel".to_owned(), "attr-1".to_owned())],
+            limit: DEFAULT_LIMIT,
+            ..Default::default()
+        };
+        assert!(query(&conn, &crossed).unwrap().is_empty(), "a body filter must not read attributes");
+    }
+
+    /// The one-way-door fix applies to body leaves too.
+    #[test]
+    fn a_filtered_body_leaf_still_offers_its_other_values() {
+        let conn = db_with(vec![
+            mb("wifi", 10, json!({"ssid": "home"}), json!({})),
+            mb("wifi", 11, json!({"ssid": "cafe"}), json!({})),
+            mb("wifi", 12, json!({"ssid": "work"}), json!({})),
+        ]);
+        let filtered =
+            QuerySpec { body: vec![("ssid".to_owned(), "cafe".to_owned())], ..Default::default() };
+
+        let widened =
+            facet_values_excluding(&conn, &filtered, &FieldRef::Body("ssid".into())).unwrap();
+        assert_eq!(widened.values, vec!["cafe", "home", "work"]);
+    }
+
+    #[test]
+    fn field_facets_carry_their_values() {
+        let conn = db_with(vec![
+            mb("wifi", 10, json!({"ssid": "home", "security": "wpa3"}), json!({})),
+            mb("wifi", 11, json!({"ssid": "cafe", "security": "wpa3"}), json!({})),
+        ]);
+        let f = facets(&conn, &QuerySpec::default()).unwrap();
+
+        let ssid = f.fields.iter().find(|x| x.name == "ssid").expect("ssid");
+        assert_eq!(ssid.values, vec!["cafe", "home"]);
+        assert!(!ssid.numeric);
+        let security = f.fields.iter().find(|x| x.name == "security").expect("security");
+        assert_eq!(security.values, vec!["wpa3"], "a repeated value is listed once");
+    }
+
     /// A measurement with an explicit body, for the field-facet and series tests.
     fn mb(kind: &str, event_time: i64, body: serde_json::Value, attrs: serde_json::Value) -> Measurement {
         Measurement {
@@ -928,7 +1148,7 @@ mod tests {
         assert_eq!(narrow_cell.values, vec!["2"], "precondition: this is why the widened query exists");
 
         // Excluding its own filter, every value is offered again.
-        let widened = facet_values_excluding(&conn, &filtered, "cell").unwrap();
+        let widened = facet_values_excluding(&conn, &filtered, &FieldRef::Attribute("cell".into())).unwrap();
         assert_eq!(widened.values, vec!["1", "2", "3"]);
     }
 
@@ -946,7 +1166,7 @@ mod tests {
             ..Default::default()
         };
 
-        let cells = facet_values_excluding(&conn, &spec, "cell").unwrap();
+        let cells = facet_values_excluding(&conn, &spec, &FieldRef::Attribute("cell".into())).unwrap();
         assert_eq!(cells.values, vec!["1", "2"], "cell 3 is in pack b, which is filtered out");
     }
 
@@ -1091,7 +1311,7 @@ mod tests {
         let spec = SeriesSpec {
             filter: QuerySpec { types: vec!["c".into()], ..Default::default() },
             field: Some("v".into()),
-            group: Some("cell".into()),
+            group: Some(FieldRef::Attribute("cell".into())),
             // Deliberately not ascending: the caller's order is what decides colour, so it must be
             // what comes back.
             groups: vec!["3".into(), "1".into()],

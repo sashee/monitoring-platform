@@ -293,12 +293,20 @@ pub fn apply_correction(
 }
 
 fn correct_record(record: &mut LogRecord, correction: Option<Correction>, flush: Flush) -> bool {
-    let correctable = string_attr_value(&record.attributes, ATTR_RESOLUTION)
-        .and_then(Disposition::from_label)
-        .is_some_and(Disposition::is_correctable);
+    // Read *and remove*. `resolution` is written by the receipt pass and read here, so it is a carrier
+    // as much as a label — but whether it *stays* on the record is decided at the bottom of this
+    // function, not by the pass that produced it.
+    let label = take_string_attr(&mut record.attributes, ATTR_RESOLUTION);
+    let correctable =
+        label.as_deref().and_then(Disposition::from_label).is_some_and(Disposition::is_correctable);
 
-    // Read *and remove*, unconditionally: these are internal bookkeeping and must not reach the
-    // wire whether or not there is an offset to use them with.
+    // Ambiguity was already marked at receipt, and that mark is what makes an ambiguous record
+    // exceptional below. Peeked rather than taken: it belongs on the wire.
+    let ambiguous = string_attr_value(&record.attributes, ATTR_SPREAD_NS).is_some()
+        || record.attributes.iter().any(|kv| kv.key == ATTR_SPREAD_NS);
+
+    // These two are internal bookkeeping and must not reach the wire whether or not there is an offset
+    // to use them with.
     let event = take_int_attr(&mut record.attributes, ATTR_EVENT_BOOTTIME);
     let receipt = take_int_attr(&mut record.attributes, ATTR_RECEIPT_BOOTTIME);
 
@@ -320,13 +328,30 @@ fn correct_record(record: &mut LogRecord, correction: Option<Correction>, flush:
         _ => None,
     };
 
-    record.attributes.push(bool_attr(ATTR_CORRECTED, applied.is_some()));
-    record.attributes.push(int_attr(ATTR_CORRECTION_NS, applied.unwrap_or(0)));
+    // **Stamped by exception (design §9.1).** A record whose timestamp was corrected from a clock that
+    // was synchronized, with no ambiguity, carries *no* clock attributes at all.
+    //
+    // These used to be unconditional — `corrected`, `correction_ns`, `resolution` and `sync_source` on
+    // every record — and that was the wrong trade for two reasons. Cardinality: `correction_ns` is
+    // effectively a new distinct value per boot, stored on every one of the millions of rows a year this
+    // host produces, so it inflates the attribute index and clutters every filter dropdown with a value
+    // nobody filters on. And redundancy: on the normal path they say the same thing on every row, and the
+    // aggregate they add up to is already reported, once a minute, by the collector's own health event
+    // (design §9) — which is the right place for "how is this host's clock doing".
+    //
+    // What is kept is the part no aggregate can reconstruct: **which individual records are not
+    // ordinary.** A record that was not corrected keeps its `resolution`, so a timestamp that silently
+    // degraded to `passthrough` is still visible per row — the exact failure this design exists to make
+    // loud (design §4.2). Uncertainty and ambiguity keep their own markers for the same reason.
+    //
+    // The happy path is therefore identified by *absence*, which is the one reading that costs nothing to
+    // store. `mp.collector.health` remains the place to look for rates and offsets.
+    let exceptional = applied.is_none() || flush.uncertain || ambiguous;
+    if exceptional && let Some(label) = label {
+        record.attributes.push(string_attr(ATTR_RESOLUTION, &label));
+    }
     if flush.uncertain {
         record.attributes.push(bool_attr(ATTR_UNCERTAIN, true));
-    }
-    if let Some(source) = flush.sync_source {
-        record.attributes.push(string_attr(ATTR_SYNC_SOURCE, source.label()));
     }
 
     applied.is_some()
@@ -338,6 +363,16 @@ fn correct_record(record: &mut LogRecord, correction: Option<Correction>, flush:
 /// a record with no timestamp rather than storing a fabricated one (SPEC.md §5.3).
 fn project(boottime: i64, offset: i64) -> u64 {
     boottime.checked_add(offset).and_then(|v| u64::try_from(v).ok()).unwrap_or(0)
+}
+
+/// Reads a string attribute and removes it, for the ones that carry state between the two passes.
+fn take_string_attr(attributes: &mut Vec<KeyValue>, key: &str) -> Option<String> {
+    let index = attributes.iter().position(|kv| kv.key == key)?;
+    let removed = attributes.remove(index);
+    match removed.value.and_then(|v| v.value) {
+        Some(Value::StringValue(s)) => Some(s),
+        _ => None,
+    }
 }
 
 fn take_int_attr(attributes: &mut Vec<KeyValue>, key: &str) -> Option<i64> {
@@ -430,6 +465,16 @@ mod tests {
         r.attributes.iter().rev().find(|kv| kv.key == key)?.value.as_ref()?.value.as_ref()
     }
 
+    /// Every `mp.clock.*` attribute left on a record, for asserting on the set rather than key by key.
+    fn clock_attrs(r: &LogRecord) -> Vec<&str> {
+        r.attributes.iter().map(|kv| kv.key.as_str()).filter(|k| k.starts_with(NS)).collect()
+    }
+
+    /// Whether the record carries none at all — the shape of an ordinary corrected record.
+    fn no_clock_attrs(r: &LogRecord) -> bool {
+        clock_attrs(r).is_empty()
+    }
+
     /// The whole loop on the case the design exists for: a stamp from a stale clock goes in, a
     /// correct wall-clock time comes out.
     #[test]
@@ -458,16 +503,21 @@ mod tests {
 
         let out = &records(&req)[0];
         assert_eq!(out.time_unix_nano, (WALL + 10 * SEC) as u64);
-        assert_eq!(attr_of(out, ATTR_CORRECTED), Some(&Value::BoolValue(true)));
-        assert_eq!(attr_of(out, ATTR_CORRECTION_NS), Some(&Value::IntValue(WALL)));
-        assert_eq!(
-            attr_of(out, ATTR_RESOLUTION),
-            Some(&Value::StringValue("exact".to_owned()))
+        // **Stamped by exception**: the correction happened, so the record says nothing about it. The
+        // corrected timestamp *is* the output; a row asserting "yes, this is fine" on every record was
+        // cardinality without information (design §9.1).
+        assert!(
+            no_clock_attrs(out),
+            "an ordinary corrected record must carry no clock attributes: {:?}",
+            clock_attrs(out)
         );
-        assert_eq!(
-            attr_of(out, ATTR_SYNC_SOURCE),
-            Some(&Value::StringValue("maxerror".to_owned()))
-        );
+        // Named individually as well as by the set above, because each one was previously stamped here
+        // and each is a separate decision to have stopped. `sync_source` in particular: which clock
+        // source was trusted is a property of the *host at that moment*, not of the record, and the
+        // health event reports it once a minute instead of once per row.
+        for dropped in [ATTR_CORRECTED, ATTR_CORRECTION_NS, ATTR_RESOLUTION, ATTR_SYNC_SOURCE] {
+            assert_eq!(attr_of(out, dropped), None, "{dropped} must not be stamped on a normal record");
+        }
         assert!(attr_of(out, ATTR_UNCERTAIN).is_none(), "not a timeout flush");
     }
 
@@ -518,8 +568,17 @@ mod tests {
 
         let out = &records(&req)[0];
         assert_eq!(out.time_unix_nano, historical as u64, "a foreign frame must survive intact");
-        assert_eq!(attr_of(out, ATTR_CORRECTED), Some(&Value::BoolValue(false)));
-        assert_eq!(attr_of(out, ATTR_CORRECTION_NS), Some(&Value::IntValue(0)));
+        // **The exception that must stay visible.** A record that was not corrected keeps its
+        // resolution, so a timestamp silently degrading to passthrough is still detectable per row —
+        // the failure mode design §4.2 exists to make loud.
+        assert_eq!(
+            attr_of(out, ATTR_RESOLUTION),
+            Some(&Value::StringValue("passthrough".to_owned()))
+        );
+        // ...and nothing more than that.
+        assert_eq!(attr_of(out, ATTR_CORRECTED), None);
+        assert_eq!(attr_of(out, ATTR_CORRECTION_NS), None);
+        assert_eq!(attr_of(out, ATTR_SYNC_SOURCE), None);
     }
 
     /// Tier 2: the application says it already knows. Even a timestamp that *would* have resolved
@@ -627,9 +686,13 @@ mod tests {
             (stale + 10 * SEC) as u64,
             "the record must still be shippable OTLP, not a bare boottime"
         );
-        assert_eq!(attr_of(out, ATTR_CORRECTED), Some(&Value::BoolValue(false)));
-        assert_eq!(attr_of(out, ATTR_CORRECTION_NS), Some(&Value::IntValue(0)));
         assert_eq!(attr_of(out, ATTR_UNCERTAIN), Some(&Value::BoolValue(true)));
+        assert!(
+            attr_of(out, ATTR_RESOLUTION).is_some(),
+            "an uncorrected record keeps its resolution"
+        );
+        assert_eq!(attr_of(out, ATTR_CORRECTED), None);
+        assert_eq!(attr_of(out, ATTR_CORRECTION_NS), None);
     }
 
     /// The collector's receipt time becomes `observed_time_unix_nano` — but only once there is an

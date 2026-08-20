@@ -77,6 +77,18 @@ pub fn list(conn: &Connection) -> Result<Vec<StoredKey>> {
     Ok(keys)
 }
 
+/// Revokes one key, returning whether it existed.
+///
+/// Deleting the row *is* the revocation — see the migration comment on `api_key` for why there is no
+/// `revoked_at`. A device presenting it next gets the ordinary "no such id" refusal after one index probe,
+/// which is exactly the outcome wanted.
+pub fn delete(conn: &Connection, id: &str) -> Result<bool> {
+    let removed = conn
+        .execute("DELETE FROM api_key WHERE id = ?1", [id])
+        .with_context(|| format!("deleting api key {id}"))?;
+    Ok(removed > 0)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -32,10 +32,6 @@ fn main() -> Result<()> {
             init_tracing_on_stderr(&args.common.log_level);
             create_api_key(&args)
         }
-        Command::ListApiKeys(args) => {
-            init_tracing_on_stderr(&args.log_level);
-            list_api_keys(&args)
-        }
         // The §14 commands, all one SQLite transaction and some printing, so no runtime here either.
         Command::CreateUser(args) => {
             init_tracing_on_stderr(&args.common.log_level);
@@ -101,18 +97,6 @@ fn create_api_key(args: &CreateApiKeyArgs) -> Result<()> {
     Ok(())
 }
 
-fn list_api_keys(args: &ApiKeyArgs) -> Result<()> {
-    let conn = store::open_read(&args.database_path())?;
-    for key in store::keys::list(&conn)? {
-        println!(
-            "{}  {}  {}",
-            key.id,
-            api::query::format_nanos(key.created_at),
-            key.label
-        );
-    }
-    Ok(())
-}
 
 /// Creates a web interface user (SPEC §14).
 ///

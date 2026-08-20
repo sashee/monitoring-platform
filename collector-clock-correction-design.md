@@ -476,10 +476,16 @@ failing tests before they showed up as arguments:
   precisely the size of the step between them — the whole correction and nothing else.
 - **it breaks the receiver's deduplication.** `SPEC.md` §6.6 makes a measurement's id a content
   hash over `event_time` and the attributes, which is what turns a retry after a lost
-  acknowledgement into a no-op rather than a second row. `mp.clock.correction_ns` is one of those
-  attributes. A re-sampled offset differs by a nanosecond or two between deliveries, changes the
-  hash, and turns an application's ordinary retry into a duplicate measurement — silently
-  defeating the property commit b6477b0 exists to provide.
+  acknowledgement into a no-op rather than a second row. A re-sampled offset differs by a nanosecond
+  or two between deliveries, so the projected `event_time` differs, the hash differs, and an
+  application's ordinary retry becomes a duplicate measurement — silently defeating the property
+  commit b6477b0 exists to provide.
+
+  **[revised] this argument used to rest on the attribute as well, and no longer needs to.** It
+  originally noted that `mp.clock.correction_ns` was itself one of the hashed attributes, so a
+  re-sampled offset perturbed the hash twice over. §6.3 no longer stamps that attribute, which
+  removes one of the two mechanisms — but not the conclusion, and not even the weaker half of it:
+  `event_time` is hashed directly, and it is `event_time` that a re-sampled offset moves.
 
 **One offset per flush, not per record**, or records drift relative to each other and ordering
 within a burst can break.
@@ -490,13 +496,39 @@ rates come out unchanged.
 
 ### 6.3 Attributes on emitted records
 
-- `mp.clock.corrected` — bool
-- `mp.clock.correction_ns` — offset applied
-- `mp.clock.resolution` — `exact` | `ambiguous` | `passthrough` | `authoritative`
-- `mp.clock.ambiguity_spread_ns` — how far apart the candidates were, when ambiguous
-- `mp.clock.uncertain` — true if flushed on timeout without sync
-- `mp.clock.sync_source` — which §4.4 condition fired
-- `observed_time_unix_nano` — collector receipt time (OTLP log records)
+**[revised] stamped by exception; an ordinary corrected record carries none.** The original list was
+unconditional — `corrected`, `correction_ns`, `resolution` and `sync_source` on every emitted record —
+and that was wrong on two counts once there was a year of real data to look at.
+
+*Cardinality.* `correction_ns` is effectively a new distinct value per boot, written onto every one of
+the millions of rows a year a busy host produces. §6.1 refuses a per-record boottime for exactly this
+reason; stamping the offset it was corrected with is the same mistake one step later. It also clutters
+every attribute filter in the read UI with a value nobody filters on.
+
+*Redundancy.* On the normal path the four say the same thing on every row, and the aggregate they add up
+to — how synchronized this host is, how many records were corrected, by how much — is already reported
+once a minute by §9's own health event. That is the right place for "how is this host's clock doing";
+per-row copies of it are not evidence, just volume.
+
+What is kept is the part no aggregate can reconstruct: **which individual records are not ordinary.**
+
+| Emitted | When |
+|---|---|
+| *(nothing)* | corrected, from a synchronized clock, unambiguous — the overwhelming majority |
+| `mp.clock.resolution` — `exact` \| `ambiguous` \| `passthrough` \| `authoritative` | the record was **not** corrected, or was uncertain, or was ambiguous |
+| `mp.clock.ambiguity_spread_ns` | ambiguous: how far apart the candidates were |
+| `mp.clock.uncertain` | flushed on timeout without sync |
+| `observed_time_unix_nano` | always (collector receipt time, OTLP log records) |
+
+So the happy path is identified by **absence**, which is the one encoding that costs nothing to store,
+and a timestamp that silently degraded to `passthrough` is still visible per row — the §4.2 failure this
+labelling exists to make loud. `mp.clock.resolution` also remains the carrier the flush pass reads to
+decide correctability (§6.2), so it is always written at receipt and *removed* at flush unless the
+outcome was exceptional.
+
+`mp.clock.corrected` is gone: it is now implied, and inverted, by the presence of `resolution`.
+`mp.clock.sync_source` is gone too — which clock source was trusted is a property of the host at that
+moment rather than of the record, and §9 reports it.
 
 **[revised] namespaced `mp.clock.`, and note where they land.** The original wrote them bare. The
 `mp.` prefix is the private namespace §6.1 asks for. Downstream, the receiver prefixes record
@@ -713,8 +745,10 @@ Retained only as a tie-break between ambiguous candidates.
 **Buffering on mid-run desync.** See §8.2.
 
 **[revised] Sampling the clock at flush.** Was the design in §6.2. It makes resolution and
-projection non-inverse, and it breaks the receiver's content-hash deduplication by perturbing
-`correction_ns` between deliveries. Replaced by the active epoch's offset.
+projection non-inverse, and it breaks the receiver's content-hash deduplication by perturbing the
+projected `event_time` between deliveries. Replaced by the active epoch's offset. (Originally this
+also cited `correction_ns`, which §6.3 no longer stamps; the timestamp itself is the reason that
+survives.)
 
 **[revised] Detecting slew.** Considered while implementing §8.3, then dropped: `realtime −
 boottime` is invariant under slewing, so there is nothing to detect. What survives is a cheap

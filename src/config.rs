@@ -40,13 +40,13 @@ pub enum Command {
     ///
     /// The token cannot be recovered afterwards: only a hash of its secret half is stored. Losing it
     /// means issuing another and deleting this one.
-    CreateApiKey(CreateApiKeyArgs),
-
-    /// List the API keys that exist, by id and label.
     ///
-    /// Never prints a secret, because none is stored — this answers "which keys exist" and "was mine
-    /// created", not "what was the token".
-    ListApiKeys(ApiKeyArgs),
+    /// **Kept although §14.1 now has a page for this**, because this command works with the service *down*
+    /// and the page cannot. That is not a hypothetical: `nix/tests/lib.nix` provisions the collector's key
+    /// before the receiver has ever started — it has to, since the collector reads its key once at startup
+    /// and is ordered before nearly everything — and it is the only way back when there is no web session
+    /// to log in with. Listing and revoking moved to the page; issuing is the bootstrap.
+    CreateApiKey(CreateApiKeyArgs),
 
     /// Create a web interface user, reading the password from stdin (SPEC §14).
     ///

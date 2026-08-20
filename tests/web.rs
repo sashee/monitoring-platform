@@ -855,9 +855,10 @@ async fn a_text_only_type_gets_a_timeline_and_no_value_chart() {
     assert!(reply.body.contains("<th>active_state</th>"), "{}", reply.body);
 }
 
-/// Past the series cap the chart says how many groups it left out, rather than inventing more hues.
+/// **All groups are plotted, not the first eight.** Past the palette's eight hues, identity is carried by
+/// hue *and* line pattern together, so a ninth series is distinguishable without a ninth hue being invented.
 #[tokio::test]
-async fn more_groups_than_the_cap_are_reported() {
+async fn every_group_is_plotted_past_the_palette() {
     let harness = harness();
     harness.ingest(&cells(2, 12));
     let cookie = harness.login().await;
@@ -865,18 +866,90 @@ async fn more_groups_than_the_cap_are_reported() {
     let reply = explore(
         &harness,
         &cookie,
-        "range=all&type=bms.status.cell&t0=bms.status.cell&field=voltage_volts\
-         &group=record.attributes.cell",
+        "range=all&type=bms.status.cell&t0=bms.status.cell&field=voltage_volts&group=record.attributes.cell",
     )
     .await;
 
-    assert!(reply.body.contains("Showing 8 of 12 groups"), "{}", reply.body);
-    assert!(reply.body.contains("var(--series-8)"), "eight slots used");
-    assert!(!reply.body.contains("var(--series-9)"), "and never a ninth");
+    assert_eq!(reply.body.matches("class=\"line\"").count(), 12, "all twelve: {}", reply.body);
+    assert!(!reply.body.contains("Showing 8 of"), "nothing is left out any more");
+    assert!(!reply.body.contains("var(--series-9)"), "and never a ninth hue");
+    // The four past the palette are dashed, which is what tells them from hues 1-4.
+    assert_eq!(reply.body.matches("stroke-dasharray").count(), 4, "{}", reply.body);
+    // Every group is in the legend.
+    let legend = reply.body.split("<ul class=\"legend\">").nth(1).expect("a legend");
+    for cell in 1..=12 {
+        assert!(legend.contains(&format!(">{cell}</a>")), "cell {cell} missing: {legend}");
+    }
 }
 
-/// Groups are chosen and coloured by *sorted* value, and numerically when they are numbers — otherwise
-/// "the first eight" of sixteen cells would be 1 and 10–16.
+/// Tapping a legend entry hides that line, and the link is how — there is no JavaScript.
+#[tokio::test]
+async fn a_legend_entry_toggles_its_series() {
+    let harness = harness();
+    harness.ingest(&cells(2, 3));
+    let cookie = harness.login().await;
+
+    let base = "range=all&type=bms.status.cell&t0=bms.status.cell&field=voltage_volts\
+&group=record.attributes.cell";
+    let shown = explore(&harness, &cookie, base).await;
+    assert_eq!(shown.body.matches("class=\"line\"").count(), 3);
+
+    // Every entry offers a hide link...
+    let legend = shown.body.split("<ul class=\"legend\">").nth(1).expect("a legend");
+    assert!(legend.contains("hide=2"), "{legend}");
+
+    // ...and following it removes exactly that line.
+    let hidden = explore(&harness, &cookie, &format!("{base}&hide=2")).await;
+    assert_eq!(hidden.body.matches("class=\"line\"").count(), 2, "one line fewer");
+
+    // The hidden one is still listed, struck through, with a link that brings it back.
+    let legend = hidden.body.split("<ul class=\"legend\">").nth(1).expect("a legend");
+    assert!(legend.contains("class=\"off\""), "a hidden entry must still be listed: {legend}");
+    let restore = legend.split("class=\"off\"").nth(1).expect("the hidden entry");
+    assert!(!restore.split("</li>").next().unwrap().contains("hide=2"), "its link must un-hide it");
+}
+
+/// **Hiding must not repaint what remains.** A reader who learned that cell 3 is the aqua line has to find
+/// it aqua after hiding cell 1.
+#[tokio::test]
+async fn hiding_a_series_does_not_recolour_the_others() {
+    let harness = harness();
+    harness.ingest(&cells(2, 4));
+    let cookie = harness.login().await;
+
+    let base = "range=all&type=bms.status.cell&t0=bms.status.cell&field=voltage_volts\
+&group=record.attributes.cell";
+    let all = explore(&harness, &cookie, base).await;
+    let hidden = explore(&harness, &cookie, &format!("{base}&hide=1")).await;
+
+    // Cell 4 is the fourth group, so it holds slot 4's hue either way.
+    assert!(all.body.contains("var(--series-4)"), "{}", all.body);
+    assert!(hidden.body.contains("var(--series-4)"), "cell 4 was repainted: {}", hidden.body);
+    // And the freed first hue is not handed to anyone else.
+    assert!(!hidden.body.contains("stroke=\"var(--series-1)\""), "{}", hidden.body);
+}
+
+/// Past the hard bound a plot cannot distinguish them at all, so it says what it left out.
+#[tokio::test]
+async fn beyond_the_hard_bound_the_chart_says_so() {
+    let harness = harness();
+    // 30 groups, past 8 hues x 3 patterns.
+    harness.ingest(&cells(1, 30));
+    let cookie = harness.login().await;
+
+    let reply = explore(
+        &harness,
+        &cookie,
+        "range=all&type=bms.status.cell&t0=bms.status.cell&field=voltage_volts&group=record.attributes.cell",
+    )
+    .await;
+
+    assert!(reply.body.contains("Showing 24 of 30 groups"), "{}", reply.body);
+}
+
+/// Groups are ordered — and coloured — by *sorted* value, numerically when they are numbers. Before the
+/// cap was lifted this decided which eight you saw at all; it still decides which hue each one gets, and a
+/// legend running 1, 10, 11, 2 is one nobody can scan.
 #[tokio::test]
 async fn numeric_groups_are_ordered_numerically() {
     let harness = harness();
@@ -891,12 +964,22 @@ async fn numeric_groups_are_ordered_numerically() {
     )
     .await;
 
-    // The legend lists the plotted groups in order: 1..8, not 1,10,11,12.
+    // Numeric order, so cell 2 comes second rather than after cell 19.
     let legend = reply.body.split("<ul class=\"legend\">").nth(1).expect("a legend").to_owned();
-    for expected in 1..=8 {
-        assert!(legend.contains(&format!(">{expected}</li>")), "cell {expected} missing: {legend}");
-    }
-    assert!(!legend.contains(">10</li>"), "cell 10 is past the cap: {legend}");
+    // The label is the text between the key span and the end of the anchor.
+    let order: Vec<&str> = legend
+        .split("</ul>")
+        .next()
+        .expect("the legend list")
+        .split("</span>")
+        .skip(1)
+        .filter_map(|rest| rest.split("</a>").next())
+        .collect();
+    assert_eq!(
+        order,
+        vec!["1", "2", "3", "4", "5", "6", "7", "8", "9", "10", "11", "12"],
+        "the legend must read in numeric order: {legend}"
+    );
 }
 
 /// Device-supplied text reaches the SVG through group labels. SVG is XML, so an unescaped `<` is as
@@ -1114,6 +1197,436 @@ async fn the_page_carries_its_narrow_screen_affordances() {
     assert!(reply.body.contains("class=\"plot-wrap\""), "a scrollable plot wrapper");
     assert!(reply.body.contains("data-label="), "cells that label themselves");
     assert!(reply.body.contains("@media(max-width:46rem)"), "and the card layout");
+}
+
+// ------------------------------------------------------- api keys (SPEC §13, §14.1)
+
+#[tokio::test]
+async fn the_keys_page_lists_and_issues() {
+    let harness = harness();
+    let cookie = harness.login().await;
+
+    // The harness starts with one key, so it is already listed.
+    let page = harness.get("/keys", Some(&cookie)).await;
+    assert_eq!(page.status, StatusCode::OK);
+    assert!(page.body.contains("<h2>issue a key</h2>"), "{}", page.body);
+    assert!(page.body.contains("integration-test"), "the existing key's label: {}", page.body);
+
+    let created = harness.post_form("/keys/create", "label=pi-7", Some(&cookie)).await;
+    assert_eq!(created.status, StatusCode::OK, "the token is rendered, not redirected to");
+    assert!(created.body.contains("mpk_"), "the token must be shown once: {}", created.body);
+    assert!(created.body.contains("cannot be shown again"), "and said to be one-shot");
+    assert!(created.body.contains("pi-7"));
+}
+
+/// **A token is shown once and never again.** Only its hash is stored, so a redirect would lose it — and a
+/// token in a URL would land in history.
+#[tokio::test]
+async fn an_issued_token_is_not_repeated_on_the_next_load() {
+    let harness = harness();
+    let cookie = harness.login().await;
+
+    let created = harness.post_form("/keys/create", "label=once", Some(&cookie)).await;
+    let token = created
+        .body
+        .split("<code>")
+        .nth(1)
+        .and_then(|rest| rest.split("</code>").next())
+        .expect("a token")
+        .to_owned();
+    assert!(token.starts_with("mpk_"), "{token}");
+
+    let again = harness.get("/keys", Some(&cookie)).await;
+    assert!(!again.body.contains(&token), "the token must not reappear: {}", again.body);
+    assert!(!again.body.contains("cannot be shown again"));
+}
+
+/// The issued key must actually authenticate — a page that stored an unusable hash would look identical.
+#[tokio::test]
+async fn a_key_issued_from_the_page_works_on_the_v1_api() {
+    let harness = harness();
+    let cookie = harness.login().await;
+
+    let created = harness.post_form("/keys/create", "label=device", Some(&cookie)).await;
+    let token = created
+        .body
+        .split("<code>")
+        .nth(1)
+        .and_then(|rest| rest.split("</code>").next())
+        .expect("a token")
+        .to_owned();
+
+    let reply = harness
+        .send(
+            Request::builder()
+                .uri("/v1/measurements")
+                .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+    assert_eq!(reply.status, StatusCode::OK, "the new key must be accepted");
+}
+
+/// Revoking deletes the row, so the next request carrying it is refused.
+#[tokio::test]
+async fn revoking_a_key_stops_it_working() {
+    let harness = harness();
+    let cookie = harness.login().await;
+    let key_id = store::keys::list(&harness.read()).unwrap()[0].id.clone();
+
+    let revoked = harness.post_form("/keys/delete", &format!("id={key_id}"), Some(&cookie)).await;
+    assert_eq!(revoked.status, StatusCode::SEE_OTHER);
+    assert!(store::keys::list(&harness.read()).unwrap().is_empty());
+
+    // The harness's own key was the one revoked, so /v1 now refuses it.
+    assert_eq!(harness.get_with_key("/v1/measurements").await.status, StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn a_key_needs_a_label() {
+    let harness = harness();
+    let cookie = harness.login().await;
+    let before = store::keys::list(&harness.read()).unwrap().len();
+
+    for body in ["label=", "label=%20%20"] {
+        let reply = harness.post_form("/keys/create", body, Some(&cookie)).await;
+        assert_eq!(reply.status, StatusCode::BAD_REQUEST, "on {body:?}");
+    }
+    assert_eq!(store::keys::list(&harness.read()).unwrap().len(), before);
+}
+
+/// The keys pages are behind the session guard and the origin check like every other mutation.
+#[tokio::test]
+async fn the_keys_page_is_guarded() {
+    let harness = harness();
+    let cookie = harness.login().await;
+
+    let anonymous = harness.get("/keys", None).await;
+    assert_eq!(anonymous.status, StatusCode::SEE_OTHER);
+    assert_eq!(anonymous.location.as_deref(), Some("/login"));
+
+    let forged = harness
+        .post_from("/keys/create", "label=x", Some(&cookie), Some("http://localhost:3000"))
+        .await;
+    assert_eq!(forged.status, StatusCode::FORBIDDEN);
+    assert_eq!(store::keys::list(&harness.read()).unwrap().len(), 1, "nothing written");
+}
+
+// ------------------------------------------------------- fields in either half of the measurement
+
+/// Measurements shaped like the real `detected-devices.wifi_bss`: the interesting identity (`ssid`) is a
+/// body leaf, while `bssid` is an attribute.
+fn wifi(rows: &[(&str, &str, f64)]) -> Vec<Measurement> {
+    rows.iter()
+        .enumerate()
+        .map(|(i, (ssid, bssid, signal))| Measurement {
+            event_time: T + i as i64 * 1_000_000_000,
+            processed_time: T,
+            kind: "detected-devices.wifi_bss".to_owned(),
+            body: Some(json!({"ssid": ssid, "signal_dbm": signal, "security": "wpa3"})),
+            attributes: json!({ "record.attributes.bssid": bssid }).as_object().unwrap().clone(),
+        })
+        .collect()
+}
+
+/// **The ask.** `ssid` lives in the body, so it used to be visible only in the table. It must be usable as
+/// the series dimension, generically — nothing here is wifi-specific.
+#[tokio::test]
+async fn a_body_field_can_be_the_series_dimension() {
+    let harness = harness();
+    harness.ingest(&wifi(&[
+        ("home", "aa", -60.0),
+        ("cafe", "bb", -70.0),
+        ("home", "cc", -50.0),
+    ]));
+    let cookie = harness.login().await;
+
+    let reply = explore(
+        &harness,
+        &cookie,
+        "range=all&type=detected-devices.wifi_bss&t0=detected-devices.wifi_bss&field=signal_dbm&group=b:ssid",
+    )
+    .await;
+
+    assert_eq!(reply.status, StatusCode::OK);
+    // Two lines, labelled by SSID rather than by BSSID.
+    assert_eq!(reply.body.matches("class=\"line\"").count(), 2, "{}", reply.body);
+    let legend = reply.body.split("<ul class=\"legend\">").nth(1).expect("a legend");
+    assert!(legend.contains(">cafe</a>"), "{legend}");
+    assert!(legend.contains(">home</a>"), "{legend}");
+}
+
+/// The control offers both halves, so the reader never has to know which column a field sits in.
+#[tokio::test]
+async fn the_grouping_control_offers_body_leaves_and_attributes() {
+    let harness = harness();
+    harness.ingest(&wifi(&[("home", "aa", -60.0), ("cafe", "bb", -70.0)]));
+    let cookie = harness.login().await;
+
+    let reply = explore(
+        &harness,
+        &cookie,
+        "range=all&type=detected-devices.wifi_bss&t0=detected-devices.wifi_bss&field=signal_dbm",
+    )
+    .await;
+
+    let select = reply.body.split(r#"name="group""#).nth(1).expect("the group select");
+    assert!(select.contains(r#"value="b:ssid""#), "the body leaf: {select}");
+    assert!(select.contains(r#"value="record.attributes.bssid""#), "the attribute: {select}");
+}
+
+/// Filtering by a body leaf, which is what makes the ">8 groups, narrow to see the rest" escape hatch work
+/// for a body-grouped chart.
+#[tokio::test]
+async fn a_body_field_can_filter_the_view() {
+    let harness = harness();
+    harness.ingest(&wifi(&[("home", "aa", -60.0), ("cafe", "bb", -70.0)]));
+    let cookie = harness.login().await;
+
+    let reply = explore(
+        &harness,
+        &cookie,
+        "range=all&type=detected-devices.wifi_bss&t0=detected-devices.wifi_bss&body.ssid=home",
+    )
+    .await;
+
+    assert_eq!(reply.status, StatusCode::OK);
+    assert!(reply.body.contains("home"), "{}", reply.body);
+    // `cafe` must be gone from the table. It is still offered in its own dropdown — that is the
+    // one-way-door fix — so the check is on the row, not on the whole page.
+    let rows = reply.body.split("<tbody>").nth(1).expect("a table body");
+    assert!(!rows.contains("cafe"), "the filter must remove the other network: {rows}");
+}
+
+/// A body filter is offered as a control, and keeps offering its alternatives once applied.
+#[tokio::test]
+async fn a_filtered_body_field_still_offers_its_other_values() {
+    let harness = harness();
+    harness.ingest(&wifi(&[("home", "aa", -60.0), ("cafe", "bb", -70.0), ("work", "cc", -55.0)]));
+    let cookie = harness.login().await;
+
+    let reply = explore(
+        &harness,
+        &cookie,
+        "range=all&type=detected-devices.wifi_bss&t0=detected-devices.wifi_bss&body.ssid=cafe",
+    )
+    .await;
+
+    let select = reply.body.split(r#"name="body.ssid""#).nth(1).expect("the ssid select");
+    let select = select.split("</select>").next().expect("its end");
+    for expected in ["home", "cafe", "work"] {
+        assert!(select.contains(expected), "{expected} missing, so the filter is a one-way door: {select}");
+    }
+    assert!(select.contains(r#"value="cafe" selected"#), "{select}");
+}
+
+// ------------------------------------------------------- the full-page chart
+
+/// The inline plot is a link to the readable version, which is what replaces horizontal scrolling in
+/// portrait.
+#[tokio::test]
+async fn an_inline_chart_links_to_its_full_page_view() {
+    let harness = harness();
+    harness.ingest(&cells(4, 1));
+    let cookie = harness.login().await;
+
+    let reply = explore(
+        &harness,
+        &cookie,
+        "range=all&type=bms.status.cell&t0=bms.status.cell&field=voltage_volts",
+    )
+    .await;
+
+    assert!(reply.body.contains("/chart?"), "{}", reply.body);
+    assert!(reply.body.contains("full size"), "and it says what it is for");
+    // The filters travel with it, or the full view would show a different chart.
+    assert!(reply.body.contains("field=voltage_volts"));
+    assert!(reply.body.contains("type=bms.status.cell"));
+}
+
+/// The full-page view ships the same chart twice — one geometry for a phone, one for a desktop — because a
+/// single `viewBox` cannot be legible at both widths.
+#[tokio::test]
+async fn the_full_page_chart_renders_both_geometries() {
+    let harness = harness();
+    harness.ingest(&cells(6, 1));
+    let cookie = harness.login().await;
+
+    let reply = harness
+        .get(
+            "/chart?range=all&type=bms.status.cell&t0=bms.status.cell&field=voltage_volts",
+            Some(&cookie),
+        )
+        .await;
+
+    assert_eq!(reply.status, StatusCode::OK);
+    assert!(reply.body.contains("class=\"plot wide\""), "{}", reply.body);
+    assert!(reply.body.contains("class=\"plot narrow\""));
+    assert_eq!(reply.body.matches("<svg").count(), 2, "exactly one pair, not one per breakpoint guess");
+    assert!(reply.body.contains("back to the explorer"), "and a way back");
+}
+
+/// **Tapping a point shows the measurements behind it.** A point is an average over a bucket, so the link
+/// carries that bucket's own window — not the whole visible range, which would be the same page again.
+#[tokio::test]
+async fn chart_points_link_to_the_rows_in_their_bucket() {
+    let harness = harness();
+    harness.ingest(&cells(6, 1));
+    let cookie = harness.login().await;
+
+    let reply = harness
+        .get(
+            "/chart?range=all&type=bms.status.cell&t0=bms.status.cell&field=voltage_volts",
+            Some(&cookie),
+        )
+        .await;
+
+    assert!(reply.body.contains("<a href=\"/?"), "the marks must be links: {}", reply.body);
+    assert!(reply.body.contains("from="), "carrying a window");
+    assert!(reply.body.contains("&amp;to="), "with both ends, xml-escaped");
+    // `range=custom` so the explicit bounds decide the window rather than the preset overriding them.
+    assert!(reply.body.contains("range=custom"), "{}", reply.body);
+
+    // And following one actually reaches the table. Picked by `from=`, which only a mark link carries —
+    // the nav and the back-link are also anchors, and grabbing the first one would test neither.
+    let href = reply
+        .body
+        .split("<a href=\"")
+        .find_map(|rest| {
+            let href = rest.split('"').next()?;
+            href.contains("from=").then(|| href.replace("&amp;", "&"))
+        })
+        .expect("a mark link carrying a bucket window");
+    let followed = harness.get(&href, Some(&cookie)).await;
+    assert_eq!(followed.status, StatusCode::OK, "the link must resolve: {href}");
+    assert!(followed.body.contains("matching measurements"), "and land on the table: {href}");
+}
+
+/// With no field chosen the timeline is the chart, and it is just as clickable.
+#[tokio::test]
+async fn the_full_page_view_falls_back_to_the_timeline() {
+    let harness = harness();
+    harness.ingest(&cells(4, 1));
+    let cookie = harness.login().await;
+
+    let reply = harness.get("/chart?range=all", Some(&cookie)).await;
+    assert_eq!(reply.status, StatusCode::OK);
+    assert!(reply.body.contains("class=\"col\""), "columns, not a line: {}", reply.body);
+}
+
+/// The chart page is behind the session guard like every other page.
+#[tokio::test]
+async fn the_full_page_chart_requires_a_session() {
+    let harness = harness();
+    let reply = harness.get("/chart?range=all", None).await;
+    assert_eq!(reply.status, StatusCode::SEE_OTHER);
+    assert_eq!(reply.location.as_deref(), Some("/login"));
+}
+
+/// Attribute keys and values go into a link's query string, and they are device-supplied — so they have to
+/// be percent-encoded, or a key containing `&` would silently change what the link means.
+#[tokio::test]
+async fn link_parameters_are_percent_encoded() {
+    let harness = harness();
+    harness.ingest(&[Measurement {
+        event_time: T,
+        processed_time: T,
+        kind: "t".to_owned(),
+        body: Some(json!({"v": 1.0})),
+        attributes: json!({"a&b=c": "x y"}).as_object().unwrap().clone(),
+    }]);
+    let cookie = harness.login().await;
+
+    let reply =
+        explore(&harness, &cookie, "range=all&type=t&t0=t&field=v&attr.a%26b%3Dc=x%20y").await;
+
+    // The filter round-trips into the /chart link with its metacharacters encoded, not raw.
+    let link = reply
+        .body
+        .split("href=\"/chart?")
+        .nth(1)
+        .and_then(|rest| rest.split('"').next())
+        .expect("a chart link")
+        .to_owned();
+    assert!(link.contains("a%26b%3Dc"), "the key must be encoded: {link}");
+    assert!(!link.contains("a&b=c"), "raw metacharacters would change the link: {link}");
+}
+
+// ------------------------------------------------------- readability of the cells
+
+/// Body and attributes render as indented `key: value` lines rather than stringified JSON.
+#[tokio::test]
+async fn structured_cells_render_as_yaml_not_json() {
+    let harness = harness();
+    harness.ingest(&cells(2, 1));
+    let cookie = harness.login().await;
+
+    // No type selected, so body and attributes are whole objects in one cell each.
+    let reply = explore(&harness, &cookie, "range=all").await;
+
+    assert!(reply.body.contains("class=\"yaml\""), "{}", reply.body);
+    assert!(reply.body.contains("voltage_volts: 3.29"), "a key: value line: {}", reply.body);
+    assert!(
+        !reply.body.contains("{&quot;voltage_volts&quot;"),
+        "no stringified JSON in a cell: {}",
+        reply.body
+    );
+}
+
+/// **Regression: `all` must include the newest row.** The window is applied as `event_time < to`, so a
+/// window taken straight from the data's extent dropped the last row — every time, silently. With two rows
+/// that is half the data; with a thousand it is invisible, which is the worse failure.
+#[tokio::test]
+async fn the_all_range_includes_the_newest_row() {
+    let harness = harness();
+    harness.ingest(&wifi(&[("first", "aa", -60.0), ("last", "bb", -70.0)]));
+    let cookie = harness.login().await;
+
+    let reply = explore(
+        &harness,
+        &cookie,
+        "range=all&type=detected-devices.wifi_bss&t0=detected-devices.wifi_bss",
+    )
+    .await;
+
+    let rows = reply.body.split("<tbody>").nth(1).expect("a table body");
+    assert!(rows.contains("first"), "{rows}");
+    assert!(rows.contains("last"), "the newest row must not be dropped: {rows}");
+}
+
+/// **Regression: the `all` window must not depend on the value filters.** If it did, filtering to one SSID
+/// would shrink the window to that SSID's rows — rescaling the axis on every filter change, and closing the
+/// one-way door again from behind, since a widened facet would have no other rows in range to offer.
+#[tokio::test]
+async fn the_all_window_does_not_shrink_when_a_value_filter_is_applied() {
+    let harness = harness();
+    harness.ingest(&wifi(&[("home", "aa", -60.0), ("cafe", "bb", -70.0), ("work", "cc", -50.0)]));
+    let cookie = harness.login().await;
+
+    let window_of = |body: &str| -> String {
+        body.split("<h2>measurements over time — ")
+            .nth(1)
+            .and_then(|rest| rest.split("</h2>").next())
+            .expect("the window heading")
+            .to_owned()
+    };
+
+    let unfiltered =
+        explore(&harness, &cookie, "range=all&type=detected-devices.wifi_bss&t0=detected-devices.wifi_bss")
+            .await;
+    let filtered = explore(
+        &harness,
+        &cookie,
+        "range=all&type=detected-devices.wifi_bss&t0=detected-devices.wifi_bss&body.ssid=cafe",
+    )
+    .await;
+
+    assert_eq!(
+        window_of(&unfiltered.body),
+        window_of(&filtered.body),
+        "the window must be a property of the type and range, not of the filters"
+    );
 }
 
 #[tokio::test]

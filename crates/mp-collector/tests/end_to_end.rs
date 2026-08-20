@@ -11,8 +11,7 @@
 //! lifecycle, readiness, peer credentials over a real connection, and the forwarding hop.
 
 use mp_collector::correct::{
-    ATTR_AUTHORITATIVE, ATTR_CORRECTED, ATTR_CORRECTION_NS, ATTR_EVENT_BOOTTIME,
-    ATTR_RECEIPT_BOOTTIME, ATTR_RESOLUTION,
+    ATTR_AUTHORITATIVE, ATTR_EVENT_BOOTTIME, ATTR_RECEIPT_BOOTTIME, ATTR_RESOLUTION,
 };
 use mp_collector::epoch::{Epoch, EpochTable, Source};
 use opentelemetry_proto::tonic::collector::logs::v1::ExportLogsServiceRequest;
@@ -26,6 +25,12 @@ use std::process::{Child, Command};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+/// Every `mp.clock.*` attribute left on a record. An ordinary corrected record carries none: the
+/// collector stamps by exception (design §9.1), so "this was fine" is said by absence.
+fn clock_attrs(r: &opentelemetry_proto::tonic::logs::v1::LogRecord) -> Vec<&str> {
+    r.attributes.iter().map(|kv| kv.key.as_str()).filter(|k| k.starts_with("mp.clock.")).collect()
+}
 
 const SEC: i64 = 1_000_000_000;
 const THREE_DAYS: i64 = 3 * 86_400 * SEC;
@@ -367,8 +372,9 @@ fn a_record_from_a_three_day_stale_clock_arrives_corrected() {
     assert_eq!(collector.post(&batch("cpu", stamped, vec![])).0, 200);
 
     let out = sink.wait_for("cpu");
-    assert_eq!(attr(&out, ATTR_CORRECTED), Some(Value::BoolValue(true)), "{out:?}");
-    assert_eq!(attr(&out, ATTR_RESOLUTION), Some(Value::StringValue("exact".into())));
+    // Corrected exactly, from a synchronized clock: the record says nothing about it, because the
+    // corrected timestamp is the output (design §9.1).
+    assert!(clock_attrs(&out).is_empty(), "expected no clock attributes, got {:?}", clock_attrs(&out));
 
     let corrected = out.time_unix_nano as i64;
     let residual = (corrected - stamped - THREE_DAYS).abs();
@@ -389,13 +395,13 @@ fn a_record_from_a_three_day_stale_clock_arrives_corrected() {
     let drift = (corrected - now_realtime()).abs();
     assert!(drift < 60 * SEC, "the corrected timestamp should be near now, but is off by {drift} ns");
 
-    let Some(Value::IntValue(applied)) = attr(&out, ATTR_CORRECTION_NS) else {
-        panic!("no correction was recorded: {out:?}");
-    };
-    assert!(
-        (applied - true_offset()).abs() < 10_000,
-        "the applied offset should be the one the host is actually running with, got {applied}"
-    );
+    // There was a third assertion here, reading `mp.clock.correction_ns` to check that the offset used
+    // was the host's real one. That attribute is no longer stamped (design §9.1), and the check is not
+    // worth reconstructing: it cannot be derived from the output — the record's boottime resolves
+    // against the *stale* epoch, so `corrected - stamped` is the three-day step, not the offset — and
+    // the two assertions above already pin the same behaviour more directly. `residual` says the
+    // correction was the step, and `drift` says the result landed at the present moment; an offset that
+    // was not the host's real one could satisfy neither.
 }
 
 /// The complement, and the stronger property: on a host whose clock is *right*, the round trip
@@ -409,7 +415,7 @@ fn a_correct_clock_round_trips_the_timestamp_exactly() {
     assert_eq!(collector.post(&batch("exact_round_trip", stamped, vec![])).0, 200);
 
     let out = sink.wait_for("exact_round_trip");
-    assert_eq!(attr(&out, ATTR_CORRECTED), Some(Value::BoolValue(true)));
+    assert!(clock_attrs(&out).is_empty(), "expected no clock attributes, got {:?}", clock_attrs(&out));
     assert_eq!(
         out.time_unix_nano as i64, stamped,
         "resolve-then-project must be the identity when the offset has not moved"
@@ -428,9 +434,10 @@ fn a_foreign_timestamp_passes_through_untouched() {
 
     let out = sink.wait_for("historical");
     assert_eq!(out.time_unix_nano as i64, historical, "a foreign frame was rewritten");
-    assert_eq!(attr(&out, ATTR_CORRECTED), Some(Value::BoolValue(false)));
+    // The exception that stays visible: a record that was NOT corrected keeps its resolution, so a
+    // timestamp degrading to passthrough is detectable per row (design §4.2).
     assert_eq!(attr(&out, ATTR_RESOLUTION), Some(Value::StringValue("passthrough".into())));
-    assert_eq!(attr(&out, ATTR_CORRECTION_NS), Some(Value::IntValue(0)));
+    assert_eq!(clock_attrs(&out), vec!["mp.clock.resolution"], "and nothing besides");
 }
 
 /// Tier 2, over the wire. An application that knows better says so, and is believed.

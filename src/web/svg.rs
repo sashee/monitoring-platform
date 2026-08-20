@@ -22,26 +22,123 @@
 //! - No small multiples past the series cap. The chart plots [`crate::store::read::MAX_SERIES`] and
 //!   says how many it left out.
 
-use crate::store::read::{MAX_SERIES, Point, Series};
+use crate::store::read::{PALETTE_SLOTS, Point, Series};
 
 use super::html::escape;
 
-/// Plot geometry. One set of numbers so the two plot kinds cannot drift out of alignment — their x
-/// axes must line up, since they are read as one stacked pair over the same window.
-const WIDTH: f64 = 960.0;
-const PAD_LEFT: f64 = 64.0;
-const PAD_RIGHT: f64 = 96.0;
-/// Room for the direct labels at the right-hand end of each line.
-const PAD_TOP: f64 = 12.0;
-/// The x-axis band. Part of the height rather than outside it: a container sized to the plot alone
-/// crops its own axis labels and grows a nested scrollbar.
-const PAD_BOTTOM: f64 = 26.0;
-const VALUE_PLOT_HEIGHT: f64 = 200.0;
-const TIMELINE_PLOT_HEIGHT: f64 = 72.0;
+/// Plot geometry. One struct so the two plot kinds cannot drift out of alignment — their x axes must
+/// line up, since they are read as one stacked pair over the same window — and so the same rendering
+/// code can serve a small inline plot and a large one on its own page.
+///
+/// **Why more than one preset exists at all.** The SVG is sized with a `viewBox` and `width="100%"`, so
+/// the browser scales everything in it, text included. That is fine while the rendered width is near the
+/// viewBox width and hopeless when it is not: a 960-unit viewBox in a 360px phone viewport is a 0.375×
+/// scale, which takes an 11px axis label to about 4px. No amount of CSS fixes that, because the scale
+/// applies to the font too. The only real answers are a viewBox that matches the target width, or a
+/// scrollbar. So the full-page view ships two — one sized for a phone, one for a desktop — and lets a
+/// media query pick, which costs one extra copy of one chart on the page whose whole purpose is being
+/// readable.
+#[derive(Debug, Clone, Copy)]
+pub struct Geometry {
+    pub width: f64,
+    pub pad_left: f64,
+    pub pad_right: f64,
+    /// Room for the direct labels at the right-hand end of each line.
+    pub pad_top: f64,
+    /// The x-axis band. Part of the height rather than outside it: a container sized to the plot alone
+    /// crops its own axis labels and grows a nested scrollbar.
+    pub pad_bottom: f64,
+    pub value_height: f64,
+    pub timeline_height: f64,
+    pub time_ticks: usize,
+    pub value_ticks: usize,
+    /// Extra class on the `<svg>`, which is how the media query chooses between the full-page pair.
+    pub class: &'static str,
+}
+
+impl Geometry {
+    /// In the page, under the filter row. Fits the column width on a desktop; on a phone the labels are
+    /// hidden by CSS and it reads as a shape, with the full view a tap away.
+    pub const INLINE: Geometry = Geometry {
+        width: 960.0,
+        pad_left: 64.0,
+        pad_right: 96.0,
+        pad_top: 12.0,
+        pad_bottom: 26.0,
+        value_height: 200.0,
+        timeline_height: 72.0,
+        time_ticks: 6,
+        value_ticks: 4,
+        class: "",
+    };
+
+    /// The full-page view on a wide screen: bigger, more ticks, room to read.
+    pub const FULL_WIDE: Geometry = Geometry {
+        width: 1200.0,
+        pad_left: 76.0,
+        pad_right: 120.0,
+        pad_top: 16.0,
+        pad_bottom: 32.0,
+        value_height: 440.0,
+        timeline_height: 120.0,
+        time_ticks: 7,
+        value_ticks: 5,
+        class: "wide",
+    };
+
+    /// The full-page view on a phone. The viewBox is close to a portrait viewport, so the scale is near
+    /// 1 and the labels render at their real size. Few ticks, because there is no width to spend.
+    pub const FULL_NARROW: Geometry = Geometry {
+        width: 420.0,
+        pad_left: 46.0,
+        pad_right: 14.0,
+        pad_top: 14.0,
+        pad_bottom: 30.0,
+        value_height: 320.0,
+        timeline_height: 96.0,
+        time_ticks: 3,
+        value_ticks: 4,
+        class: "narrow",
+    };
+
+    fn plot_right(&self) -> f64 {
+        self.width - self.pad_right
+    }
+}
+
+/// Compile-time guards, not tests, because these are invariants about constants and a build is the right
+/// place to lose an argument with one.
+///
+/// The presets exist to *differ* — if the narrow one stopped suiting a portrait viewport, or the wide one
+/// stopped being the larger, the media-query swap on the full-page view would be decoration and the
+/// legibility problem it solves would silently return.
+const _: () = assert!(
+    Geometry::FULL_NARROW.width < 480.0,
+    "the narrow preset has to be near a portrait viewport's width, or its text scales down again"
+);
+const _: () = assert!(Geometry::FULL_WIDE.width > Geometry::INLINE.width);
+const _: () = assert!(Geometry::FULL_WIDE.value_height > Geometry::INLINE.value_height);
+// Fewer ticks where there is less room to put them.
+const _: () = assert!(Geometry::FULL_NARROW.time_ticks < Geometry::INLINE.time_ticks);
+const _: () = assert!(Geometry::FULL_WIDE.time_ticks >= Geometry::INLINE.time_ticks);
+// The plot area must be positive in every preset, or a scale inverts and the marks render outside it.
+const _: () = assert!(Geometry::INLINE.width > Geometry::INLINE.pad_left + Geometry::INLINE.pad_right);
+const _: () = assert!(
+    Geometry::FULL_NARROW.width > Geometry::FULL_NARROW.pad_left + Geometry::FULL_NARROW.pad_right
+);
+const _: () =
+    assert!(Geometry::FULL_WIDE.width > Geometry::FULL_WIDE.pad_left + Geometry::FULL_WIDE.pad_right);
 
 /// Markers are drawn only when they would not merge into a smear. At 8px across, ~40 of them across
 /// 800px is already touching.
 const MAX_MARKERS: usize = 40;
+/// Narrowest tap target, in viewBox units, for the drill-down zones.
+///
+/// A bucket can be five units wide — 240 of them across a 1200-unit plot — and a five-pixel tap target is
+/// one nobody hits. Zones therefore span as many whole buckets as it takes to clear this, and the link
+/// covers that whole span. A little above the usual 24px floor, because the zones sit edge to edge with no
+/// gaps to aim between.
+const MIN_HIT_WIDTH: f64 = 28.0;
 /// Past this, direct labels collide with each other and the legend carries identity alone.
 const MAX_DIRECT_LABELS: usize = 4;
 
@@ -192,27 +289,49 @@ pub fn value_label(v: f64) -> String {
     s.to_owned()
 }
 
-/// The CSS variable naming one categorical slot.
+/// How one series is drawn: a validated hue, and a line pattern.
 ///
-/// Indexed by the caller's series position, and the caller's order is derived from the *sorted group
-/// value* — so a group keeps its colour when a filter removes some other group. Colour following the
-/// entity rather than the row number is the point: a reader who learned that cell 3 is aqua must not
-/// find it orange after narrowing the view.
-pub fn series_color(index: usize) -> String {
-    format!("var(--series-{})", (index % MAX_SERIES) + 1)
+/// **Composite encoding, because a ninth hue does not exist.** The palette's eight slots are validated as a
+/// set; a generated ninth is indistinguishable from one of them under colour-vision deficiency, so past
+/// eight the *pattern* carries identity and the hue repeats. Two series sharing a hue therefore never share
+/// a pattern, and within each pattern the eight hues clear their separation gates unchanged.
+///
+/// `slot` is the series' position in the **full sorted group list** — not among the ones currently visible.
+/// That is what makes hiding a line leave every other line's appearance alone: a reader who learned that
+/// `NemSnet` is the dashed aqua one must still find it dashed and aqua after hiding something else.
+pub fn series_style(slot: usize) -> (String, &'static str) {
+    let hue = format!("var(--series-{})", (slot % PALETTE_SLOTS) + 1);
+    let dash = match (slot / PALETTE_SLOTS) % 3 {
+        0 => "",
+        1 => "7 4",
+        _ => "2 3",
+    };
+    (hue, dash)
+}
+
+/// The CSS `border-style` matching a slot's line pattern, for the legend key.
+pub fn series_border_style(slot: usize) -> &'static str {
+    match (slot / PALETTE_SLOTS) % 3 {
+        0 => "solid",
+        1 => "dashed",
+        _ => "dotted",
+    }
 }
 
 /// Opens an SVG element sized to include its axis band.
-fn open_svg(height: f64, label: &str) -> String {
+fn open_svg(geo: &Geometry, height: f64, label: &str) -> String {
     format!(
-        "<svg viewBox=\"0 0 {WIDTH} {height}\" width=\"100%\" height=\"{height}\" \
-         preserveAspectRatio=\"xMidYMid meet\" role=\"img\" aria-label=\"{}\" class=\"plot\">",
-        escape(label)
+        "<svg viewBox=\"0 0 {} {height}\" width=\"100%\" height=\"{height}\" \
+         preserveAspectRatio=\"xMidYMid meet\" role=\"img\" aria-label=\"{}\" class=\"plot {}\">",
+        geo.width,
+        escape(label),
+        geo.class
     )
 }
 
 /// Gridlines and axis labels, shared by both plot kinds so their x axes align exactly.
 fn axes(
+    geo: &Geometry,
     x: &Scale,
     y: &Scale,
     from: i64,
@@ -222,17 +341,18 @@ fn axes(
 ) -> String {
     let mut out = String::new();
     let span = to.saturating_sub(from);
+    let right = geo.plot_right();
 
     if value_axis {
         // Solid hairlines, one shade off the surface. Dashed gridlines read as "threshold" or
         // "projection" when they are just a grid.
-        for tick in value_ticks(y.d0, y.d1, 4) {
+        for tick in value_ticks(y.d0, y.d1, geo.value_ticks) {
             let py = y.map(tick);
             out.push_str(&format!(
-                "<line x1=\"{PAD_LEFT}\" y1=\"{py:.1}\" x2=\"{:.1}\" y2=\"{py:.1}\" class=\"grid\"/>\
+                "<line x1=\"{:.1}\" y1=\"{py:.1}\" x2=\"{right:.1}\" y2=\"{py:.1}\" class=\"grid\"/>\
                  <text x=\"{:.1}\" y=\"{:.1}\" class=\"tick tick-y\">{}</text>",
-                WIDTH - PAD_RIGHT,
-                PAD_LEFT - 6.0,
+                geo.pad_left,
+                geo.pad_left - 6.0,
                 py + 3.0,
                 escape(&value_label(tick))
             ));
@@ -240,12 +360,12 @@ fn axes(
     }
 
     out.push_str(&format!(
-        "<line x1=\"{PAD_LEFT}\" y1=\"{plot_bottom:.1}\" x2=\"{:.1}\" y2=\"{plot_bottom:.1}\" \
+        "<line x1=\"{:.1}\" y1=\"{plot_bottom:.1}\" x2=\"{right:.1}\" y2=\"{plot_bottom:.1}\" \
          class=\"axis\"/>",
-        WIDTH - PAD_RIGHT
+        geo.pad_left
     ));
 
-    for tick in time_ticks(from, to, 6) {
+    for tick in time_ticks(from, to, geo.time_ticks) {
         let px = x.map(tick as f64);
         out.push_str(&format!(
             "<line x1=\"{px:.1}\" y1=\"{plot_bottom:.1}\" x2=\"{px:.1}\" y2=\"{:.1}\" class=\"axis\"/>\
@@ -263,23 +383,30 @@ fn axes(
 /// Always available, whatever the data is made of — it is the plot that answers "when did these
 /// arrive", which is the only question a type whose body is all text can be asked. One hue, because
 /// there is one series and its identity is the title's job.
-pub fn timeline(points: &[Point], from: i64, to: i64, bucket_nanos: i64) -> String {
-    let plot_bottom = TIMELINE_PLOT_HEIGHT + PAD_TOP;
+pub fn timeline(
+    points: &[Point],
+    from: i64,
+    to: i64,
+    bucket_nanos: i64,
+    geo: &Geometry,
+    link: Option<&str>,
+) -> String {
+    let plot_bottom = geo.timeline_height + geo.pad_top;
+    let height = geo.timeline_height + geo.pad_top + geo.pad_bottom;
     if points.is_empty() {
-        return empty_plot(TIMELINE_PLOT_HEIGHT + PAD_TOP + PAD_BOTTOM, "no measurements in range");
+        return empty_plot(geo, height, "no measurements in range");
     }
 
-    let x = Scale::new(from as f64, to as f64, PAD_LEFT, WIDTH - PAD_RIGHT);
+    let x = Scale::new(from as f64, to as f64, geo.pad_left, geo.plot_right());
     let max_count = points.iter().map(|p| p.count).max().unwrap_or(1).max(1) as f64;
-    let y = Scale::new(0.0, max_count, plot_bottom, PAD_TOP);
+    let y = Scale::new(0.0, max_count, plot_bottom, geo.pad_top);
 
-    let mut out = open_svg(TIMELINE_PLOT_HEIGHT + PAD_TOP + PAD_BOTTOM, "measurements over time");
-    out.push_str(&axes(&x, &y, from, to, plot_bottom, false));
+    let mut out = open_svg(geo, height, "measurements over time");
+    out.push_str(&axes(geo, &x, &y, from, to, plot_bottom, false));
 
     // One column per bucket, at least a hairline wide so a sparse bucket is still visible, and with a
     // 1px gap so adjacent columns read as separate marks without a border being drawn around them.
-    let width = ((WIDTH - PAD_LEFT - PAD_RIGHT) * bucket_nanos as f64
-        / (to - from).max(1) as f64)
+    let width = ((geo.plot_right() - geo.pad_left) * bucket_nanos as f64 / (to - from).max(1) as f64)
         .max(1.5);
     for p in points {
         let px = x.map(p.start as f64);
@@ -299,10 +426,14 @@ pub fn timeline(points: &[Point], from: i64, to: i64, bucket_nanos: i64) -> Stri
     }
 
     out.push_str(&format!(
-        "<text x=\"{PAD_LEFT}\" y=\"{:.1}\" class=\"tick tick-y\">{}/bucket</text>",
-        PAD_TOP - 2.0,
+        "<text x=\"{:.1}\" y=\"{:.1}\" class=\"tick tick-y\">{}/bucket</text>",
+        geo.pad_left,
+        geo.pad_top - 2.0,
         escape(&value_label(max_count))
     ));
+    if let Some(link) = link {
+        out.push_str(&hit_layer(from, to, bucket_nanos, geo, plot_bottom, link));
+    }
     out.push_str("</svg>");
     out
 }
@@ -314,25 +445,32 @@ pub fn timeline(points: &[Point], from: i64, to: i64, bucket_nanos: i64) -> Stri
 /// can see when a flat-looking mean is covering a swing.
 pub fn value_chart(
     series: &[Series],
+    slots: &[usize],
     from: i64,
     to: i64,
     field: &str,
-    total_groups: usize,
+    geo: &Geometry,
+    link: Option<&str>,
 ) -> String {
-    let plotted: Vec<&Series> = series.iter().filter(|s| s.points.iter().any(|p| p.avg.is_some())).collect();
+    // Paired with their slots, so a series' appearance depends on its position in the full group list
+    // rather than on how many happen to be plotted right now.
+    let plotted: Vec<(usize, &Series)> = series
+        .iter()
+        .enumerate()
+        .filter(|(_, s)| s.points.iter().any(|p| p.avg.is_some()))
+        .map(|(i, s)| (slots.get(i).copied().unwrap_or(i), s))
+        .collect();
+    let height = geo.value_height + geo.pad_top + geo.pad_bottom;
     if plotted.is_empty() {
-        return empty_plot(
-            VALUE_PLOT_HEIGHT + PAD_TOP + PAD_BOTTOM,
-            "no numeric values in range for this field",
-        );
+        return empty_plot(geo, height, "no numeric values in range for this field");
     }
 
-    let plot_bottom = VALUE_PLOT_HEIGHT + PAD_TOP;
-    let x = Scale::new(from as f64, to as f64, PAD_LEFT, WIDTH - PAD_RIGHT);
+    let plot_bottom = geo.value_height + geo.pad_top;
+    let x = Scale::new(from as f64, to as f64, geo.pad_left, geo.plot_right());
 
     // The domain spans the band, not just the means, or the band would be clipped by the plot edge.
     let (mut lo, mut hi) = (f64::MAX, f64::MIN);
-    for s in &plotted {
+    for (_, s) in &plotted {
         for p in &s.points {
             for v in [p.min, p.max, p.avg].into_iter().flatten() {
                 lo = lo.min(v);
@@ -342,16 +480,16 @@ pub fn value_chart(
     }
     // A little headroom so a line does not sit exactly on the axis.
     let pad = ((hi - lo) * 0.08).max(f64::EPSILON);
-    let y = Scale::new(lo - pad, hi + pad, plot_bottom, PAD_TOP);
+    let y = Scale::new(lo - pad, hi + pad, plot_bottom, geo.pad_top);
 
-    let mut out = open_svg(VALUE_PLOT_HEIGHT + PAD_TOP + PAD_BOTTOM, &format!("{field} over time"));
-    out.push_str(&axes(&x, &y, from, to, plot_bottom, true));
+    let mut out = open_svg(geo, height, &format!("{field} over time"));
+    out.push_str(&axes(geo, &x, &y, from, to, plot_bottom, true));
 
     let direct_label = plotted.len() <= MAX_DIRECT_LABELS;
-    for (i, s) in plotted.iter().enumerate() {
-        let color = series_color(i);
+    for (slot, s) in &plotted {
+        let (color, dash) = series_style(*slot);
         out.push_str(&band_path(&s.points, &x, &y, &color));
-        out.push_str(&line_path(&s.points, &x, &y, &color));
+        out.push_str(&line_path(&s.points, &x, &y, &color, dash));
         out.push_str(&markers(&s.points, &x, &y, &color, field, s.group.as_deref()));
 
         if let (true, Some(last)) =
@@ -367,47 +505,23 @@ pub fn value_chart(
         }
     }
 
+    if let Some(link) = link {
+        // The bucket width is derivable from the points, and the hit layer needs whole buckets.
+        let bucket = plotted
+            .iter()
+            .flat_map(|(_, s)| s.points.windows(2))
+            .map(|w| w[1].start - w[0].start)
+            .min()
+            .unwrap_or((to - from).max(1));
+        out.push_str(&hit_layer(from, to, bucket, geo, plot_bottom, link));
+    }
     out.push_str("</svg>");
 
-    // A legend whenever there is more than one series — identity must never rest on colour alone.
-    // With one series the heading names it, and a legend box would be ink saying nothing.
-    let mut html = out;
-    if plotted.len() > 1 {
-        html.push_str("<ul class=\"legend\">");
-        for (i, s) in plotted.iter().enumerate() {
-            html.push_str(&format!(
-                "<li><span class=\"key\" style=\"background:{}\"></span>{}</li>",
-                series_color(i),
-                escape(s.group.as_deref().unwrap_or("(none)"))
-            ));
-        }
-        html.push_str("</ul>");
-    }
-    if total_groups > plotted.len() {
-        html.push_str(&format!(
-            "<p class=\"note\">Showing {} of {} groups — narrow the filter to see the rest.</p>",
-            plotted.len(),
-            total_groups
-        ));
-    }
-
-    // **Partial coverage, said out loud.** Each point is an average over the rows in its bucket that
-    // carried a number, and on a leaf that is often null — `system.unit.active_enter_seconds_ago` is null
-    // on more than half its rows — that is a very different claim from an average over all of them.
-    //
-    // Marker `<title>`s carry this per bucket, but markers are dropped on a dense chart precisely when
-    // there are most buckets, so relying on them alone means the caveat disappears exactly when the chart
-    // is busiest. This note does not depend on marker density.
-    let (rows, valued) = plotted.iter().flat_map(|s| &s.points).fold((0i64, 0i64), |(r, v), p| {
-        (r + p.count, v + p.value_count)
-    });
-    if valued < rows {
-        html.push_str(&format!(
-            "<p class=\"note\">{valued} of {rows} matching measurements carried a number for this \
-             field; the rest are counted in the timeline but not averaged here.</p>"
-        ));
-    }
-    html
+    // **No legend and no notes here.** They used to be appended to the returned string, which was fine
+    // while they were static text. The legend now carries links — tapping an entry hides that series — and
+    // a link is a web concern, not a drawing one. `web::mod` composes them alongside this SVG, so this
+    // function stays what it says it is: data in, one `<svg>` out.
+    out
 }
 
 /// The min/max envelope, drawn behind the line in the series' own hue.
@@ -439,7 +553,7 @@ fn band_path(points: &[Point], x: &Scale, y: &Scale, color: &str) -> String {
 }
 
 /// The mean line. 2px, and broken across gaps rather than interpolated over them.
-fn line_path(points: &[Point], x: &Scale, y: &Scale, color: &str) -> String {
+fn line_path(points: &[Point], x: &Scale, y: &Scale, color: &str, dash: &str) -> String {
     let mut d = String::new();
     for run in runs(points) {
         for (n, p) in run.iter().enumerate() {
@@ -451,7 +565,71 @@ fn line_path(points: &[Point], x: &Scale, y: &Scale, color: &str) -> String {
     if d.is_empty() {
         return String::new();
     }
-    format!("<path d=\"{d}\" fill=\"none\" stroke=\"{color}\" class=\"line\"/>")
+    let dasharray =
+        if dash.is_empty() { String::new() } else { format!(" stroke-dasharray=\"{dash}\"") };
+    format!("<path d=\"{d}\" fill=\"none\" stroke=\"{color}\"{dasharray} class=\"line\"/>")
+}
+
+/// A transparent layer of tap targets, one per span of buckets, laid over a plot whose marks drill down.
+///
+/// **Why this rather than linking the marks themselves.** The marks are the wrong hit target twice over.
+/// They are too small — an 8px dot is a pinpoint — and, worse, on a dense chart there are none at all:
+/// [`markers`] drops them past [`MAX_MARKERS`] precisely because 240 of them would smear, which is exactly
+/// the chart someone wants to drill into. Linking the marks meant the feature disappeared when it was most
+/// wanted. A separate layer is also how an interactive chart does it, minus the JavaScript.
+///
+/// Drawn last so it sits above everything and receives the taps. `fill="transparent"` rather than
+/// `fill="none"`: the latter is not hit-testable, so the zones would be invisible *and* unclickable.
+fn hit_layer(
+    from: i64,
+    to: i64,
+    bucket_nanos: i64,
+    geo: &Geometry,
+    plot_bottom: f64,
+    link: &str,
+) -> String {
+    let span = (to - from).max(1);
+    let plot_width = geo.plot_right() - geo.pad_left;
+    let bucket_width = plot_width * bucket_nanos as f64 / span as f64;
+    // Whole buckets per zone, so a zone's window lands on a bucket boundary rather than slicing through
+    // one — a link to half a bucket would list rows the point never covered.
+    let per_zone = if bucket_width >= MIN_HIT_WIDTH {
+        1
+    } else {
+        (MIN_HIT_WIDTH / bucket_width.max(0.01)).ceil() as i64
+    };
+    let zone_nanos = bucket_nanos.saturating_mul(per_zone.max(1)).max(1);
+
+    let x = Scale::new(from as f64, to as f64, geo.pad_left, geo.plot_right());
+    let mut out = String::new();
+    let mut start = from;
+    while start < to {
+        let mut end = (start + zone_nanos).min(to);
+        // Absorb a remainder that would itself be too thin to hit, rather than leaving a sliver at the
+        // right-hand edge. Measured in width, not in buckets: "half a zone" is the wrong test, because a
+        // remainder of nearly a whole zone can still be under the minimum when the zone barely clears it.
+        let remainder_width = plot_width * (to - end) as f64 / span as f64;
+        if remainder_width > 0.0 && remainder_width < MIN_HIT_WIDTH {
+            end = to;
+        }
+        let left = x.map(start as f64);
+        let right = x.map(end as f64);
+        out.push_str(&format!(
+            "<a href=\"{}&amp;from={start}&amp;to={end}\">\
+             <rect x=\"{left:.1}\" y=\"{:.1}\" width=\"{:.1}\" height=\"{:.1}\" \
+             fill=\"transparent\" class=\"hit\"><title>{}</title></rect></a>",
+            escape(link),
+            geo.pad_top,
+            (right - left).max(1.0),
+            (plot_bottom - geo.pad_top).max(1.0),
+            escape(&format!(
+                "{} — tap for the measurements in this slice",
+                crate::api::query::format_nanos(start)
+            ))
+        ));
+        start = end;
+    }
+    out
 }
 
 /// Consecutive runs of points that carry a value.
@@ -513,24 +691,25 @@ fn markers(
         if p.value_count < p.count {
             title.push_str(&format!("\n{} of {} rows had a value", p.value_count, p.count));
         }
-        out.push_str(&format!(
+        let mark = format!(
             "<circle cx=\"{:.1}\" cy=\"{:.1}\" r=\"4\" fill=\"{color}\" class=\"dot\">\
              <title>{}</title></circle>",
             x.map(p.start as f64),
             y.map(avg),
             escape(&title)
-        ));
+        );
+        out.push_str(&mark);
     }
     out
 }
 
 /// The empty state. A message, not an axis with nothing between it — a bare grid leaves the reader
 /// wondering whether the page failed.
-fn empty_plot(height: f64, message: &str) -> String {
+fn empty_plot(geo: &Geometry, height: f64, message: &str) -> String {
     format!(
         "{}<text x=\"{:.1}\" y=\"{:.1}\" class=\"empty-plot\" text-anchor=\"middle\">{}</text></svg>",
-        open_svg(height, message),
-        WIDTH / 2.0,
+        open_svg(geo, height, message),
+        geo.width / 2.0,
         height / 2.0,
         escape(message)
     )
@@ -539,6 +718,14 @@ fn empty_plot(height: f64, message: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The inline preset, which is what the old bare constants referred to.
+    const G: Geometry = Geometry::INLINE;
+
+    /// Slots for `n` series in their natural order — what the caller passes when nothing is hidden.
+    fn slots(n: usize) -> Vec<usize> {
+        (0..n).collect()
+    }
 
     fn point(start: i64, avg: Option<f64>) -> Point {
         Point {
@@ -673,11 +860,24 @@ mod tests {
 
     /// The regression test for recolour-on-filter: a series' colour depends on its own position in
     /// the caller's sorted list, so removing another series cannot repaint it.
+    /// The regression test for recolour-on-filter, now also covering what happens past the palette: the
+    /// hue repeats and the *pattern* changes, so identity survives without a ninth hue being invented.
     #[test]
-    fn series_colours_are_stable_slots() {
-        assert_eq!(series_color(0), "var(--series-1)");
-        assert_eq!(series_color(7), "var(--series-8)");
-        assert_eq!(series_color(8), "var(--series-1)", "wraps rather than inventing a ninth hue");
+    fn styles_are_stable_slots_and_composite_past_the_palette() {
+        assert_eq!(series_style(0), ("var(--series-1)".to_owned(), ""));
+        assert_eq!(series_style(7), ("var(--series-8)".to_owned(), ""));
+        // Slot 8 reuses hue 1 but is dashed, so it is not confusable with slot 0.
+        assert_eq!(series_style(8), ("var(--series-1)".to_owned(), "7 4"));
+        assert_eq!(series_style(16), ("var(--series-1)".to_owned(), "2 3"), "and then dotted");
+        assert_eq!(series_border_style(0), "solid");
+        assert_eq!(series_border_style(8), "dashed");
+        assert_eq!(series_border_style(16), "dotted");
+
+        // No two slots inside the bound share both channels.
+        let mut seen = std::collections::HashSet::new();
+        for slot in 0..crate::store::read::MAX_SERIES {
+            assert!(seen.insert(series_style(slot)), "slot {slot} duplicates an earlier appearance");
+        }
     }
 
     /// **A gap must break the line, not be drawn across.** Interpolating over a period with no data
@@ -689,7 +889,7 @@ mod tests {
         let x = Scale::new(0.0, 30.0, 0.0, 300.0);
         let y = Scale::new(0.0, 3.0, 100.0, 0.0);
 
-        let path = line_path(&points, &x, &y, "var(--series-1)");
+        let path = line_path(&points, &x, &y, "var(--series-1)", "");
         assert_eq!(path.matches('M').count(), 2, "two runs means two subpaths: {path}");
     }
 
@@ -699,7 +899,7 @@ mod tests {
         let x = Scale::new(0.0, 10.0, 0.0, 100.0);
         let y = Scale::new(0.0, 1.0, 100.0, 0.0);
 
-        assert!(line_path(&points, &x, &y, "c").contains('M'));
+        assert!(line_path(&points, &x, &y, "c", "").contains('M'));
         assert!(band_path(&points, &x, &y, "c").is_empty(), "a band needs two points");
         assert!(markers(&points, &x, &y, "c", "v", None).contains("<circle"));
     }
@@ -715,11 +915,11 @@ mod tests {
 
     #[test]
     fn an_empty_series_renders_an_empty_state_not_a_broken_path() {
-        let svg = value_chart(&[], 0, 100, "v", 0);
+        let svg = value_chart(&[], &[], 0, 100, "v", &G, None);
         assert!(svg.contains("no numeric values"), "{svg}");
         assert!(!svg.contains("<path"), "{svg}");
 
-        let svg = timeline(&[], 0, 100, 10);
+        let svg = timeline(&[], 0, 100, 10, &G, None);
         assert!(svg.contains("no measurements in range"), "{svg}");
     }
 
@@ -728,7 +928,7 @@ mod tests {
     #[test]
     fn a_series_with_no_values_is_treated_as_empty() {
         let series = vec![Series { group: None, points: vec![point(0, None), point(10, None)] }];
-        let svg = value_chart(&series, 0, 100, "state", 1);
+        let svg = value_chart(&series, &slots(series.len()), 0, 100, "state", &G, None);
         assert!(svg.contains("no numeric values"), "{svg}");
     }
 
@@ -741,90 +941,162 @@ mod tests {
             group: Some(hostile.to_owned()),
             points: vec![point(0, Some(1.0)), point(10, Some(2.0))],
         }];
-        let svg = value_chart(&series, 0, 100, hostile, 1);
+        let svg = value_chart(&series, &slots(series.len()), 0, 100, hostile, &G, None);
 
         assert!(!svg.contains("<script>"), "unescaped markup reached the SVG: {svg}");
         assert!(svg.contains("&lt;script&gt;"), "the value must still be shown, escaped");
     }
 
+    /// The legend and the notes are HTML, composed by `web::mod` — this function returns one `<svg>` and
+    /// nothing else, which is what lets the legend carry links.
     #[test]
-    fn a_legend_appears_only_with_more_than_one_series() {
-        let one = vec![Series { group: Some("a".into()), points: vec![point(0, Some(1.0))] }];
-        assert!(!value_chart(&one, 0, 100, "v", 1).contains("legend"));
-
+    fn the_chart_is_only_an_svg() {
         let two = vec![
             Series { group: Some("a".into()), points: vec![point(0, Some(1.0))] },
             Series { group: Some("b".into()), points: vec![point(0, Some(2.0))] },
         ];
-        let svg = value_chart(&two, 0, 100, "v", 2);
-        assert!(svg.contains("legend"), "{svg}");
+        let svg = value_chart(&two, &slots(two.len()), 0, 100, "v", &G, None);
+        assert!(!svg.contains("legend"), "{svg}");
+        assert!(svg.trim_end().ends_with("</svg>"), "{svg}");
     }
 
-    /// The caveat must not depend on marker density: markers are dropped on a dense chart, which is
-    /// exactly when there are most buckets to be partially covered.
+    /// A series past the palette is drawn with a dash pattern, which is the channel carrying its identity.
     #[test]
-    fn partial_coverage_is_reported_even_when_markers_are_dropped() {
-        let sparse = vec![Series {
-            group: None,
-            points: vec![Point { start: 0, count: 10, value_count: 4, avg: Some(1.0), min: Some(1.0), max: Some(1.0) }],
-        }];
-        assert!(
-            value_chart(&sparse, 0, 100, "ago", 1).contains("4 of 10 matching measurements"),
-            "the sparse case"
-        );
+    fn a_series_past_the_palette_is_drawn_dashed() {
+        let series = vec![Series { group: Some("ninth".into()), points: vec![point(0, Some(1.0)), point(10, Some(2.0))] }];
+        let svg = value_chart(&series, &[8], 0, 20, "v", &G, None);
+        assert!(svg.contains("stroke-dasharray=\"7 4\""), "{svg}");
+    }
 
-        let dense = vec![Series {
-            group: None,
-            points: (0..(MAX_MARKERS as i64 + 10))
-                .map(|i| Point {
-                    start: i,
-                    count: 2,
-                    value_count: 1,
-                    avg: Some(i as f64),
-                    min: Some(i as f64),
-                    max: Some(i as f64),
-                })
-                .collect(),
-        }];
-        let svg = value_chart(&dense, 0, 100, "ago", 1);
+    /// Hiding a series must not repaint the others: the slot is the position in the full group list, so a
+    /// series drawn alone still has the appearance it had among its peers.
+    #[test]
+    fn a_series_keeps_its_appearance_when_others_are_hidden() {
+        let third = vec![Series { group: Some("c".into()), points: vec![point(0, Some(1.0)), point(10, Some(2.0))] }];
+        let alone = value_chart(&third, &[2], 0, 20, "v", &G, None);
+        assert!(alone.contains("var(--series-3)"), "slot 2 keeps hue 3: {alone}");
+        assert!(!alone.contains("var(--series-1)"), "it must not be promoted to the first hue");
+    }
+
+
+
+
+    /// **What tapping means.** A point is an average over a bucket, not one measurement, so the only honest
+    /// target is the rows in that window — and the link has to carry exactly that window, not the whole
+    /// visible range.
+    #[test]
+    fn the_hit_layer_links_each_slice_to_its_own_window() {
+        // Wide buckets, so each gets its own zone rather than being merged for tappability.
+        let points = vec![point(0, Some(1.0)), point(2_000, Some(2.0))];
+        let svg = timeline(&points, 0, 4_000, 2_000, &G, Some("/?type=cpu"));
+
+        assert!(svg.contains("from=0&amp;to=2000"), "first slice: {svg}");
+        assert!(svg.contains("from=2000&amp;to=4000"), "second slice: {svg}");
+        assert!(svg.contains("class=\"hit\""), "there must be a hit layer");
+        assert!(svg.contains("fill=\"transparent\""), "fill=none would not be clickable");
+    }
+
+    /// **The bug this layer exists for.** `markers` drops the dots on a dense chart, so linking the marks
+    /// meant a 240-bucket chart — exactly the one worth drilling into — had nothing to tap at all.
+    #[test]
+    fn a_dense_chart_is_still_clickable_although_it_has_no_markers() {
+        let points: Vec<Point> =
+            (0..200).map(|i| point(i * 10, Some(i as f64))).collect();
+        let series = vec![Series { group: None, points }];
+        let svg = value_chart(&series, &slots(series.len()), 0, 2_000, "v", &G, Some("/?type=t"));
+
         assert!(!svg.contains("<circle"), "precondition: markers are dropped when dense");
-        assert!(svg.contains("matching measurements carried a number"), "but the caveat survives: {svg}");
+        assert!(svg.contains("class=\"hit\""), "but the chart must still be clickable: {svg}");
+        assert!(svg.contains("<a href="), "{svg}");
     }
 
-    /// ...and stays quiet when every row had a value, or it would be noise on every chart.
+    /// Narrow buckets are merged into a tappable zone rather than left as slivers, and the merged link
+    /// spans whole buckets so it cannot select rows the marks never covered.
     #[test]
-    fn full_coverage_is_not_commented_on() {
-        let full = vec![Series {
+    fn slivers_are_merged_into_a_reachable_target() {
+        // 400 buckets across the plot: each is well under the minimum.
+        let points: Vec<Point> = (0..400).map(|i| point(i * 10, Some(1.0))).collect();
+        let series = vec![Series { group: None, points }];
+        let svg = value_chart(&series, &slots(series.len()), 0, 4_000, "v", &G, Some("/?t=1"));
+
+        let zones = svg.matches("class=\"hit\"").count();
+        assert!(zones > 1, "there must be several zones: {zones}");
+        assert!(zones < 400, "but not one per bucket: {zones}");
+
+        // Every zone is at least the minimum wide. Parsed per `<rect>` element, so the visible column
+        // marks — which are legitimately thin — are not mistaken for hit zones.
+        let is_hit = |rect: &&str| {
+            rect.split("/>").next().is_some_and(|el| el.contains("class=\"hit\""))
+                || rect.split("><title>").next().is_some_and(|el| el.contains("class=\"hit\""))
+        };
+        for rect in svg.split("<rect ").skip(1).filter(is_hit) {
+            let width: f64 = rect
+                .split("width=\"")
+                .nth(1)
+                .and_then(|w| w.split('"').next())
+                .and_then(|w| w.parse().ok())
+                .expect("a width");
+            assert!(width >= MIN_HIT_WIDTH - 0.5, "a sliver survived: {width} in {rect:.120}");
+        }
+    }
+
+    /// ...and with no link the marks are plain, so the inline plot does not become a field of tap targets
+    /// that all leave the page.
+    #[test]
+    fn there_is_no_hit_layer_without_a_target() {
+        let svg = timeline(&[point(0, Some(1.0))], 0, 100, 10, &G, None);
+        assert!(!svg.contains("<a href="), "{svg}");
+        assert!(!svg.contains("class=\"hit\""), "and no invisible rectangles either: {svg}");
+    }
+
+    /// The `&` in a link must be escaped: this is XML inside HTML, and a bare `&from=` is a malformed
+    /// entity reference.
+    #[test]
+    fn a_link_is_xml_safe() {
+        let svg = timeline(&[point(0, Some(1.0))], 0, 100, 10, &G, Some("/?a=1&amp;b=2"));
+        assert!(!svg.contains("?a=1&b=2"), "an unescaped ampersand: {svg}");
+        assert!(svg.contains("&amp;"), "{svg}");
+    }
+
+    #[test]
+    fn the_value_chart_gets_a_hit_layer_too() {
+        let series = vec![Series {
             group: None,
-            points: vec![Point { start: 0, count: 3, value_count: 3, avg: Some(1.0), min: Some(1.0), max: Some(1.0) }],
+            points: vec![point(0, Some(1.0)), point(10, Some(2.0))],
         }];
-        assert!(!value_chart(&full, 0, 100, "v", 1).contains("carried a number"));
+        let svg = value_chart(&series, &slots(series.len()), 0, 20, "v", &G, Some("/?type=t"));
+        assert!(svg.contains("class=\"hit\""), "{svg}");
+        assert!(svg.contains("<a href=\"/?type=t&amp;from="), "{svg}");
     }
 
+    /// The class is how CSS picks one of the pair, so each preset must be distinguishable in the markup.
     #[test]
-    fn a_capped_series_count_says_how_many_were_left_out() {
-        let series: Vec<Series> = (0..MAX_SERIES)
-            .map(|i| Series { group: Some(i.to_string()), points: vec![point(0, Some(i as f64))] })
-            .collect();
-        let svg = value_chart(&series, 0, 100, "v", 16);
-        assert!(svg.contains("Showing 8 of 16 groups"), "{svg}");
+    fn each_preset_labels_itself_in_the_markup() {
+        for (geo, expected) in [
+            (&Geometry::INLINE, "class=\"plot \""),
+            (&Geometry::FULL_WIDE, "class=\"plot wide\""),
+            (&Geometry::FULL_NARROW, "class=\"plot narrow\""),
+        ] {
+            let svg = timeline(&[point(0, Some(1.0))], 0, 100, 10, geo, None);
+            assert!(svg.contains(expected), "{expected} missing from {svg}");
+        }
     }
 
     /// The container has to be tall enough for its own axis labels, or the card grows a nested
     /// scrollbar and crops them.
     #[test]
     fn the_viewbox_includes_the_axis_band() {
-        let svg = timeline(&[point(0, None)], 0, 100, 10);
-        let expected = TIMELINE_PLOT_HEIGHT + PAD_TOP + PAD_BOTTOM;
-        assert!(svg.contains(&format!("0 0 {WIDTH} {expected}")), "{svg}");
+        let svg = timeline(&[point(0, None)], 0, 100, 10, &G, None);
+        let expected = G.timeline_height + G.pad_top + G.pad_bottom;
+        assert!(svg.contains(&format!("0 0 {} {expected}", G.width)), "{svg}");
     }
 
     /// The two plots are read as a stacked pair over one window, so their x axes must line up to the
     /// pixel.
     #[test]
     fn both_plots_share_the_same_horizontal_geometry() {
-        let x = Scale::new(0.0, 100.0, PAD_LEFT, WIDTH - PAD_RIGHT);
-        assert_eq!(x.map(0.0), PAD_LEFT);
-        assert_eq!(x.map(100.0), WIDTH - PAD_RIGHT);
+        let x = Scale::new(0.0, 100.0, G.pad_left, G.width - G.pad_right);
+        assert_eq!(x.map(0.0), G.pad_left);
+        assert_eq!(x.map(100.0), G.width - G.pad_right);
     }
 }

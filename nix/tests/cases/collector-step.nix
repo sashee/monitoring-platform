@@ -119,17 +119,20 @@
         machine.wait_for_unit("monitoring-platform.service")
         retry(lambda _: rows_since_cutoff("heart_rate") > 0, timeout_seconds=180)
 
-    with subtest("and it is marked as corrected, not as a guess"):
+    with subtest("and it is corrected cleanly, not marked as a guess"):
+        # **Stamped by exception** (design §9.1): a record corrected against a synchronized clock,
+        # with no ambiguity, carries no clock attributes at all. So the empty set is the assertion,
+        # and it is a strong one — it says at once that the correction applied, that the resolution
+        # did not degrade to `passthrough`, and that nothing is `uncertain`.
+        #
+        # That last one is the distinction this whole case exists to draw: `uncertain` would mean
+        # the timeout shipped the record, which is the §8.1 path and proves nothing about the step.
         attrs = clock_attributes("heart_rate")
-        assert attrs["corrected"] is True, f"the held record was shipped uncorrected: {attrs}"
-        assert attrs["resolution"] == "exact", attrs
-        # The distinction this whole case exists to draw. `uncertain` would mean the timeout
-        # shipped it, which is the §8.1 path and proves nothing about the step.
-        assert "uncertain" not in attrs, (
-            f"this record was released by the step, not by the timeout: {attrs}"
-        )
-        assert attrs["correction_ns"] != 0, f"a real correction has a non-zero magnitude: {attrs}"
+        assert attrs == {}, f"the held record was not corrected cleanly by the step: {attrs}"
 
+        # And the correction itself is asserted where it now lives: on the timestamp. A 2019 stamp
+        # that comes out the far side of the cutoff moved by seven years, which is the magnitude
+        # `correction_ns` used to carry — measured on the row instead of trusted from a label.
         assert rows_before_cutoff("heart_rate") == 0, (
             "the held record kept its 2019 timestamp; the correction did not reach the database"
         )

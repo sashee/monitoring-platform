@@ -31,7 +31,9 @@ use serde::Deserialize;
 use crate::AppState;
 use crate::api::query::format_nanos;
 use crate::model::StoredMeasurement;
-use crate::store::read::{Facets, MAX_SERIES, Point, QuerySpec, Series, SeriesSpec, TypeCount, bucket_nanos};
+use crate::store::read::{
+    Facets, FieldRef, MAX_SERIES, Point, QuerySpec, Series, SeriesSpec, TypeCount, bucket_nanos,
+};
 use session::Identity;
 
 /// Rows the explorer's table shows per page.
@@ -71,9 +73,13 @@ const DEFAULT_RANGE: &str = "24h";
 pub fn routers(state: AppState) -> (Router<AppState>, Router<AppState>) {
     let guarded = Router::new()
         .route("/", get(explore))
+        .route("/chart", get(chart))
         .route("/users", get(users))
         .route("/users/create", post(create_user))
         .route("/users/delete", post(delete_user))
+        .route("/keys", get(keys))
+        .route("/keys/create", post(create_key))
+        .route("/keys/delete", post(delete_key))
         .route("/sessions", get(sessions))
         .route("/sessions/end", post(end_session))
         .route("/logout", post(logout))
@@ -143,9 +149,15 @@ struct Explore {
     to: Option<i64>,
     kind: Option<String>,
     attrs: Vec<(String, String)>,
+    /// Body-leaf equality filters. Separate from `attrs` because they are a different column, not because
+    /// a reader should care — see [`FieldRef`].
+    body: Vec<(String, String)>,
     /// Body leaves to chart. One plot each — never two measures on one pair of axes.
     fields: Vec<String>,
-    group: Option<String>,
+    group: Option<FieldRef>,
+    /// Series the reader has hidden by tapping the legend. Carried in the URL like every other bit of
+    /// state, so a view with two networks hidden is still a link you can paste.
+    hidden: Vec<String>,
     cursor: Option<(i64, crate::content_id::ContentId)>,
 }
 
@@ -174,14 +186,22 @@ fn parse_explore(raw: &[(String, String)]) -> Explore {
             "type" => out.kind = Some(value.clone()),
             // Repeats: a checkbox group submits one `field` per ticked box.
             "field" => out.fields.push(value.clone()),
-            "group" => out.group = Some(value.clone()),
+            "group" => out.group = Some(FieldRef::parse(value)),
             // Which type the form was rendered for. See below.
             "t0" => previous_kind = Some(value.clone()),
+            // Repeats: one per hidden series.
+            "hide" => out.hidden.push(value.clone()),
             "cursor" => out.cursor = crate::api::query::decode_cursor(value).ok(),
             k if k.starts_with("attr.") => {
                 let attr_key = &k["attr.".len()..];
                 if !attr_key.is_empty() {
                     out.attrs.push((attr_key.to_owned(), value.clone()));
+                }
+            }
+            k if k.starts_with("body.") => {
+                let leaf = &k["body.".len()..];
+                if !leaf.is_empty() {
+                    out.body.push((leaf.to_owned(), value.clone()));
                 }
             }
             _ => {}
@@ -196,8 +216,10 @@ fn parse_explore(raw: &[(String, String)]) -> Explore {
         && out.kind.as_deref() != Some(previous.as_str())
     {
         out.attrs.clear();
+        out.body.clear();
         out.fields.clear();
         out.group = None;
+        out.hidden.clear();
         out.cursor = None;
     }
     out
@@ -219,6 +241,7 @@ impl Explore {
             from: Some(window.0),
             to: Some(window.1),
             attrs: self.attrs.clone(),
+            body: self.body.clone(),
             limit,
             cursor: self.cursor,
         }
@@ -240,12 +263,196 @@ struct ExploreData {
     charts: Vec<Chart>,
     rows: Vec<StoredMeasurement>,
     more: bool,
+    /// Measurements still waiting for a `series_id` (SPEC §6.7). Surfaced only while non-zero, because
+    /// it is the signal that decides when the 4.0 migration is safe to deploy — and once the sweep has
+    /// converged there is nothing to say. An index probe, so it costs nothing per render.
+    series_pending: i64,
 }
 
 struct Chart {
     field: String,
+    /// Only the visible series, in the order of `groups`.
     series: Vec<Series>,
+    /// Each visible series' slot: its index in the **full** ordered group list, which is what keeps a
+    /// line's colour and pattern the same when another line is hidden.
+    slots: Vec<usize>,
+    /// Every group, hidden or not, in the order that decides slots.
+    groups: Vec<String>,
+    /// How many groups exist, which may exceed what one plot will draw.
     total_groups: usize,
+}
+
+/// Everything a render of the explorer or of one full-page chart needs, from one connection.
+///
+/// Shared by both handlers so the full-page view cannot disagree with the inline one about the window, the
+/// buckets or the series — they are the same chart at two sizes, and a second copy of this resolution
+/// order is how that would quietly stop being true.
+fn gather(conn: &rusqlite::Connection, p: &Explore, now: i64) -> anyhow::Result<ExploreData> {
+let types = crate::store::read::types(conn)?;
+
+    // The window, in order of precedence: an explicit bound wins, then a preset, then the extent of
+    // the data itself. `all` has to be a query, because the answer is a property of the rows.
+    let span = RANGES.iter().find(|(id, _, _)| *id == p.range).map(|(_, _, s)| *s);
+    let window = match (p.from, p.to, span) {
+        (Some(from), Some(to), _) => (from, to),
+        (Some(from), None, _) => (from, now),
+        (None, Some(to), Some(s)) if s > 0 => (to.saturating_sub(s), to),
+        (None, _, Some(s)) if s > 0 => (now.saturating_sub(s), now),
+        // `all`, or an unrecognised preset from a stale bookmark.
+        // **`+ 1` on the upper bound, and it is load-bearing.** The window is applied as
+        // `event_time < to` (§7.1's exclusive upper bound), so a window of `[min, max]` taken straight
+        // from the data excludes the newest row — every time, silently. Visible as "half my rows are
+        // missing" with two of them and as nothing at all with a thousand, which is the worse case.
+        _ => {
+            // **The extent ignores the value filters**, taking only the type into account. Two reasons,
+            // both about the window being a stable frame rather than a consequence of the filters: an axis
+            // that rescales every time a filter changes makes two views impossible to compare, and — worse
+            // — a window derived from `ssid = cafe` rows contains only those rows, so widening that same
+            // filter's options (the one-way-door fix) would find nothing else to offer and the door would
+            // close again through the back.
+            let mut unfiltered = p.filter((i64::MIN, i64::MAX), PAGE_LIMIT);
+            unfiltered.attrs.clear();
+            unfiltered.body.clear();
+            crate::store::read::extent(conn, &unfiltered)?
+                .map(|(min, max)| (min, max.saturating_add(1)))
+                .unwrap_or((now.saturating_sub(DAY), now))
+        }
+    };
+    // A degenerate window — one row, or none at all — still needs a plottable domain.
+    let window = if window.1 > window.0 { window } else { (window.0, window.0 + SEC) };
+
+    let filter = p.filter(window, PAGE_LIMIT);
+    let mut facets = crate::store::read::facets(conn, &filter)?;
+    let bucket = bucket_nanos(window.0, window.1, SERIES_BUCKETS);
+
+    // **A key that is being filtered has its own filter excluded from its own options**, or the
+    // dropdown collapses to the one value already chosen and the filter becomes a one-way door. Only
+    // the actively-filtered keys need re-asking; for the rest the scoped answer is already right.
+    for (key, _) in &filter.attrs {
+        let widened = crate::store::read::facet_values_excluding(
+            conn,
+            &filter,
+            &FieldRef::Attribute(key.clone()),
+        )?;
+        match facets.attrs.iter_mut().find(|a| a.key == *key) {
+            Some(existing) => *existing = widened,
+            // The key is filtered but absent from the sample — a filter that matches nothing. Offering
+            // its other values is exactly how the reader gets back out.
+            None => facets.attrs.push(widened),
+        }
+    }
+    facets.attrs.sort_by(|a, b| a.key.cmp(&b.key));
+
+    // The same widening for body leaves: a filtered field's own options must not be narrowed by its own
+    // filter, whichever half of the measurement it lives in.
+    for (leaf, _) in &filter.body {
+        let widened =
+            crate::store::read::facet_values_excluding(conn, &filter, &FieldRef::Body(leaf.clone()))?;
+        if let Some(existing) = facets.fields.iter_mut().find(|f| f.name == *leaf) {
+            existing.values = widened.values;
+            existing.truncated = widened.truncated;
+        }
+    }
+
+    // Numerically where the values are numbers, so a dropdown of sixteen cells reads 1, 2, 3 … rather
+    // than SQL's collation order of 1, 10, 11 … 2. The same function the chart uses to decide series
+    // order, for the same reason: lexicographic order on numbers is not what a reader expects.
+    for facet in &mut facets.attrs {
+        crate::store::read::sort_facet_values(&mut facet.values);
+    }
+    for facet in &mut facets.fields {
+        crate::store::read::sort_facet_values(&mut facet.values);
+    }
+
+    // The timeline: counts only, ungrouped, so it renders whatever the bodies contain.
+    let timeline = crate::store::read::series(
+        conn,
+        &SeriesSpec {
+            filter: filter.clone(),
+            field: None,
+            group: None,
+            groups: vec![],
+            bucket_nanos: bucket,
+        },
+    )?
+    .into_iter()
+    .next()
+    .map(|s| s.points)
+    .unwrap_or_default();
+
+    // The group values are the same for every chart, so they are resolved once. Sorted here, because
+    // the order decides both which groups make the cap and which colour each gets.
+    // The candidate values come from whichever half the group names.
+    let mut group_values = match &p.group {
+        Some(FieldRef::Attribute(key)) => facets
+            .attrs
+            .iter()
+            .find(|a| a.key == *key)
+            .map(|a| a.values.clone())
+            .unwrap_or_default(),
+        Some(FieldRef::Body(leaf)) => facets
+            .fields
+            .iter()
+            .find(|f| f.name == *leaf)
+            .map(|f| f.values.clone())
+            .unwrap_or_default(),
+        None => Vec::new(),
+    };
+    crate::store::read::sort_facet_values(&mut group_values);
+    let total_groups = group_values.len();
+    // All of them, up to the hard bound — identity past the palette's eight hues is carried by the line
+    // pattern instead of by an invented ninth hue (see `svg::series_style`).
+    group_values.truncate(MAX_SERIES);
+
+    // **One plot per chosen field, never two measures on one pair of axes.** Two scales on one plot
+    // have an arbitrary alignment, which invents a correlation the data does not contain.
+    //
+    // Only numeric fields are queried. A text field would plot nothing anyway — the json_type guard in
+    // `build_series_query` makes sure it plots nothing rather than a flat line of zeros — but there is
+    // no reason to ask the database for it.
+    let mut charts = Vec::new();
+    for field in &p.fields {
+        if !facets.fields.iter().any(|x| x.name == *field && x.numeric) {
+            continue;
+        }
+        // Hidden series are not queried at all — there is no point aggregating what will not be drawn —
+        // but their slots are still reserved, so hiding one does not repaint the others.
+        let visible: Vec<String> =
+            group_values.iter().filter(|g| !p.hidden.contains(g)).cloned().collect();
+        let slots: Vec<usize> = visible
+            .iter()
+            .map(|g| group_values.iter().position(|x| x == g).unwrap_or(0))
+            .collect();
+
+        let series = crate::store::read::series(
+            conn,
+            &SeriesSpec {
+                filter: filter.clone(),
+                field: Some(field.clone()),
+                group: p.group.clone(),
+                groups: visible,
+                bucket_nanos: bucket,
+            },
+        )?;
+        charts.push(Chart {
+            field: field.clone(),
+            series,
+            slots,
+            groups: group_values.clone(),
+            total_groups,
+        });
+    }
+
+    // One more than the page, so "is there another page" is answered without a second count.
+    let mut probe = filter.clone();
+    probe.limit = PAGE_LIMIT + 1;
+    let mut rows = crate::store::query(conn, &probe)?;
+    let more = rows.len() as i64 > PAGE_LIMIT;
+    rows.truncate(PAGE_LIMIT as usize);
+
+    let series_pending = crate::store::series::pending(conn)?;
+
+    Ok(ExploreData { types, facets, window, bucket, timeline, charts, rows, more, series_pending })
 }
 
 async fn explore(State(state): State<AppState>, Query(raw): Query<Vec<(String, String)>>) -> Response {
@@ -254,112 +461,12 @@ async fn explore(State(state): State<AppState>, Query(raw): Query<Vec<(String, S
     let now = crate::now_unix_nanos();
     let p = params.clone();
 
-    let gathered = tokio::task::spawn_blocking(move || -> anyhow::Result<ExploreData> {
-        let conn = crate::store::open_read(&db_path)?;
-        let types = crate::store::read::types(&conn)?;
-
-        // The window, in order of precedence: an explicit bound wins, then a preset, then the extent of
-        // the data itself. `all` has to be a query, because the answer is a property of the rows.
-        let span = RANGES.iter().find(|(id, _, _)| *id == p.range).map(|(_, _, s)| *s);
-        let window = match (p.from, p.to, span) {
-            (Some(from), Some(to), _) => (from, to),
-            (Some(from), None, _) => (from, now),
-            (None, Some(to), Some(s)) if s > 0 => (to.saturating_sub(s), to),
-            (None, _, Some(s)) if s > 0 => (now.saturating_sub(s), now),
-            // `all`, or an unrecognised preset from a stale bookmark.
-            _ => crate::store::read::extent(&conn, &p.filter((i64::MIN, i64::MAX), PAGE_LIMIT))?
-                .unwrap_or((now.saturating_sub(DAY), now)),
-        };
-        // A degenerate window — one row, or none at all — still needs a plottable domain.
-        let window = if window.1 > window.0 { window } else { (window.0, window.0 + SEC) };
-
-        let filter = p.filter(window, PAGE_LIMIT);
-        let mut facets = crate::store::read::facets(&conn, &filter)?;
-        let bucket = bucket_nanos(window.0, window.1, SERIES_BUCKETS);
-
-        // **A key that is being filtered has its own filter excluded from its own options**, or the
-        // dropdown collapses to the one value already chosen and the filter becomes a one-way door. Only
-        // the actively-filtered keys need re-asking; for the rest the scoped answer is already right.
-        for (key, _) in &filter.attrs {
-            let widened = crate::store::read::facet_values_excluding(&conn, &filter, key)?;
-            match facets.attrs.iter_mut().find(|a| a.key == *key) {
-                Some(existing) => *existing = widened,
-                // The key is filtered but absent from the sample — a filter that matches nothing. Offering
-                // its other values is exactly how the reader gets back out.
-                None => facets.attrs.push(widened),
-            }
-        }
-        facets.attrs.sort_by(|a, b| a.key.cmp(&b.key));
-
-        // Numerically where the values are numbers, so a dropdown of sixteen cells reads 1, 2, 3 … rather
-        // than SQL's collation order of 1, 10, 11 … 2. The same function the chart uses to decide series
-        // order, for the same reason: lexicographic order on numbers is not what a reader expects.
-        for facet in &mut facets.attrs {
-            crate::store::read::sort_facet_values(&mut facet.values);
-        }
-
-        // The timeline: counts only, ungrouped, so it renders whatever the bodies contain.
-        let timeline = crate::store::read::series(
-            &conn,
-            &SeriesSpec {
-                filter: filter.clone(),
-                field: None,
-                group: None,
-                groups: vec![],
-                bucket_nanos: bucket,
-            },
-        )?
-        .into_iter()
-        .next()
-        .map(|s| s.points)
-        .unwrap_or_default();
-
-        // The group values are the same for every chart, so they are resolved once. Sorted here, because
-        // the order decides both which groups make the cap and which colour each gets.
-        let mut group_values = p
-            .group
-            .as_ref()
-            .and_then(|g| facets.attrs.iter().find(|a| a.key == *g))
-            .map(|a| a.values.clone())
-            .unwrap_or_default();
-        crate::store::read::sort_facet_values(&mut group_values);
-        let total_groups = group_values.len();
-        group_values.truncate(MAX_SERIES);
-
-        // **One plot per chosen field, never two measures on one pair of axes.** Two scales on one plot
-        // have an arbitrary alignment, which invents a correlation the data does not contain.
-        //
-        // Only numeric fields are queried. A text field would plot nothing anyway — the json_type guard in
-        // `build_series_query` makes sure it plots nothing rather than a flat line of zeros — but there is
-        // no reason to ask the database for it.
-        let mut charts = Vec::new();
-        for field in &p.fields {
-            if !facets.fields.iter().any(|x| x.name == *field && x.numeric) {
-                continue;
-            }
-            let series = crate::store::read::series(
-                &conn,
-                &SeriesSpec {
-                    filter: filter.clone(),
-                    field: Some(field.clone()),
-                    group: p.group.clone(),
-                    groups: group_values.clone(),
-                    bucket_nanos: bucket,
-                },
-            )?;
-            charts.push(Chart { field: field.clone(), series, total_groups });
-        }
-
-        // One more than the page, so "is there another page" is answered without a second count.
-        let mut probe = filter.clone();
-        probe.limit = PAGE_LIMIT + 1;
-        let mut rows = crate::store::query(&conn, &probe)?;
-        let more = rows.len() as i64 > PAGE_LIMIT;
-        rows.truncate(PAGE_LIMIT as usize);
-
-        Ok(ExploreData { types, facets, window, bucket, timeline, charts, rows, more })
-    })
-    .await;
+    let gathered =
+        tokio::task::spawn_blocking(move || -> anyhow::Result<ExploreData> {
+            let conn = crate::store::open_read(&db_path)?;
+            gather(&conn, &p, now)
+        })
+        .await;
 
     match gathered {
         Ok(Ok(data)) => html(StatusCode::OK, render_explore(&params, &data)),
@@ -419,6 +526,25 @@ fn filter_row(params: &Explore, data: &ExploreData) -> String {
 
         // Checkboxes, not a dropdown: each ticked field gets its own plot, and a multi-select needs
         // ctrl-click, which a touch screen does not have.
+        // Body-leaf filters, alongside the attribute ones above and behaving identically. Without these,
+        // grouping by a body field would have no escape hatch when there are more groups than the cap —
+        // "narrow the filter to see the rest" has to be possible for the field being grouped by.
+        for facet in &data.facets.fields {
+            // A leaf with one value narrows nothing; a value field like `signal_dbm` has hundreds and is a
+            // text box rather than a dropdown nobody can scroll.
+            if facet.values.len() < 2 && !facet.truncated {
+                continue;
+            }
+            let current = params.body.iter().find(|(k, _)| *k == facet.name).map(|(_, v)| v.as_str());
+            let name = format!("body.{}", facet.name);
+            if facet.truncated {
+                out.push_str(&html::text_input(&name, &facet.name, current, "exact value"));
+            } else {
+                let options = facet.values.iter().map(|v| (v.clone(), v.clone())).collect::<Vec<_>>();
+                out.push_str(&html::select(&name, &facet.name, &options, current, "any"));
+            }
+        }
+
         let numeric_fields: Vec<String> =
             data.facets.fields.iter().filter(|f| f.numeric).map(|f| f.name.clone()).collect();
         if !numeric_fields.is_empty() {
@@ -430,19 +556,43 @@ fn filter_row(params: &Explore, data: &ExploreData) -> String {
         //
         // Only keys that actually divide the data: a key with one value would draw one line identical to
         // the ungrouped chart.
-        let groupable: Vec<(String, String)> = data
+        // **Both halves of the measurement can be a series dimension.** `detected-devices.wifi_bss` keeps
+        // `bssid` in its attributes and `ssid` in its body, and the second is the more interesting identity
+        // — there is no reason the reader should have to know which column a field sits in.
+        //
+        // Same admission rule for both: a small enough set of distinct values to be a dropdown, and more
+        // than one of them, since a single value would draw one line identical to the ungrouped chart. That
+        // rule also keeps a value field like `signal_dbm` out on its own merits rather than by type.
+        let mut groupable: Vec<(String, String)> = data
             .facets
             .attrs
             .iter()
             .filter(|a| !a.truncated && a.values.len() > 1)
-            .map(|a| (a.key.clone(), short_key(&a.key)))
+            .map(|a| (FieldRef::Attribute(a.key.clone()).encode(), short_key(&a.key)))
             .collect();
+        let attr_labels: Vec<String> = groupable.iter().map(|(_, label)| label.clone()).collect();
+        groupable.extend(
+            data.facets
+                .fields
+                .iter()
+                .filter(|f| !f.truncated && f.values.len() > 1)
+                .map(|f| {
+                    // Disambiguated only when it would otherwise read as a duplicate: the two namespaces
+                    // can collide, and two identically-labelled options is worse than a little noise.
+                    let label = if attr_labels.contains(&f.name) {
+                        format!("{} (body)", f.name)
+                    } else {
+                        f.name.clone()
+                    };
+                    (FieldRef::Body(f.name.clone()).encode(), label)
+                }),
+        );
         if !groupable.is_empty() && !params.fields.is_empty() {
             out.push_str(&html::select(
                 "group",
                 "one line per",
                 &groupable,
-                params.group.as_deref(),
+                params.group.as_ref().map(|g| g.encode()).as_deref(),
                 "nothing (a single line)",
             ));
         }
@@ -466,6 +616,15 @@ fn filter_row(params: &Explore, data: &ExploreData) -> String {
 fn render_explore(params: &Explore, data: &ExploreData) -> String {
     let mut body = filter_row(params, data);
 
+    // Self-removing: it says something only while the sweep still has work, and the fill is what makes
+    // that condition temporary. Nothing here is wrong while it shows — measurements are stored and
+    // served normally — so it reports rather than warns.
+    if data.series_pending > 0 {
+        body.push_str(&html::note(&format!(
+            "{} measurements are still being assigned to a series; this finishes on its own.",
+            data.series_pending
+        )));
+    }
     if params.kind.is_none() {
         body.push_str(&html::note("Choose a type to filter by its attributes and chart its values."));
     }
@@ -486,7 +645,10 @@ fn render_explore(params: &Explore, data: &ExploreData) -> String {
         data.window.0,
         data.window.1,
         data.bucket,
+        &svg::Geometry::INLINE,
+        None,
     )));
+    body.push_str(&open_chart_link(params, None));
 
     // One plot per field, each with its own y axis. Fields that turned out to have no numeric values in
     // range are reported rather than silently dropped.
@@ -494,11 +656,16 @@ fn render_explore(params: &Explore, data: &ExploreData) -> String {
         body.push_str(&format!("<h2>{}</h2>\n", html::escape(&chart.field)));
         body.push_str(&html::plot(&svg::value_chart(
             &chart.series,
+            &chart.slots,
             data.window.0,
             data.window.1,
             &chart.field,
-            chart.total_groups,
+            &svg::Geometry::INLINE,
+            None,
         )));
+        body.push_str(&chart_legend(params, chart, "/"));
+        body.push_str(&chart_notes(chart, &chart.field));
+        body.push_str(&open_chart_link(params, Some(&chart.field)));
     }
     for field in &params.fields {
         if !data.charts.iter().any(|c| &c.field == field) {
@@ -536,12 +703,28 @@ fn render_explore(params: &Explore, data: &ExploreData) -> String {
     html::page("measurements", "/", &body)
 }
 
-/// One JSON value, rendered for a table cell.
+/// One JSON value, rendered as the **HTML** for a table cell.
 ///
-/// A string loses its quotes and a null becomes nothing — a cell reading `""` or `null` is noise, and the
-/// narrow-screen stylesheet hides empty cells outright. Anything structured keeps its compact JSON, since
-/// there is no better one-line form for it.
+/// A scalar loses its JSON quoting; a null becomes nothing, since a cell reading `null` is noise and the
+/// narrow-screen stylesheet hides an empty cell outright. Anything structured becomes indented
+/// `key: value` lines (see [`html::yamlish`]) rather than compact JSON, because down a column the braces
+/// and quotes are most of the characters and none of the information.
+///
+/// Returns HTML, so callers must not escape the result again — the escaping happens here, where it can
+/// tell a scalar from the markup that wraps a multi-line block.
 fn cell(value: Option<&serde_json::Value>) -> String {
+    match value {
+        None | Some(serde_json::Value::Null) => String::new(),
+        Some(serde_json::Value::String(s)) => html::escape(s),
+        Some(v @ (serde_json::Value::Object(_) | serde_json::Value::Array(_))) => {
+            html::multiline(&html::yamlish(v))
+        }
+        Some(other) => html::escape(&other.to_string()),
+    }
+}
+
+/// The plain-text form of one value, for the "same on every row" line where markup would not fit.
+fn cell_text(value: Option<&serde_json::Value>) -> String {
     match value {
         None | Some(serde_json::Value::Null) => String::new(),
         Some(serde_json::Value::String(s)) => s.clone(),
@@ -574,7 +757,7 @@ fn partition_attributes(rows: &[StoredMeasurement]) -> (Vec<String>, Vec<(String
         let mut seen: Option<String> = None;
         let mut differs = false;
         for row in rows {
-            let rendered = cell(row.attributes.get(key));
+            let rendered = cell_text(row.attributes.get(key));
             match &seen {
                 None => seen = Some(rendered),
                 Some(first) if *first != rendered => {
@@ -615,8 +798,8 @@ fn measurement_table(rows: &[StoredMeasurement], type_selected: bool, facets: &F
                     vec![
                         html::escape(&format_nanos(m.event_time)),
                         html::escape(&m.kind),
-                        html::escape(&cell(m.body.as_ref())),
-                        html::escape(&cell(Some(&m.attributes))),
+                        cell(m.body.as_ref()),
+                        cell(Some(&m.attributes)),
                     ]
                 })
                 .collect::<Vec<_>>(),
@@ -639,10 +822,10 @@ fn measurement_table(rows: &[StoredMeasurement], type_selected: bool, facets: &F
         .map(|m| {
             let mut out = vec![html::escape(&format_nanos(m.event_time))];
             for key in &body_keys {
-                out.push(html::escape(&cell(m.body.as_ref().and_then(|b| b.get(key)))));
+                out.push(cell(m.body.as_ref().and_then(|b| b.get(key))));
             }
             for key in &varying {
-                out.push(html::escape(&cell(m.attributes.get(key))));
+                out.push(cell(m.attributes.get(key)));
             }
             out
         })
@@ -662,13 +845,173 @@ fn measurement_table(rows: &[StoredMeasurement], type_selected: bool, facets: &F
     out
 }
 
+/// The "open this chart" link under an inline plot.
+///
+/// A link to a page rather than a scripted overlay. It costs a navigation, and buys three things a
+/// fullscreen overlay would not: it is bookmarkable, it works with no JavaScript at all (SPEC §14.6), and
+/// on a phone it can use a geometry built for a portrait viewport instead of a scaled-down desktop one.
+fn open_chart_link(params: &Explore, field: Option<&str>) -> String {
+    let mut carried = current_params(params);
+    // One chart per page, so the field is *the* subject rather than one of several.
+    carried.retain(|(k, _)| k != "field");
+    if let Some(field) = field {
+        carried.push(("field".to_owned(), field.to_owned()));
+    }
+    format!(
+        "<p class=\"note\"><a href=\"{}\">open {} full size — tap a point for the measurements behind \
+         it</a></p>\n",
+        html::escape(&html::query_string("/chart", &carried)),
+        html::escape(field.unwrap_or("the timeline"))
+    )
+}
+
+/// The full-page view of one chart (SPEC §14.9).
+///
+/// Renders the **same** chart at two geometries and lets a media query choose, which is the no-JavaScript
+/// answer to a `viewBox` that cannot suit a phone and a desktop at once — see [`svg::Geometry`]. One extra
+/// copy of one chart is a cost worth paying on the page whose only job is legibility.
+async fn chart(State(state): State<AppState>, Query(raw): Query<Vec<(String, String)>>) -> Response {
+    let params = parse_explore(&raw);
+    let db_path = state.config.database_path.clone();
+    let now = crate::now_unix_nanos();
+    let p = params.clone();
+
+    let gathered = tokio::task::spawn_blocking(move || -> anyhow::Result<ExploreData> {
+        let conn = crate::store::open_read(&db_path)?;
+        gather(&conn, &p, now)
+    })
+    .await;
+
+    let data = match gathered {
+        Ok(Ok(data)) => data,
+        Ok(Err(e)) => return failed("reading the measurements", &e),
+        Err(e) => return failed("the measurement query task", &e),
+    };
+
+    // Each mark links back to the explorer, filtered to that bucket's own window. `range=custom` so the
+    // explicit `from`/`to` the link appends are what decide the window rather than the preset.
+    let mut back = current_params(&params);
+    back.retain(|(k, _)| k != "range" && k != "from" && k != "to");
+    back.push(("range".to_owned(), "custom".to_owned()));
+    let link = html::query_string("/", &back);
+
+    let mut body = String::new();
+    let title = params.fields.first().cloned().unwrap_or_else(|| "measurements".to_owned());
+
+    body.push_str(&format!(
+        "<p class=\"note\"><a href=\"{}\">← back to the explorer</a></p>\n",
+        html::escape(&html::query_string("/", &current_params(&params)))
+    ));
+    body.push_str(&format!(
+        "<h2>{} — {} to {}</h2>\n",
+        html::escape(&title),
+        html::escape(&format_nanos(data.window.0)),
+        html::escape(&format_nanos(data.window.1))
+    ));
+
+    for geo in [&svg::Geometry::FULL_WIDE, &svg::Geometry::FULL_NARROW] {
+        match data.charts.first() {
+            Some(chart) => body.push_str(&svg::value_chart(
+                &chart.series,
+                &chart.slots,
+                data.window.0,
+                data.window.1,
+                &chart.field,
+                geo,
+                Some(&link),
+            )),
+            // No field chosen: the timeline is the chart, and it is just as clickable.
+            None => body.push_str(&svg::timeline(
+                &data.timeline,
+                data.window.0,
+                data.window.1,
+                data.bucket,
+                geo,
+                Some(&link),
+            )),
+        }
+    }
+
+    if let Some(chart) = data.charts.first() {
+        body.push_str(&chart_legend(&params, chart, "/chart"));
+        body.push_str(&chart_notes(chart, &chart.field));
+    }
+    body.push_str(&html::note(
+        "Every point is an average over its bucket. Tap one to see the measurements it covers; tap a \
+         legend entry to hide that line.",
+    ));
+
+    html(StatusCode::OK, html::page(&title, "/", &body))
+}
+
+/// The legend for one chart, with each entry linking to the same view with that series toggled.
+///
+/// Built here rather than in `svg` because the links are the point: tapping an entry is how a reader
+/// declutters a plot with more lines than colours, and a link is the only way to do that without
+/// JavaScript. `path` is where the entries point — the explorer or the full-page chart, whichever is
+/// showing.
+fn chart_legend(params: &Explore, chart: &Chart, path: &str) -> String {
+    let entries: Vec<html::LegendEntry> = chart
+        .groups
+        .iter()
+        .enumerate()
+        .map(|(slot, group)| {
+            let hidden = params.hidden.contains(group);
+            // Toggle: drop it from the hidden list if it is in there, add it if not.
+            let mut toggled = current_params(params);
+            toggled.retain(|(k, v)| !(k == "hide" && v == group));
+            if !hidden {
+                toggled.push(("hide".to_owned(), group.clone()));
+            }
+            let (color, _) = svg::series_style(slot);
+            html::LegendEntry {
+                label: group.clone(),
+                color,
+                pattern: svg::series_border_style(slot),
+                hidden,
+                href: html::query_string(path, &toggled),
+            }
+        })
+        .collect();
+    html::legend(&entries)
+}
+
+/// What a chart has left out, if anything, and how to reach it.
+fn chart_notes(chart: &Chart, field: &str) -> String {
+    let mut out = String::new();
+    if chart.total_groups > chart.groups.len() {
+        out.push_str(&html::note(&format!(
+            "Showing {} of {} groups — more than one plot can distinguish. Narrow the filter to reach the \
+             rest.",
+            chart.groups.len(),
+            chart.total_groups
+        )));
+    }
+    // Partial coverage, said out loud whatever the marker density (see `svg`).
+    let (rows, valued) = chart
+        .series
+        .iter()
+        .flat_map(|s| &s.points)
+        .fold((0i64, 0i64), |(r, v), p| (r + p.count, v + p.value_count));
+    if valued < rows {
+        out.push_str(&html::note(&format!(
+            "{valued} of {rows} matching measurements carried a number for {field}; the rest are counted \
+             in the timeline but not averaged here."
+        )));
+    }
+    out
+}
+
 /// The current filter state as name/value pairs, for carrying across a pagination submit.
 fn current_params(params: &Explore) -> Vec<(String, String)> {
     let mut out = vec![("range".to_owned(), params.range.clone())];
-    for (name, value) in [("type", &params.kind), ("t0", &params.kind), ("group", &params.group)] {
+    for (name, value) in [("type", &params.kind), ("t0", &params.kind)] {
         if let Some(v) = value {
             out.push((name.to_owned(), v.clone()));
         }
+    }
+    if let Some(group) = &params.group {
+        out.push(("group".to_owned(), group.encode()));
     }
     for field in &params.fields {
         out.push(("field".to_owned(), field.clone()));
@@ -681,6 +1024,12 @@ fn current_params(params: &Explore) -> Vec<(String, String)> {
     }
     for (key, value) in &params.attrs {
         out.push((format!("attr.{key}"), value.clone()));
+    }
+    for (leaf, value) in &params.body {
+        out.push((format!("body.{leaf}"), value.clone()));
+    }
+    for value in &params.hidden {
+        out.push(("hide".to_owned(), value.clone()));
     }
     out
 }
@@ -845,6 +1194,153 @@ async fn delete_user(
         }
         Ok(Err(e)) => failed("deleting the user", &e),
         Err(e) => failed("the user deletion task", &e),
+    }
+}
+
+// ------------------------------------------------------------------------------------ api keys
+
+async fn keys(State(state): State<AppState>) -> Response {
+    render_keys(&state, None, None).await
+}
+
+/// The API keys page (SPEC §13, §14.1).
+///
+/// `issued` carries a token that has just been minted. **It is shown exactly once, on this response**,
+/// because only its hash is stored and nothing can recover it afterwards — the same contract
+/// `create-api-key` has on the command line. It is deliberately *not* carried through a redirect: a token
+/// in a URL lands in history and in any log that records paths.
+async fn render_keys(state: &AppState, error: Option<&str>, issued: Option<&str>) -> Response {
+    let db_path = state.config.database_path.clone();
+    let listed = tokio::task::spawn_blocking(move || {
+        let conn = crate::store::open_read(&db_path)?;
+        crate::store::keys::list(&conn)
+    })
+    .await;
+
+    let listed = match listed {
+        Ok(Ok(keys)) => keys,
+        Ok(Err(e)) => return failed("reading the API keys", &e),
+        Err(e) => return failed("the API key query task", &e),
+    };
+
+    let table = html::table(
+        &["id", "label", "created", ""],
+        &listed
+            .iter()
+            .map(|k| {
+                vec![
+                    html::escape(&k.id),
+                    html::escape(&k.label),
+                    html::escape(&format_nanos(k.created_at)),
+                    html::post_button("/keys/delete", "id", &k.id, "revoke", "link"),
+                ]
+            })
+            .collect::<Vec<_>>(),
+        "no API keys — every /v1 request will be refused until one is issued",
+    );
+
+    let mut body = String::new();
+    if let Some(message) = error {
+        body.push_str(&format!("<p class=\"error\">{}</p>\n", html::escape(message)));
+    }
+    if let Some(token) = issued {
+        // The one place a secret is ever rendered. Marked as such, because the reader has one chance.
+        body.push_str(&format!(
+            "<p class=\"issued\"><strong>Copy this now — it is not stored and cannot be shown \
+             again:</strong><br><code>{}</code></p>\n",
+            html::escape(token)
+        ));
+    }
+    body.push_str(&table);
+    if listed.is_empty() {
+        body.push_str(&html::note(
+            "Devices authenticate with these (SPEC §13). With none issued, the receiver refuses every \
+             request except /healthz.",
+        ));
+    }
+    body.push_str(
+        "<h2>issue a key</h2>\n\
+         <form method=\"post\" action=\"/keys/create\" class=\"filters\">\
+         <label>label<input name=\"label\" placeholder=\"which device\" required></label>\
+         <button type=\"submit\" class=\"go\">issue</button></form>\n",
+    );
+    body.push_str(&html::note(
+        "The label is for you; it is never checked against anything. Revoking a key deletes it, so the \
+         next request carrying it is refused.",
+    ));
+
+    let status = if error.is_some() { StatusCode::BAD_REQUEST } else { StatusCode::OK };
+    html(status, html::page("api keys", "/keys", &body))
+}
+
+#[derive(Deserialize)]
+pub struct NewKey {
+    label: String,
+}
+
+async fn create_key(State(state): State<AppState>, Form(form): Form<NewKey>) -> Response {
+    let label = form.label.trim().to_owned();
+    if label.is_empty() {
+        return render_keys(&state, Some("a label is required."), None).await;
+    }
+
+    // The same token construction the CLI uses, so a key issued here is indistinguishable from one issued
+    // over ssh — one code path decides what a credential is (`crate::auth`).
+    let bytes = match crate::random_bytes() {
+        Ok(bytes) => bytes,
+        Err(e) => return failed("reading randomness for the new key", &e),
+    };
+    let token = crate::auth::Token::from_random(&bytes);
+    let printed = token.to_secret_string();
+
+    let db_path = state.config.database_path.clone();
+    let (id, hash, name) = (token.id().to_owned(), token.secret_hash(), label.clone());
+    let stored = tokio::task::spawn_blocking(move || {
+        let conn = crate::store::open_write_existing(&db_path)?;
+        crate::store::keys::insert(&conn, &id, &hash, &name, crate::now_unix_nanos())
+    })
+    .await;
+
+    match stored {
+        Ok(Ok(())) => {
+            // The id is public and worth logging; the token is not, and is not (see `auth`'s redacted
+            // Debug for the same rule).
+            tracing::info!(key = %token.id(), label = %label, "API key issued from the web interface");
+            render_keys(&state, None, Some(&printed)).await
+        }
+        Ok(Err(e)) => failed("storing the new API key", &e),
+        Err(e) => failed("the API key creation task", &e),
+    }
+}
+
+#[derive(Deserialize)]
+pub struct TargetKey {
+    id: String,
+}
+
+async fn delete_key(State(state): State<AppState>, Form(form): Form<TargetKey>) -> Response {
+    let db_path = state.config.database_path.clone();
+    let target = form.id.clone();
+    let removed = tokio::task::spawn_blocking(move || {
+        let conn = crate::store::open_write_existing(&db_path)?;
+        crate::store::keys::delete(&conn, &target)
+    })
+    .await;
+
+    match removed {
+        Ok(Ok(existed)) => {
+            // **No last-key guard, unlike users.** Revoking the last key stops devices delivering, which is
+            // recoverable from this very page; deleting the last *user* would lock the operator out of the
+            // page itself. Different failure, different answer.
+            if existed {
+                tracing::info!(key = %form.id, "API key revoked from the web interface");
+            } else {
+                tracing::warn!(key = %form.id, "revoke: no such API key");
+            }
+            see_other("/keys")
+        }
+        Ok(Err(e)) => failed("revoking the API key", &e),
+        Err(e) => failed("the API key deletion task", &e),
     }
 }
 
@@ -1104,7 +1600,7 @@ mod tests {
         assert_eq!(p.kind.as_deref(), Some("bms.status.cell"));
         assert_eq!(p.attrs, vec![("record.attributes.cell".to_owned(), "3".to_owned())]);
         assert_eq!(p.fields, vec!["voltage_volts".to_owned()]);
-        assert_eq!(p.group.as_deref(), Some("record.attributes.cell"));
+        assert_eq!(p.group, Some(FieldRef::Attribute("record.attributes.cell".into())));
     }
 
     /// **Changing the type must clear what belonged to the old one.** The filter row is a single form, so

@@ -182,6 +182,46 @@
     # the stylesheet.
     assert "var(--series-1)" in explorer, explorer[:400]
 
+    # **The API keys page** (SPEC.md §13, §14.1), against the real unit. The harness already issued a key
+    # through the CLI, so it must be listed here — which also proves the page reads the same database the
+    # service and the collector are using.
+    keys_page = web_curl("http://localhost/keys", cookie=cookie)
+    assert http_status(keys_page) == 200, keys_page
+    assert "harness" in keys_page, f"the CLI-issued key must be listed: {keys_page}"
+
+    # Issuing one, and the token is shown exactly once because only its hash is stored.
+    issued = web_curl(
+        "-X POST --data-urlencode label=vm-test http://localhost/keys/create", cookie=cookie
+    )
+    assert http_status(issued) == 200, issued
+    assert "mpk_" in issued, f"the token must be rendered: {issued}"
+    new_token = issued.split("<code>", 1)[1].split("</code>", 1)[0]
+
+    again = web_curl("http://localhost/keys", cookie=cookie)
+    assert new_token not in again, "a token must not reappear on a later load"
+
+    # The key works on the machine API — a page that stored an unusable hash would look identical up to
+    # here.
+    code = machine.succeed(_as_user(CLIENT,
+        f"curl -sS -o /dev/null -w '%{{http_code}}' -H 'Authorization: Bearer {new_token}' "
+        f"--unix-socket {SOCKET} http://localhost/v1/measurements"
+    )).strip()
+    assert code == "200", f"a key issued from the page was refused: {code}"
+
+    # Revoking deletes the row, so the very next request carrying it is refused.
+    revoked = web_curl(
+        "-X POST --data-urlencode "
+        + shlex.quote(f"id={new_token.split('.')[0].removeprefix('mpk_')}")
+        + " http://localhost/keys/delete",
+        cookie=cookie,
+    )
+    assert http_status(revoked) == 303, revoked
+    code = machine.succeed(_as_user(CLIENT,
+        f"curl -sS -o /dev/null -w '%{{http_code}}' -H 'Authorization: Bearer {new_token}' "
+        f"--unix-socket {SOCKET} http://localhost/v1/measurements"
+    )).strip()
+    assert code == "401", f"a revoked key still worked: {code}"
+
     # Logging out invalidates the cookie the browser is holding.
     logged_out = web_curl("-X POST http://localhost/logout", cookie=cookie)
     assert http_status(logged_out) == 303, logged_out

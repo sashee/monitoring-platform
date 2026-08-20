@@ -140,9 +140,13 @@
 
         attrs = clock_attributes("heart_rate")
         assert attrs["uncertain"] is True, f"the held record lost its marking: {attrs}"
-        assert attrs["corrected"] is False, (
-            f"nothing had disciplined the clock, so nothing may claim a correction: {attrs}"
+        # `corrected` is no longer stamped (design §9.1). What replaces it as the per-row signal is
+        # `resolution`, which is kept precisely because this record was NOT corrected — the silent
+        # degradation to passthrough is the failure this labelling exists to prevent (§4.2).
+        assert attrs.get("resolution"), (
+            f"an uncorrected record must still say what it resolved to: {attrs}"
         )
+        assert "corrected" not in attrs, f"corrected is stamped by exception now: {attrs}"
 
     with subtest("a real clock step is observed"):
         # The `TFD_TIMER_CANCEL_ON_SET` path, for real: it needs something to actually call

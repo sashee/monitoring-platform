@@ -88,11 +88,26 @@
         # the assertions below would then read whatever row happened to be newest.
         retry(lambda _: row_count() >= before + 3, timeout_seconds=60)
 
+        # **Stamped by exception** (design §9.1): an ordinary corrected record carries no clock
+        # attributes at all, so the assertion is that the set is empty. The correction itself is
+        # asserted on the timestamp by `collector-clock`, which is where it belongs — a per-row
+        # "yes, this was fine" was cardinality rather than information.
         attrs = clock_attributes("heart_rate")
-        assert attrs["corrected"] is True, f"the sender's own timestamp was not corrected: {attrs}"
-        assert attrs["resolution"] == "exact", attrs
-        assert attrs["sync_source"], f"the condition that released the buffer must be named: {attrs}"
-        assert "uncertain" not in attrs, f"the clock was fine; nothing is uncertain: {attrs}"
+        assert attrs == {}, f"an ordinary corrected record must carry no clock attributes: {attrs}"
+
+        # The corrected stamp is still the proof: `mp-make-sample` stamps now, and the collector
+        # projects it through a synchronized clock, so it must land at the present moment.
+        sql = (
+            "select max(event_time) from measurement where type = 'heart_rate' "
+            f"and {sample_scope()};"
+        )
+        landed = int(machine.succeed(
+            "sqlite3 " + shlex.quote(f"file:{DB}?mode=ro") + " " + shlex.quote(sql)
+        ).strip())
+        now_ns = int(machine.succeed("date +%s%N").strip())
+        assert abs(now_ns - landed) < 120 * 10**9, (
+            f"the corrected timestamp should be near now; off by {(now_ns - landed) / 1e9:.1f}s"
+        )
 
         # The collector's bookkeeping must not have escaped into the database, where it would be
         # part of a measurement's content hash.

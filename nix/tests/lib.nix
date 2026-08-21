@@ -328,6 +328,12 @@ let
       SAMPLE_DEVICE_ID = "dev-7"
       SAMPLE_ATTR = "resource.attributes.device.id"
 
+      # Since schema 4.0 a measurement's type and attributes live in `series`, not on the row
+      # (SPEC §6.7), so every direct SQL probe below joins for them. One constant, for the same
+      # reason `store::read` has one: these queries bypass the read API deliberately, and a
+      # second spelling of the join is how they would drift out of step with it.
+      MEASUREMENTS = "measurement m join series s on s.id = m.series_id"
+
       # Two nodes, so the driver no longer auto-starts on first use.
       start_all()
 
@@ -452,11 +458,11 @@ let
           # return NULL rather than raise, so a typo here reads as "zero rows" instead
           # of as an error. shlex.quote rather than hand-nested quotes for that reason.
           if device_id is None:
-              sql = "select count(*) from measurement;"
+              sql = f"select count(*) from {MEASUREMENTS};"
           else:
               sql = (
-                  "select count(*) from measurement where "
-                  f"json_extract(attributes, '$.\"{SAMPLE_ATTR}\"') = '{device_id}';"
+                  f"select count(*) from {MEASUREMENTS} where "
+                  f"json_extract(s.attributes, '$.\"{SAMPLE_ATTR}\"') = '{device_id}';"
               )
           out = machine.succeed(
               "sqlite3 " + shlex.quote(f"file:{DB}?mode=ro") + " " + shlex.quote(sql)
@@ -477,7 +483,7 @@ let
           # The SQL predicate row_count scopes on, for the collector cases that need a
           # `where` of their own and would otherwise reach past the helpers to a bare
           # count (see the header). Returns a bare condition, to be `and`-ed in.
-          return f"""json_extract(attributes, '$.\"{SAMPLE_ATTR}\"') = '{device_id}'"""
+          return f"""json_extract(s.attributes, '$.\"{SAMPLE_ATTR}\"') = '{device_id}'"""
 
       def collector_health():
           # The collector answers JSON on its own socket: clock state, epoch count, buffer depth.
@@ -505,8 +511,8 @@ let
           # was most recent, so a foreign producer would not just add noise here — it would make
           # every assertion below read the wrong row.
           sql = (
-              f"select attributes from measurement where type = '{kind}' "
-              f"and {sample_scope()} order by processed_time desc limit 1;"
+              f"select s.attributes from {MEASUREMENTS} where s.type = '{kind}' "
+              f"and {sample_scope()} order by m.processed_time desc limit 1;"
           )
           out = machine.succeed(
               "sqlite3 " + shlex.quote(f"file:{DB}?mode=ro") + " " + shlex.quote(sql)

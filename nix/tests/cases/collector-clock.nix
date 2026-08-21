@@ -62,8 +62,8 @@
         # Scoped like row_count: a producer on the machine under test posts straight to the
         # receiver, never through this collector, so its rows can only dilute the count here.
         sql = (
-            "select count(*) from measurement where "
-            f"attributes like '%mp.clock.uncertain%' and {sample_scope()};"
+            f"select count(*) from {MEASUREMENTS} where "
+            f"s.attributes like '%mp.clock.uncertain%' and {sample_scope()};"
         )
         out = machine.succeed(
             "sqlite3 " + shlex.quote(f"file:{DB}?mode=ro") + " " + shlex.quote(sql)
@@ -183,14 +183,20 @@
             # steps that clock back to 2019, so it is not a sequence here: a row ingested during
             # the 2019 window sorts below rows that arrived before it. `measurement` is a rowid
             # table on purpose (src/store/schema.rs, the v2 migration), so rowid IS arrival order.
+            # 4.0 rebuilds the table, and `INSERT ... SELECT` scans the source in rowid order and
+            # assigns increasing rowids, so relative arrival order survives the rebuild.
+            #
+            # Every column is qualified because the join puts two rowid tables in scope: bare
+            # `rowid` is ambiguous and SQLite rejects it at prepare time, which is exactly how this
+            # was caught.
             #
             # The one query here NOT scoped on sample_scope(), and deliberately: the collector
             # synthesizes these rows itself rather than relaying a sender's batch, so they carry
             # no device.id and the type is already the narrower filter — nothing but this
             # collector writes mp.collector.health.
             out = machine.succeed(
-                f"""sqlite3 'file:{DB}?mode=ro' "select body from measurement """
-                f"""where type = 'mp.collector.health' order by rowid desc limit 1;" """
+                f"""sqlite3 'file:{DB}?mode=ro' "select m.body from {MEASUREMENTS} """
+                f"""where s.type = 'mp.collector.health' order by m.rowid desc limit 1;" """
             ).strip()
             return json.loads(out) if out else None
 

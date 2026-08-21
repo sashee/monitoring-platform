@@ -86,8 +86,8 @@ pub fn insert_batch(conn: &mut Connection, measurements: &[Measurement]) -> Resu
         let mut stmt = tx
             .prepare_cached(
                 "INSERT OR IGNORE INTO measurement \
-                 (id, event_time, processed_time, type, body, attributes, series_id) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                 (id, event_time, processed_time, body, series_id) \
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
             )
             .context("preparing insert")?;
 
@@ -100,6 +100,8 @@ pub fn insert_batch(conn: &mut Connection, measurements: &[Measurement]) -> Resu
                 .map(serde_json::to_string)
                 .transpose()
                 .context("serialising body")?;
+            // Still serialised, but it is `series.attributes` that receives it now — since 4.0
+            // `measurement` has no attributes column of its own.
             let attributes =
                 serde_json::to_string(&m.attributes).context("serialising attributes")?;
 
@@ -113,18 +115,13 @@ pub fn insert_batch(conn: &mut Connection, measurements: &[Measurement]) -> Resu
                     &id[..],
                     m.event_time,
                     m.processed_time,
-                    m.kind,
                     body,
-                    attributes,
                     &series[..]
                 ])
                 .context("inserting measurement")?;
             stored += inserted;
 
             if inserted > 0 {
-                // The same `attributes` string the column got, so `series.attributes` is
-                // byte-identical to `measurement.attributes` by construction rather than by
-                // coincidence — which is what makes phase two's column drop lossless.
                 series::accumulate(
                     &mut deltas,
                     &m.kind,
@@ -292,12 +289,11 @@ mod tests {
         assert_eq!(series_count(&c), 2);
     }
 
-    /// Phase two drops `measurement.type` and `measurement.attributes` and reads them from `series`
-    /// instead. That is only lossless if the two carry the same bytes, so it is asserted rather than
-    /// assumed — and asserted on the text, because a JSON-equal but differently-serialised string
-    /// would still make the column drop a change in what is stored.
+    /// `series` is now the *only* record of a measurement's type and attributes, so what it stores has
+    /// to be exactly what arrived — asserted on the text, since a JSON-equal but differently-serialised
+    /// string would be a change in what is stored.
     #[test]
-    fn a_series_carries_the_same_type_and_attributes_text_as_its_measurements() {
+    fn a_series_stores_the_type_and_attributes_verbatim() {
         let mut c = conn();
         let mut m = measurement("gps", 1);
         m.attributes = json!({"z.last": 1, "a.first": 2, "record.attributes.unit": "wgs84"})
@@ -306,15 +302,15 @@ mod tests {
             .clone();
         insert_batch(&mut c, std::slice::from_ref(&m)).unwrap();
 
-        let mismatched: i64 = c
+        let (kind, attributes): (String, String) = c
             .query_row(
-                "SELECT count(*) FROM measurement m JOIN series s ON s.id = m.series_id \
-                 WHERE m.type <> s.type OR m.attributes <> s.attributes",
+                "SELECT s.type, s.attributes FROM measurement m JOIN series s ON s.id = m.series_id",
                 [],
-                |r| r.get(0),
+                |r| Ok((r.get(0)?, r.get(1)?)),
             )
             .unwrap();
-        assert_eq!(mismatched, 0);
+        assert_eq!(kind, "gps");
+        assert_eq!(attributes, serde_json::to_string(&m.attributes).unwrap());
     }
 
     #[test]
@@ -484,8 +480,10 @@ mod tests {
 
             let (from_body, from_attr): (i64, i64) = c
                 .query_row(
-                    "SELECT json_extract(body,'$.n'), json_extract(attributes,'$.\"record.attributes.id\"') \
-                     FROM measurement ORDER BY event_time DESC LIMIT 1",
+                    "SELECT json_extract(m.body,'$.n'), \
+                            json_extract(s.attributes,'$.\"record.attributes.id\"') \
+                     FROM measurement m JOIN series s ON s.id = m.series_id \
+                     ORDER BY m.event_time DESC LIMIT 1",
                     [],
                     |r| Ok((r.get(0)?, r.get(1)?)),
                 )

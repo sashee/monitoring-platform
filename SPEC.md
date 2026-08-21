@@ -558,6 +558,7 @@ The versions that exist:
 | 3.1 | `web_user`, `web_session` (§14) | **minor** — the first under this scheme |
 | 3.2 | `series` + a nullable `measurement.series_id` + the backfill index (§6.7) | **minor**, and phase one of a two-phase change |
 | 3.3 | `measurement_series_event_time_idx`, for the read path's move onto the join (§6.7) | **minor** — the risky half of 4.0, done where it can be reverted |
+| 4.0 | `measurement` rebuilt without `type`/`attributes`, `series_id NOT NULL` + foreign key, `web_session.username` foreign key, foreign keys enabled (§6.7) | **major**, and the second in this project's life |
 
 ### 6.3 Write path
 
@@ -712,10 +713,10 @@ one transaction, so a measurement can never be stored uncounted or counted unsto
 - **Phase one and a half, 3.3.** Point the **read** path at the join, and add the index it needs. Still a
   minor: `measurement.type` and `measurement.attributes` are still written and still present, so a
   reverted binary reads them exactly as before.
-- **Phase two, 4.0 (later).** Rebuild `measurement` without `type` and `attributes` and with
-  `series_id NOT NULL`, and delete the backfill machinery entirely. This is what reclaims the ~62 MB, and
+- **Phase two, 4.0.** Rebuild `measurement` without `type` and `attributes` and with `series_id NOT NULL`
+  referencing `series`, and delete the backfill machinery entirely. This is what reclaims the ~62 MB, and
   it cannot be a minor: dropping a column a running 3.2 binary selects is precisely what §6.2's majors are
-  for. It requires 3.3 to have reached the host through the pipeline first — see below.
+  for. It required 3.3 to have reached the host through the pipeline first — see below.
 
 **Why the read path moves in 3.3 rather than in 4.0.** 4.0 is the only migration that cannot be
 rehearsed on the deployed host: it must arrive through the pipeline, and once applied there is no
@@ -802,30 +803,69 @@ afterwards — only the writer stores measurements, it is spawned after, and it 
 Reachable only from data this receiver did not write, or from I/O failure; both need a human, and
 `Restart=on-failure` retries every 60 s meanwhile.
 
-**Phase two needs no fill at all, provided 3.3 reaches the host through the pipeline first.** Once the
-pipeline delivers 3.3, every binary that can run writes a `series_id`: the nightly upgrade can only
-revert to 3.3, and a locally-switched generation is 3.3 or newer. So the queue converges once and stays
-empty, and 4.0 arrives at a database where every row is already assigned. The sweep, `pending`, the
-partial index and the UI note are then **pure deletion** — no fill logic survives into 4.0, and none is
-needed there.
+**Phase two needed no fill at all, because 3.3 reached the host through the pipeline first.** Once the
+pipeline delivered 3.3, every binary that could run wrote a `series_id`: the nightly upgrade could only
+revert to 3.3, and a locally-switched generation was 3.3 or newer. So the queue converged once and stayed
+empty, and 4.0 arrived at a database where every row was already assigned. The sweep, `pending`, the
+partial index and the UI note were **pure deletion**.
 
-That ordering is a real precondition, not a hope, so 4.0 **checks rather than assumes**: one probe of
-`measurement_backfill_idx` before dropping it, refusing to migrate if anything is unassigned. Cheap, and
-the alternative is silently discarding the only source those rows have. It is recoverable, since the
-generation being replaced is still bootable and still converges. The only way to reach it is booting an
-older generation from the bootloader by hand, which is a deliberate act.
+That ordering was a real precondition, not a hope, and `NOT NULL` is what enforces it: a database that
+never passed through 3.3 has unassigned rows, so 4.0's `INSERT … SELECT` fails on them, the migration
+rolls back whole, `user_version` stays at 3.3 and the previous generation still boots. **The constraint
+being added and the precondition being checked are the same thing**, so it costs nothing extra. The
+practical consequence is that restoring a pre-3.2 backup means running a 3.3 binary over it first; there
+is no path where 4.0 repairs it, because minting a series row needs blake3 and SQL cannot hash.
 
-Getting the fill *out* of 4.0 matters because a fill cannot be expressed in the migration's SQL: minting
-a series row for a combination never seen before needs blake3, and a reverted binary crossing a reboot
-produces exactly that — `resource.attributes.boot_id` is a dimension, so a new boot is a new series. A
-4.0 that had to fill would need a Rust step ordered before its own DDL, in the one migration that cannot
-be rehearsed on the deployed host. Shipping the read path in 3.3 is what removes that requirement.
+Getting the fill *out* of 4.0 is what left it as SQL only. A 4.0 that had to fill would have needed a Rust
+step ordered before its own DDL — in the one migration that cannot be rehearsed on the deployed host, and
+that cannot be reverted once applied, since every 3.x binary then refuses the database as a newer major.
+The only rollback 4.0 has is a database backup taken immediately before it.
 
 4.0 is therefore a **table rebuild**, the way 2.0 was: `CREATE` the new shape, `INSERT … SELECT`, `DROP`,
-`RENAME`. A rebuild rather than `DROP COLUMN` for two reasons — SQLite cannot `ALTER TABLE … ADD NOT
-NULL`, and `DROP COLUMN` rewrites every row without shrinking the file. Measured on the deployed
-database, 3.2 left **+9.2 MB** of page-split slack from widening every row in place; a rebuild reclaims
-that together with the ~62 MB of duplicated text, with no `VACUUM` and no second pass.
+`RENAME`. A rebuild rather than `DROP COLUMN` for three reasons — SQLite cannot `ALTER TABLE … ADD NOT
+NULL`, it cannot add a foreign key to an existing table at all, and `DROP COLUMN` rewrites every row
+without producing a compact table. The rebuild gets all three in the one pass the data has to make anyway.
+`measurement_type_event_time_idx` and `measurement_backfill_idx` die with the old table;
+`series_type_attributes_idx` is kept, because the read path's type filter uses it.
+
+No `VACUUM`: it cannot run inside a transaction. So 4.0 frees the ~62 MB of duplicated text *within* the
+file rather than returning it to the filesystem — later rows reuse it at ~150 bytes each instead of ~1 KB.
+A one-off manual `VACUUM` with the service stopped reclaims it if the file size itself matters.
+
+### 6.7.1 Foreign keys
+
+Enabled from 4.0. They were not before, and the reason given was that no genuine referential relationship
+existed — `api_key` does not own the measurements ingested with it, so declaring one would have implied a
+constraint that was not real. That reasoning expired when `measurement.series_id` arrived.
+
+**The key is what makes the read path's inner join total.** `NOT NULL` forbids an *absent* series;
+only the key forbids a *dangling* one, which a write-path bug computing the wrong hash would produce and
+which would make those measurements silently invisible to every read — the same under-reporting a NULL
+would cause, from a different mistake. Both halves are needed and neither substitutes for the other.
+
+`ON DELETE RESTRICT` by omission: a series still holding measurements cannot be deleted. That becomes
+load-bearing when retention arrives.
+
+**`DEFERRABLE INITIALLY DEFERRED`, and that is load-bearing.** `store::write::insert_batch` inserts each
+measurement *before* upserting its series row, because `added_measurements` may only count rows the
+`INSERT OR IGNORE` actually stored — folding first would let a retried batch inflate the count. An
+immediate constraint would forbid that order, and reversing it reintroduces exactly that bug. Deferred
+checks at `COMMIT`, so the write order stays free and the guarantee is identical. A violation therefore
+fails the whole batch rather than one row, surfacing as a retryable 503 rather than a silent gap.
+
+`web_session.username` references `web_user(username)` with `ON DELETE CASCADE`. `store::users::delete`
+still performs the cascade by hand and keeps doing so: it works whether or not the connection enforced
+the key, and deleting a user *must* invalidate their sessions. The migration filters orphan sessions
+rather than failing on them — a session whose user no longer exists is a credential that should already
+be invalid, so dropping it is the same repair.
+
+**Enforcement is per-connection and not stored in the file**, which is the hazard that made the original
+decision cautious, and it does not go away: a write path that forgets `PRAGMA foreign_keys = ON` is
+silently unenforced. So it is set in `apply_pragmas`, in `open_write_existing`, and — the belt — in
+`migrate` itself, since a connection that just built or upgraded the schema is precisely the one that must
+have the constraints live. `apply_foreign_keys` then *reads the pragma back* and fails if it did not take,
+because it is a silent no-op inside a transaction. `open_read` deliberately does not set it: a read-only
+connection cannot violate a constraint.
 
 ## 7. Read API
 
@@ -1465,25 +1505,27 @@ Unit tests (pure functions, no I/O):
   numeric, so 3.9 < 3.10 rather than the reverse a lexical comparison would give. Plus a guard that
   `MIGRATIONS` ascends and its last entry is exactly `SCHEMA_VERSION`, which catches both adding a
   migration without bumping the constant and bumping it without adding one.
-- Migrating (§6.2): forward from empty, from 1.0 and from 2.0 (keeping the measurements beside the
-  new table), and idempotent. A newer **major** is refused. A newer **minor** is *accepted* — it
+- Migrating (§6.2): forward from empty, from 1.0 and from 2.0, and idempotent. **A pre-3.2 database with
+  rows refuses to reach 4.0** and rolls back whole, leaving the version and the rows untouched; the same
+  database with no rows migrates all the way. A 3.0 database's other tables survive both of 4.0's
+  rebuilds. A newer **major** is refused. A newer **minor** is *accepted* — it
   applies nothing, leaves the stored version alone rather than silently downgrading the file, and
   leaves the newer binary's extra table intact. A database already at the current version is not
   written to at all, which is what keeps a deployed 3.0 database readable by a binary from before
   major.minor existed.
-- **An older binary's writes still work against the current schema** (§6.2). Asserted behaviourally,
-  by executing the verbatim pre-3.2 `INSERT` — the one that does not name `series_id` — plus the
-  `api_key` and `web_user` inserts. This replaced a test that compared `pragma_table_info` between
-  versions, which was a proxy that failed the moment 3.2 added a nullable column an older binary
-  survives perfectly well. Comparing shapes would have forced a needless major bump; comparing
-  behaviour permits exactly the additions §6.2 allows and no others.
+- **An older binary's writes are refused by the 4.0 schema** (§6.2) — the inverse of the test it
+  replaced, and the definition of a major. Through 3.3 the asserted property was that the verbatim
+  pre-3.2 `INSERT` still succeeded, which is what made those bumps minors and kept the nightly revert
+  survivable. 4.0 ends it deliberately, so the refusal is asserted rather than left implied by a deleted
+  test. The tables 4.0 did not touch still take the same writes.
+- STRICT survives the 4.0 rebuild — a rebuilt table that forgot it would silently start accepting
+  anything.
 - Series identity (§6.7): attribute order and nested-object order do not change a `series_id`; both
   halves of the key do; a series id is domain-separated from the measurement id of the same inputs;
   field boundaries are unambiguous, so `("ab", {"c":…})` and `("a", {"bc":…})` differ; and the encoding
   is pinned to a fixed hex value, because changing it invalidates every stored `series_id`.
 - The series fold (§6.7): rows of one series collapse into one delta; the extents are `min`/`max`, so
-  they do not depend on the order rows are folded — neither a batch nor the backfill scan is
-  time-ordered.
+  they do not depend on the order rows are folded — a batch is not time-ordered.
 - Series bookkeeping through the write path (§6.7). **A re-uploaded batch does not inflate
   `added_measurements`** — the regression test for folding before the insert rather than after it,
   which is the specific untruth the `added_` naming promises against. A partly-overlapping batch
@@ -1491,33 +1533,21 @@ Unit tests (pure functions, no I/O):
   spool drained after a reboot requires. `added_processed_time_*` tracks `processed_time` and not
   `event_time`, catching a transposed parameter that is otherwise invisible. Timestamps are **not**
   part of the key, so two measurements differing only in time share a series. A 16-series batch
-  attributes each row to its own series. And `series.type`/`series.attributes` are byte-identical to
-  the measurement's, which is what makes phase two's column drop lossless.
-- The backfill sweep (§6.7). **The rollback scenario as a test**: a row written the way a 3.1 binary
-  writes it leaves `series_id` NULL, and the sweep then fills it. **The sweep and the write path derive
-  the same id** — the sweep is the one place a series id comes from *stored JSON* rather than from the
-  measurement the ingest path built, and §6.2's version-2 note treats a second encoding path as a
-  hazard, so it is pinned rather than assumed. Five rows of one series fill into a single `series` row
-  carrying all five and the extents SQL computed for the group; twelve rows over four series fill in one
-  pass without cross-assigning. Re-running fills nothing and changes no count, which is what lets it run
-  on every startup, and a *later* sweep accumulates onto what an earlier one left rather than replacing
-  it — the case a reverted 3.1 binary produces twice. Rows written by the write path and rows swept
-  accumulate into *one* series whose count and extents span both. **Two spellings of one object are
-  refused and rolled back whole**, asserting that neither row was assigned and no `series` row survives,
-  because a partial commit would be worse than the error. Plus an empty table, a row with no attributes
-  and a NULL body, and that the partial index is empty — not merely unused — once the fill converges.
-- **Every read of `type` and `attributes` comes from `series`** (§6.7) — the guard on 4.0, since that
-  migration drops the old columns as pure DDL with no code change, so anything still reading them would
-  break unrehearsably. Asserted by de-synchronising the two copies, which nothing in the receiver ever
-  does, and demanding the `series` answer from: the projected row columns, the type list, the type filter
-  in *both* directions, the attribute filter in both directions, facet discovery, the extent query and the
-  aggregated chart query.
-- A measurement with no `series_id` is invisible to reads and counted as pending — the precondition
-  stated as a test, and the reason a failed backfill is fatal.
-- The join is omitted exactly when nothing reads it (§6.7): asserted on the generated SQL, since both
-  forms return identical results and only the cost differs. An unfiltered extent and a plain timeline skip
-  it; a type filter, an attribute filter and grouping by an attribute require it; a body filter and
-  grouping by a body leaf do not; the row query can never skip it.
+  attributes each row to its own series. And `series` stores the type and attributes verbatim, since it
+  is now their only record.
+- **The referential guarantee** (§6.7.1). A measurement cannot reference a series that does not exist,
+  and cannot have none at all — the two halves of what makes the read path's inner join total, each
+  asserted separately because neither constraint substitutes for the other. The write path satisfies the
+  key *despite inserting the measurement before its series row*, which only the deferred mode permits and
+  which the count's correctness depends on. A series still holding measurements cannot be deleted. A
+  session cannot be created for a user who does not exist. These are worth pinning precisely because
+  enforcement is per-connection and therefore forgettable.
+- **`measurement` has no `type` or `attributes` of its own** (§6.7), asserted on `pragma_table_info`.
+  Through 3.3 this was covered by de-synchronising the two copies and demanding the `series` answer — the
+  only way to tell the sources apart while both existed. 4.0 deleted the columns, so the guard became
+  structural, and asserting the structure is what stops a future migration quietly putting a second copy
+  back. The seven read shapes are still swept as a group, since they are what would have to change if the
+  source ever moved again.
 - The JSON path builder (§7.1): keys containing `"`, `\`, `.`, `[`, `]`, `$` and `*` all produce paths
   that match the intended key. Verified that unquoted/unescaped variants fail *silently* in SQLite
   (`NULL`, not an error), which is why this is a unit-tested function rather than inline formatting.
@@ -1560,12 +1590,9 @@ Integration tests:
   assert the socket file is gone.
 - Stale-socket handling: leave a dead socket file behind and assert startup reclaims it; leave a
   regular file and assert startup fails without deleting it.
-- **Startup refuses to serve when a measurement cannot be assigned a series** (§6.7), asserting the exit
-  is non-zero, that the message names the cause, and that the rows are still queued — the fill is one
-  transaction, so a refusal changes nothing. Forced with the only input that can do it: two spellings of
-  one attribute object.
-- Startup **assigns** a series to rows that have none, which is the wiring a unit test on `backfill`
-  cannot reach: unwired, every unit test still passes and the deployed receiver never converges.
+- **Startup refuses to serve against a database that skipped the assigning release** (§6.7), asserting a
+  non-zero exit, that the message names the constraint, and that `user_version` and the rows are untouched
+  — a partial migration would be unrecoverable, since every 3.x binary refuses a 4.0 database.
 - Schema compatibility, against the spawned binary rather than only `migrate` (§6.2): a database at a
   newer **major** exits non-zero with the reason on stderr; one at a newer **minor** starts, serves
   `/healthz` *and* `/v1/measurements`, and leaves `user_version` untouched. The end-to-end shape is
@@ -1656,8 +1683,6 @@ The explorer (§14.9):
   data's extent dropped the last row every time — invisible at a thousand rows, which is why it is pinned.
 - **The `all` window does not depend on the value filters**, so the axis does not rescale as filters change
   and widening a facet still has rows in range to offer.
-- The backfill note (§6.7) appears while measurements are unassigned and **disappears** once the sweep
-  has converged — a permanent banner about a finished job is noise.
 - API keys (§13, §14.1): the page lists and issues; an issued token is rendered **once** and is absent from
   the next load; a key issued from the page authenticates on `/v1`; revoking one stops it working; a label
   is required; the pages are behind the session guard and the origin check.

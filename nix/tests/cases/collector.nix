@@ -98,7 +98,7 @@
         # The corrected stamp is still the proof: `mp-make-sample` stamps now, and the collector
         # projects it through a synchronized clock, so it must land at the present moment.
         sql = (
-            "select max(event_time) from measurement where type = 'heart_rate' "
+            f"select max(m.event_time) from {MEASUREMENTS} where s.type = 'heart_rate' "
             f"and {sample_scope()};"
         )
         landed = int(machine.succeed(
@@ -134,9 +134,9 @@
         ))
         def resolutions():
             sql = (
-                "select json_extract(attributes, "
+                "select json_extract(s.attributes, "
                 """'$."record.attributes.mp.clock.resolution"') """
-                f"from measurement where {sample_scope()};"
+                f"from {MEASUREMENTS} where {sample_scope()};"
             )
             out = machine.succeed(
                 "sqlite3 " + shlex.quote(f"file:{DB}?mode=ro") + " " + shlex.quote(sql)

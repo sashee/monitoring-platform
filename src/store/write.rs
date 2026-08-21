@@ -124,9 +124,9 @@ pub fn insert_batch(conn: &mut Connection, measurements: &[Measurement]) -> Resu
             if inserted > 0 {
                 series::accumulate(
                     &mut deltas,
+                    series,
                     &m.kind,
                     &attributes,
-                    &m.attributes,
                     m.event_time,
                     m.processed_time,
                 );
@@ -420,8 +420,8 @@ mod tests {
         }
     }
 
-    /// The invariant phase two rests on, and the one that holds only until something starts deleting
-    /// rows — which is the entire reason these columns are named `added_*`.
+    /// The invariant that holds only until something starts deleting rows — which is the entire reason
+    /// these columns are named `added_*` rather than describing current contents.
     #[test]
     fn every_series_count_matches_the_rows_pointing_at_it() {
         let mut c = conn();

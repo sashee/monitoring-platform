@@ -556,7 +556,7 @@ The versions that exist:
 | 2.0 | content-addressed ids (§6.6): `measurement` dropped and recreated | major, and the illustration of why majors exist |
 | 3.0 | `api_key` (§13) | additive, but shipped as a single number |
 | 3.1 | `web_user`, `web_session` (§14) | **minor** — the first under this scheme |
-| 3.2 | `series` + a nullable `measurement.series_id` + the backfill index (§6.7) | **minor**, and phase one of a two-phase change |
+| 3.2 | `series` + a nullable `measurement.series_id` + the transitional fill index (§6.7) | **minor**, first of three steps |
 | 3.3 | `measurement_series_event_time_idx`, for the read path's move onto the join (§6.7) | **minor** — the risky half of 4.0, done where it can be reverted |
 | 4.0 | `measurement` rebuilt without `type`/`attributes`, `series_id NOT NULL` + foreign key, `web_session.username` foreign key, foreign keys enabled (§6.7) | **major**, and the second in this project's life |
 
@@ -706,131 +706,46 @@ write path folds a measurement into the bookkeeping only after its `INSERT OR IG
 otherwise a device retrying after a lost acknowledgement would inflate the count. Both writes share
 one transaction, so a measurement can never be stored uncounted or counted unstored.
 
-**This is deliberately a two-phase change.**
+**How this reached the deployed host, because the method is the reusable part.**
 
-- **Phase one, 3.2.** Add `series`, add a *nullable* `measurement.series_id`, write both. Nothing is
-  dropped and nothing reads `series` yet, so a 3.1 binary works against the result unchanged.
-- **Phase one and a half, 3.3.** Point the **read** path at the join, and add the index it needs. Still a
-  minor: `measurement.type` and `measurement.attributes` are still written and still present, so a
-  reverted binary reads them exactly as before.
-- **Phase two, 4.0.** Rebuild `measurement` without `type` and `attributes` and with `series_id NOT NULL`
-  referencing `series`, and delete the backfill machinery entirely. This is what reclaims the ~62 MB, and
-  it cannot be a minor: dropping a column a running 3.2 binary selects is precisely what §6.2's majors are
-  for. It required 3.3 to have reached the host through the pipeline first — see below.
+`measurement.type` and `measurement.attributes` could not be dropped in one step. A major bump strands
+the binary the nightly `system.autoUpgrade` puts back (§6.2), and 4.0 is the only migration that cannot
+be rehearsed on the host: it must arrive through the pipeline, and once applied there is no reverting to
+a binary that expects the columns. So it went in three:
 
-**Why the read path moves in 3.3 rather than in 4.0.** 4.0 is the only migration that cannot be
-rehearsed on the deployed host: it must arrive through the pipeline, and once applied there is no
-reverting to a binary that expects the dropped columns. Rewriting every read *and* dropping the columns
-in that one step would put the risky half — a hundred lines of query construction — where it can neither
-be tested live nor rolled back. Doing the reads first, in a revertible minor, leaves 4.0 as pure DDL
-with **no accompanying code change at all**.
+| | |
+|---|---|
+| **3.2** | add `series`, add a *nullable* `series_id`, write both, read neither |
+| **3.3** | point every **read** at the join; columns still written, so a revert still works |
+| **pipeline** | 3.3 delivered through GitHub, making every binary in circulation one that writes a `series_id` |
+| **4.0** | rebuild `measurement` without the columns, `NOT NULL` + foreign key, delete the transitional machinery |
 
-That is also why `read.rs` has exactly one `FROM` constant. `measurement` still carries both columns, so
-the only thing keeping a query off the stale copy is that no query names it — and one constant is what
-makes that checkable rather than hoped for. A test de-synchronises the two copies and demands the
-`series` answer from every read: rows, the type list, both filter halves, facet discovery, the extent
-query and the aggregated chart query.
+The ordering is the whole point. Moving the reads in 3.3 put the risky half — a hundred lines of query
+construction — where it could be tested on real data and reverted, leaving 4.0 as a table rebuild with
+**no read-path change at all**. Waiting for the pipeline before 4.0 is what let the transitional machinery
+be *deleted* rather than carried: with no binary left that writes an unassigned row, 4.0 could enforce the
+invariant with a constraint instead of repairing it at every startup.
 
-The rollback story still holds, and it is what makes 3.3 safe: a revert takes the *code* back too, so a
-3.2 binary reads `measurement.type` as it always did. A revert followed by an update is fine as well —
-the older binary leaves rows with no `series_id`, and the next 3.3 startup's sweep assigns them before
-the socket is bound.
+Two things from that period are worth keeping in mind rather than rediscovering:
 
-**The join is inner, so an unassigned row is invisible** — which turns the sweep from a tidiness concern
-into a correctness precondition, and is why a failed backfill is **fatal** from 3.3 on (§6.7 below, and
-`main.rs`). It is skipped entirely for queries that read neither `type` nor `attributes`: the join cannot
-remove a row, so omitting it is result-preserving, and it saves ~85 ms on a landing-page render.
+- **3.2 and 3.3 carried a convergence sweep**, not a one-shot fill in the migration. A one-shot would have
+  left a hole in the middle of the table: 3.2 fills, the nightly reverts to a binary that writes NULL
+  `series_id`, and rolling forward leaves an arbitrary interior range unassigned with nothing marking it.
+  Any future column that an older binary cannot populate has the same shape, and wants the same answer —
+  converge on every startup, not once.
+- **`NOT NULL` doubles as the precondition check.** A database that never passed through 3.3 has
+  unassigned rows, so 4.0's `INSERT … SELECT` fails on them and rolls back whole, leaving `user_version`
+  at 3.3 and the previous generation bootable. Nothing in 4.0 could have filled them: minting a series row
+  needs blake3, and SQL cannot hash. So "upgrade through 3.3" is enforced rather than documented, and it
+  is a real constraint on restoring any pre-3.2 backup.
 
-**The fill is a convergence sweep, not a migration step**, and that is the load-bearing decision. A
-one-shot fill inside the 3.2 migration would leave a hole, and not at the head of the table where it
-would be noticed:
+`read.rs` still has exactly one `FROM` constant, for a reason that outlived the transition. During 3.3 it
+was what kept queries off the stale second copy of `type` and `attributes`; now it is the single place
+that decides where a measurement's identity comes from, and the reason the *next* such move would again
+be a one-line change rather than a scattered one.
 
-1. 3.2 migrates and fills every row.
-2. The nightly `system.autoUpgrade` reverts to the 3.1 binary. It *starts fine* — the entire point of
-   a minor version — but its `INSERT` does not name `series_id`, so every row it writes gets NULL and
-   no `series` row.
-3. Rolling forward leaves an arbitrary interior range unfilled, with nothing marking it.
-
-So the invariant is not "the migration filled it" but **a 3.2 binary running drives the gap to zero**.
-`store::series::backfill` runs on **every startup**.
-
-`measurement_backfill_idx`, partial on `series_id IS NULL`, **is the work queue**. It costs
-O(unfilled) rather than O(table), collapses to nothing once the fill converges, makes "how many are
-left" an index probe cheap enough for a page render, and — the point — a row written by a reverted 3.1
-binary enters it automatically. It is deliberately temporary; 4.0 drops it.
-
-**The fill is per-series, not per-measurement**, and that is what makes it affordable. One grouped scan
-(`GROUP BY type, attributes` over the queue) yields the 1,458 distinct pairs with their `count`/`min`/
-`max` computed by SQL; the hashing and the upserts then run 1,458 times rather than 118,718. A single
-set-wise `UPDATE`, correlated on `(type, attributes)` through `series_type_attributes_idx`, assigns
-every row in one statement.
-
-The first implementation did it the obvious way — read each row, hash it, update it, in resumable
-2,000-row chunks — and took **168 s** on the deployed database against **19 s** for the form above:
-118,718 single-row updates across 60 committing transactions, with a WAL checkpoint every few. That
-does not fit the startup budget, so the whole fill is now **one transaction**. The failure mode
-chunking protected against — a power cut mid-fill — now costs a clean rollback and a repeat on the next
-start, which at ~20 s is a better trade than three minutes of startup every time.
-
-Because the fill is one transaction, its bookkeeping is atomic with its assignment by construction: a
-row is counted and leaves the queue in the same commit, or neither happens. No row can be filled twice,
-and nothing sets `series_id` back to NULL.
-
-**One case is refused rather than half-done.** SQL must group by the attribute *text*, since it cannot
-compute the hash — so two spellings of the same object (differing key order) arrive as two groups,
-share a series id, and the second finds no matching `series.attributes` and stays NULL. The fill
-re-checks the queue inside the transaction and rolls back with an error naming the count. Nothing the
-write path emits can produce this: it serialises from a sorted map. So it is a report that something
-else wrote the column, and leaving those rows queued is the honest outcome.
-
-The unit allows `TimeoutStartSec = maxPolls × pollIntervalSecs + 120` = 420 s, of which the clock gate
-claims 300, so the fill has 120 s of slack. Measured at **41.7 s** on the deployed database, once; every
-startup after is one index probe (`starting` → `ready` in 1.1 ms). It logs `filled` and `elapsed`, and if
-that ever approaches the slack it moves behind `sd_notify(READY)`. It runs in `serve` rather than in
-`migrate` or `open_write`, because `create-api-key` and `create-user` open the database the same way and
-have no business running a backfill.
-
-**A failed fill is fatal**, and the contrast with the api-key count two paragraphs up is deliberate. A
-missing key degrades a *feature*: requests are refused, loudly, and nothing reported is wrong. An
-unassigned measurement is different — since 3.3 the read path joins `series`, so such a row is invisible
-to `/v1/measurements` and to every chart. Quietly under-reporting is the worst failure available to a
-monitoring system: an empty chart reads as "nothing happened", which is the one answer it must never give
-wrongly. Being down and saying so is strictly better.
-
-The precondition is exact rather than approximate, because the fill is one transaction that re-checks the
-queue before committing: **`backfill` returning `Ok` means the queue is empty.** Nothing can refill it
-afterwards — only the writer stores measurements, it is spawned after, and it always sets `series_id`.
-Reachable only from data this receiver did not write, or from I/O failure; both need a human, and
-`Restart=on-failure` retries every 60 s meanwhile.
-
-**Phase two needed no fill at all, because 3.3 reached the host through the pipeline first.** Once the
-pipeline delivered 3.3, every binary that could run wrote a `series_id`: the nightly upgrade could only
-revert to 3.3, and a locally-switched generation was 3.3 or newer. So the queue converged once and stayed
-empty, and 4.0 arrived at a database where every row was already assigned. The sweep, `pending`, the
-partial index and the UI note were **pure deletion**.
-
-That ordering was a real precondition, not a hope, and `NOT NULL` is what enforces it: a database that
-never passed through 3.3 has unassigned rows, so 4.0's `INSERT … SELECT` fails on them, the migration
-rolls back whole, `user_version` stays at 3.3 and the previous generation still boots. **The constraint
-being added and the precondition being checked are the same thing**, so it costs nothing extra. The
-practical consequence is that restoring a pre-3.2 backup means running a 3.3 binary over it first; there
-is no path where 4.0 repairs it, because minting a series row needs blake3 and SQL cannot hash.
-
-Getting the fill *out* of 4.0 is what left it as SQL only. A 4.0 that had to fill would have needed a Rust
-step ordered before its own DDL — in the one migration that cannot be rehearsed on the deployed host, and
-that cannot be reverted once applied, since every 3.x binary then refuses the database as a newer major.
-The only rollback 4.0 has is a database backup taken immediately before it.
-
-4.0 is therefore a **table rebuild**, the way 2.0 was: `CREATE` the new shape, `INSERT … SELECT`, `DROP`,
-`RENAME`. A rebuild rather than `DROP COLUMN` for three reasons — SQLite cannot `ALTER TABLE … ADD NOT
-NULL`, it cannot add a foreign key to an existing table at all, and `DROP COLUMN` rewrites every row
-without producing a compact table. The rebuild gets all three in the one pass the data has to make anyway.
-`measurement_type_event_time_idx` and `measurement_backfill_idx` die with the old table;
-`series_type_attributes_idx` is kept, because the read path's type filter uses it.
-
-No `VACUUM`: it cannot run inside a transaction. So 4.0 frees the ~62 MB of duplicated text *within* the
-file rather than returning it to the filesystem — later rows reuse it at ~150 bytes each instead of ~1 KB.
-A one-off manual `VACUUM` with the service stopped reclaims it if the file size itself matters.
+The join is skipped entirely for queries that read neither `type` nor `attributes` — it cannot remove a
+row, so omitting it is result-preserving, and it saves ~85 ms on a landing-page render.
 
 ### 6.7.1 Foreign keys
 
@@ -1326,7 +1241,7 @@ src/
     schema.rs          version encoding, migrations, pragmas
     write.rs           writer task, insert_batch
     read.rs            query building, JSON path builder, row mapping
-    series.rs          the series table (§6.7): the fold, the upsert, the backfill sweep
+    series.rs          the series table (§6.7): identity, the per-batch fold, the upsert
     keys.rs            the api_key table (§13)
     users.rs           the web_user table (§14)
     sessions.rs        the web_session table (§14)

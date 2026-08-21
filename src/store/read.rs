@@ -19,11 +19,10 @@ pub const MAX_LIMIT: i64 = 1000;
 /// which matters because 4.0 is the one migration that cannot be rehearsed here: it has to arrive
 /// through the pipeline, and once applied there is no reverting to a binary that expects the columns.
 ///
-/// The join is **inner**, so a measurement with no `series_id` is invisible. That is only safe because
-/// `store::series::backfill` runs to completion before the socket is bound and refuses to let the
-/// process start if it cannot — see `main.rs`. A `LEFT JOIN … coalesce(sr.type, m.type)` would tolerate
-/// unassigned rows, but `coalesce(…) IN (?)` cannot use an index, so it would trade a provable
-/// precondition for a slow one.
+/// The join is **inner**, so a measurement whose series does not resolve would be invisible. Since 4.0
+/// the schema makes that unreachable rather than merely unlikely: `series_id` is `NOT NULL` with a
+/// foreign key, so the absent and the dangling case are both refused at write time. Through 3.2 and 3.3
+/// the same guarantee cost a startup sweep that had to succeed before the socket was bound.
 const FROM_MEASUREMENT: &str = "FROM measurement m JOIN series sr ON sr.id = m.series_id";
 
 /// The same table without the join, for queries that read neither `type` nor `attributes`.

@@ -285,12 +285,12 @@ const MIGRATIONS: &[Migration] = &[
     // reverted 3.1 binary enters it automatically, which is what makes the fill self-healing rather
     // than a one-shot with a hole in it. Deliberately temporary: 4.0 drops it.
     //
-    // `series_type_attributes_idx` exists for one statement: the backfill assigns every unfilled row
-    // its series with a single set-wise `UPDATE` correlated on `(type, attributes)`, and without this
-    // index that correlation is a scan of `series` per measurement. Measured: assigning row-by-row from
-    // Rust instead took 168 s on the deployed database against 19 s for the set-wise form, which is the
-    // difference between fitting inside `TimeoutStartSec` and not. Also temporary — at 4.0 the columns
-    // it indexes are gone from `measurement` and the correlation with them.
+    // `series_type_attributes_idx` was added for the backfill's set-wise `UPDATE`, correlated on
+    // `(type, attributes)`. **That is no longer why it exists, and it must not be dropped**: since 3.3
+    // the read path's type filter is `series.type`, and the query plan uses this index to drive the
+    // whole join from the 1,629-row `series` table — `SEARCH sr USING INDEX series_type_attributes_idx
+    // (type=?)`. Removing it as dead weight would turn every type-filtered query into a scan. 4.0
+    // deliberately keeps it while dropping the two indexes that really did become dead.
     //
     // No index on `measurement (series_id, …)`. Nothing reads `series` in phase one, and an index over
     // 118k rows costs space and write throughput now for a query that does not exist yet. Additive, so

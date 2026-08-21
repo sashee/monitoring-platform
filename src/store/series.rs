@@ -18,7 +18,6 @@
 
 use anyhow::{Context, Result};
 use rusqlite::{Connection, params};
-use serde_json::{Map, Value};
 use std::collections::BTreeMap;
 
 use crate::content_id::{ContentId, series_id};
@@ -31,9 +30,8 @@ use crate::model::Measurement;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Delta {
     pub kind: String,
-    /// The serialised attributes, passed in rather than re-serialised, so `series.attributes` is
-    /// byte-identical to `measurement.attributes` by construction. Phase two's column drop is only
-    /// lossless because of that.
+    /// The serialised attributes, passed in rather than re-serialised here. `series` is now their only
+    /// record, so what lands in the column is exactly the string the ingest path produced.
     pub attributes: String,
     pub added: i64,
     pub event_min: i64,
@@ -58,9 +56,9 @@ impl Delta {
 
     /// Folds another contribution to the *same* series in.
     ///
-    /// `min`/`max` rather than assignment: neither a batch nor the backfill's scan is ordered by time,
-    /// so assignment would make the result depend on which row happened to come first. `kind` and
-    /// `attributes` are left alone — they are what the two deltas agree on by definition of the key.
+    /// `min`/`max` rather than assignment: a batch is not ordered by time, so assignment would make the
+    /// result depend on which row happened to come first. `kind` and `attributes` are left alone — they
+    /// are what the two deltas agree on by definition of the key.
     fn merge(&mut self, other: &Delta) {
         self.added += other.added;
         self.event_min = self.event_min.min(other.event_min);
@@ -70,8 +68,25 @@ impl Delta {
     }
 }
 
-/// Adds a delta to a map, merging when the series is already there.
-fn fold(deltas: &mut BTreeMap<ContentId, Delta>, id: ContentId, delta: Delta) {
+/// Accumulates one row into a delta map, merging when its series is already there.
+///
+/// Takes the id rather than deriving it, so [`id_of`] is the single place a series id comes from. It
+/// used to derive its own, which was right while the 3.x backfill also called this with an id it did
+/// not have — but it left the write path hashing every measurement's attributes twice, once for the
+/// row and once for the bookkeeping.
+///
+/// `BTreeMap` rather than `HashMap` so the upserts run in a deterministic order, which keeps a test's
+/// expectations stable and makes lock acquisition order predictable.
+pub fn accumulate(
+    deltas: &mut BTreeMap<ContentId, Delta>,
+    id: ContentId,
+    kind: &str,
+    attributes_json: &str,
+    event_time: i64,
+    processed_time: i64,
+) {
+    let delta =
+        Delta::single(kind.to_owned(), attributes_json.to_owned(), event_time, processed_time);
     match deltas.get_mut(&id) {
         Some(existing) => existing.merge(&delta),
         None => {
@@ -80,30 +95,7 @@ fn fold(deltas: &mut BTreeMap<ContentId, Delta>, id: ContentId, delta: Delta) {
     }
 }
 
-/// Accumulates one row into a delta map, keyed by series id.
-///
-/// `BTreeMap` rather than `HashMap` so the upserts run in a deterministic order, which keeps a test's
-/// expectations stable and makes lock acquisition order predictable.
-///
-/// Returns the series id, because the caller needs it for the measurement row itself.
-pub fn accumulate(
-    deltas: &mut BTreeMap<ContentId, Delta>,
-    kind: &str,
-    attributes_json: &str,
-    attributes: &Map<String, Value>,
-    event_time: i64,
-    processed_time: i64,
-) -> ContentId {
-    let id = series_id(kind, attributes);
-    fold(
-        deltas,
-        id,
-        Delta::single(kind.to_owned(), attributes_json.to_owned(), event_time, processed_time),
-    );
-    id
-}
-
-/// The series id a measurement belongs to, without going through a delta map.
+/// The series a measurement belongs to. The only place this is derived.
 pub fn id_of(m: &Measurement) -> ContentId {
     series_id(&m.kind, &m.attributes)
 }
@@ -180,10 +172,10 @@ mod tests {
     #[test]
     fn rows_of_one_series_fold_into_one_delta() {
         let mut deltas = BTreeMap::new();
-        let attrs = json!({"a": 1}).as_object().unwrap().clone();
-        accumulate(&mut deltas, "t", "{\"a\":1}", &attrs, 500, 5_500);
-        accumulate(&mut deltas, "t", "{\"a\":1}", &attrs, 100, 1_100);
-        accumulate(&mut deltas, "t", "{\"a\":1}", &attrs, 300, 3_300);
+        let id = series_id("t", &json!({"a": 1}).as_object().unwrap().clone());
+        accumulate(&mut deltas, id, "t", "{\"a\":1}", 500, 5_500);
+        accumulate(&mut deltas, id, "t", "{\"a\":1}", 100, 1_100);
+        accumulate(&mut deltas, id, "t", "{\"a\":1}", 300, 3_300);
 
         assert_eq!(deltas.len(), 1, "one series, one statement");
         let d = deltas.values().next().unwrap();
@@ -195,11 +187,11 @@ mod tests {
     /// silently depend on arrival order.
     #[test]
     fn extents_do_not_depend_on_the_order_rows_are_folded() {
-        let attrs = json!({"a": 1}).as_object().unwrap().clone();
+        let id = series_id("t", &json!({"a": 1}).as_object().unwrap().clone());
         let fold_all = |times: &[(i64, i64)]| {
             let mut deltas = BTreeMap::new();
             for (e, p) in times {
-                accumulate(&mut deltas, "t", "{\"a\":1}", &attrs, *e, *p);
+                accumulate(&mut deltas, id, "t", "{\"a\":1}", *e, *p);
             }
             deltas.into_values().next().unwrap()
         };
@@ -212,8 +204,8 @@ mod tests {
         let mut deltas = BTreeMap::new();
         let a = json!({"record.attributes.cell": 1}).as_object().unwrap().clone();
         let b = json!({"record.attributes.cell": 2}).as_object().unwrap().clone();
-        accumulate(&mut deltas, "t", "{}", &a, 1, 2);
-        accumulate(&mut deltas, "t", "{}", &b, 1, 2);
+        accumulate(&mut deltas, series_id("t", &a), "t", "{}", 1, 2);
+        accumulate(&mut deltas, series_id("t", &b), "t", "{}", 1, 2);
         assert_eq!(deltas.len(), 2);
     }
 

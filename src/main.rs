@@ -245,11 +245,9 @@ async fn serve(args: ServeArgs) -> Result<()> {
     // rather than a service that accepts requests it cannot store.
     let conn = store::open_write(&config.database_path)?;
 
-    // No backfill here any more (SPEC §6.7). 3.2 and 3.3 ran a convergence sweep on every startup to
-    // assign a series to rows written without one; since 4.0 `series_id` is `NOT NULL` with a foreign
-    // key, so there is nothing left that could need assigning and nothing that could quietly go
-    // unassigned. The invariant the read path's inner join depends on is enforced by the schema rather
-    // than repaired at startup — which also took ~42 s off the first start after the upgrade.
+    // Nothing between the migration and the writer: the invariant the read path's inner join needs is
+    // enforced by the schema (`series_id NOT NULL` with a foreign key, SPEC §6.7), not repaired at
+    // startup. 3.2 and 3.3 ran a convergence sweep here instead, which cost ~42 s on the first start.
 
     // Loud, but not fatal. Refusing to start would take `/healthz` down with it — the one endpoint
     // that needs no key and that a readiness probe depends on — and turn a recoverable state into a

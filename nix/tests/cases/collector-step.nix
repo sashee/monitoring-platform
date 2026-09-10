@@ -160,9 +160,17 @@
             f"the persisted history and the new reading should both be present: {health}"
         )
 
-        journal = machine.succeed("journalctl -u mp-collector.service --no-pager")
-        assert "resumed offset history from disk" in journal, (
-            f"the epoch table was not persisted across the restart:\n{journal}"
+        # Polled rather than read once, for the same reason as the gate's verdict in
+        # clock-gate.nix: the line is written during startup and reaches journald
+        # asynchronously, so a single read races the ingest even though the resume has
+        # already happened -- the epochs check above has just proven it did. This restart
+        # steps the clock backwards, which makes journald rotate ("Time jumped backwards,
+        # rotating"), and a rotation is exactly when ingest lags behind the writer. Seen for
+        # real: a run where epochs >= 2 passed, healthz answered, and this string was absent
+        # from the journal 300ms after the start returned.
+        machine.wait_until_succeeds(
+            "journalctl -u mp-collector.service --no-pager | grep -q 'resumed offset history from disk'",
+            timeout=60,
         )
 
         # And it still works: put the clock back and a fresh record lands correctly.

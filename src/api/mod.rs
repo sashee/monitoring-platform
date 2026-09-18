@@ -1,4 +1,5 @@
 pub mod auth;
+pub mod compress;
 pub mod ingest;
 pub mod query;
 pub mod status;
@@ -27,6 +28,10 @@ use crate::AppState;
 /// API-key middleware never reads `Cookie`, so a cookie cannot reach an OTLP endpoint and a bearer token
 /// cannot open a page. Hoisting either layer out to wrap the merge would quietly end that; `tests/web.rs`
 /// asserts it in both directions.
+///
+/// Response compression (§8.3) is layered per group for the same reason and along a different line: it
+/// wraps the browser pages and the JSON read API, and deliberately not ingest, whose response encoding
+/// §4.1.1 pins. `/healthz` is outside it too — a liveness probe's body is a handful of bytes.
 pub fn app(state: AppState) -> Router {
     let ingest = Router::new()
         .route("/v1/logs", post(ingest::handler))
@@ -36,21 +41,24 @@ pub fn app(state: AppState) -> Router {
 
     let measurements = Router::new()
         .route("/v1/measurements", get(query::list))
-        .layer(axum::middleware::from_fn_with_state(state.clone(), auth::guard_json));
+        .layer(axum::middleware::from_fn_with_state(state.clone(), auth::guard_json))
+        // Outside the auth layer, so a refusal is compressed on the same terms as a page — the layer
+        // decides by media type and size, and has no reason to care which of those it is looking at.
+        .layer(axum::middleware::from_fn(compress::gzip_responses));
 
     // The web interface (SPEC §14), already carrying its own session layer on the guarded half. `login` is
     // outside it by definition: it is how a request with no session acquires one.
     let (web_pages, web_login) = crate::web::routers(state.clone());
+
+    // Compression wraps both halves of the browser surface (SPEC §8.3). Merged here rather than layered
+    // inside `web::routers` because that function's contract is about *authentication* — it returns two
+    // routers precisely so the caller can guard one and not the other — and gzip draws no such line.
+    let web = web_pages.merge(web_login).layer(axum::middleware::from_fn(compress::gzip_responses));
 
     // Deliberately unprotected (SPEC §13): a health check has to answer before any key exists —
     // during a deploy, from an `ExecStartPre`, from a probe that holds no credential — and it
     // discloses nothing but liveness.
     let health = Router::new().route("/healthz", get(query::healthz));
 
-    ingest
-        .merge(measurements)
-        .merge(web_pages)
-        .merge(web_login)
-        .merge(health)
-        .with_state(state)
+    ingest.merge(measurements).merge(web).merge(health).with_state(state)
 }

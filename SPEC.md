@@ -910,6 +910,50 @@ listener; `axum::serve` accepts `tokio::net::UnixListener` directly. Adding iroh
 `iroh::endpoint::Connection` streams and driving the same `Router` over them with
 `hyper::server::conn`, in a new `transport/iroh.rs`. No change to `api`, `otlp` or `store`.
 
+### 8.3 Response compression
+
+`Content-Encoding: gzip` on the way out, when the request's `Accept-Encoding` offers it. The mirror of
+§4.2's inbound decompression, and it exists for the same reason that section gives: iroh's QUIC streams
+carry no transport-level compression, so this is the only lever on the bytes a client has to pull down.
+
+What makes it worth having is §14.9's explorer, not the read API. A 30-day page with four grouped
+charts is ~651 KB of inline SVG — measured, on 691k rows across 16 series — and gzip takes that to
+~141 KB. Over a phone link that is the difference between a page that arrives and one that does not.
+
+**The policy is three decisions, and each one is a refusal to compress:**
+
+- **The client must have offered gzip.** `q=0` is a refusal and is parsed as one; a `*` stands in only
+  where there is no explicit `gzip` entry. Reading the header as "does it contain the substring gzip"
+  would send an encoded body to a client that said it could not decode one.
+- **The media type must be text.** An allow-list (`text/*`, `application/json`, `*+json`), because
+  re-compressing an already compressed format spends CPU to add bytes, and a type this service does not
+  yet return is better sent untouched than assumed.
+- **The body must clear 1 KiB.** gzip's envelope plus deflate's block overhead can exceed the saving on
+  a small body, and every response below that here is a redirect, a cleared cookie or a one-line error.
+
+A response that comes out no smaller than it went in is sent uncompressed, and an encoder failure logs
+and falls back to the original body rather than failing the request.
+
+**`Vary: Accept-Encoding` on every response through the layer**, compressed or not: the answer now
+depends on a request header, and without it a cache between here and the browser could hand a gzipped
+page to a client that never asked for one.
+
+**Level 6, the default.** Measured on that 651 KB page: level 1 gives 3.5x for 6 ms, level 6 gives 4.6x
+for 29 ms, level 9 gives 4.8x for 101 ms. Level 9 more than triples the CPU for another 4%, and over a
+phone link the 46 KB level 6 saves over level 1 outweighs the 23 ms it costs.
+
+**Applied to the browser pages and the JSON read API; not to ingest.** That route's responses are an
+empty protobuf on success and a `google.rpc.Status` on failure — below the threshold either way — and
+§4.1.1 pins their encoding for OTLP conformance, so a `Content-Encoding` there would be a conformance
+question with no payoff.
+
+Hand-rolled over `flate2` rather than `tower-http`'s `CompressionLayer`, consistently with §10.2: the
+policy above is three predicates, `flate2` is already a dependency for §4.2, and `tower-http` is the
+crate that section already declined.
+
+**This is a transfer fix, not a latency fix.** The page is built in full before any of it is encoded, so
+the time to the first byte is unchanged — see §14.9 on where that time actually goes.
+
 ## 9. Configuration and deployment
 
 ### 9.1 CLI
@@ -1251,6 +1295,7 @@ src/
     ingest.rs          POST /v1/logs: limits, decompression, conversion
     query.rs           GET /v1/measurements, /healthz
     status.rs          google.rpc.Status + the non-protobuf error rewrite layer
+    compress.rs        pure Accept-Encoding parsing + the gzip response layer (§8.3)
   web/                 the browser interface (§14)
     mod.rs             routers and handlers
     html.rs            pure: escaping and page rendering
@@ -1262,6 +1307,8 @@ tests/
   read_api.rs          router-level read API
   auth.rs              router-level API key enforcement (§13)
   web.rs               router-level login, guard and credential separation (§14)
+  compression.rs       router-level: gzipped for a client that offers it, untouched for one that
+                       does not, same bytes either way (§8.3)
   end_to_end.rs        the compiled binary over a real socket, incl. SIGTERM
 crates/                see collector-clock-correction-design.md for these two
   mp-host/             clock and socket primitives shared by both binaries
@@ -1292,7 +1339,7 @@ The conversion and query-building layers are pure functions over owned data; all
 | `prost`              | 0.14    | decode/encode of the OTLP messages, and the local `Status` |
 | `rusqlite`           | 0.40    | feature `bundled` — vendored SQLite, no system lib         |
 | `serde` / `serde_json`| 1      | JSON mapping and read-API responses                       |
-| `flate2`             | 1.1     | gzip decompression, called directly so both size limits stay explicit (§4.2) |
+| `flate2`             | 1.1     | gzip: decompression on ingest, called directly so both size limits stay explicit (§4.2), and response compression (§8.3) |
 | `base64`             | 0.23    | `bytes_value` encoding, pagination cursor                  |
 | `jiff`               | 0.2     | RFC 3339 ⇄ i64 nanos: `Timestamp::from_nanosecond` / `as_nanosecond` |
 | `clap`               | 4.6     | `derive`, `env`                                            |
@@ -1304,8 +1351,9 @@ The conversion and query-building layers are pure functions over owned data; all
 | dev: `tempfile`      | 3       | throwaway databases and sockets                            |
 | dev: `libc`          | 0.2     | sending `SIGTERM` in the end-to-end test                    |
 
-Deliberately *not* used: `tower-http` (see §4.2 — the limits are enforced in the handler) and
-`tonic-types` (see §4.1.1 — the one `Status` field is declared locally).
+Deliberately *not* used: `tower-http` (see §4.2 — the limits are enforced in the handler — and §8.3,
+where the compression policy is three predicates over `flate2`) and `tonic-types` (see §4.1.1 — the one
+`Status` field is declared locally).
 
 `opentelemetry-proto`'s `logs` feature pulls in `opentelemetry` and `opentelemetry_sdk` for its
 transform module; that is accepted in exchange for not needing `protoc` or vendored `.proto` files

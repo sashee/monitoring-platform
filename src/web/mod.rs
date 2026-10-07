@@ -32,7 +32,7 @@ use crate::AppState;
 use crate::api::query::format_nanos;
 use crate::model::StoredMeasurement;
 use crate::store::read::{
-    Facets, FieldRef, MAX_SERIES, Point, QuerySpec, Series, SeriesSpec, TypeCount, bucket_nanos,
+    Facets, FieldRef, MAX_SERIES, Point, QuerySpec, Series, SeriesSpec, bucket_nanos,
 };
 use session::Identity;
 
@@ -254,7 +254,7 @@ impl Explore {
 /// snapshot, and separate tasks could each see a different one — the chart would then describe rows the
 /// table does not list.
 struct ExploreData {
-    types: Vec<TypeCount>,
+    types: Vec<String>,
     facets: Facets,
     window: (i64, i64),
     bucket: i64,
@@ -278,13 +278,58 @@ struct Chart {
     total_groups: usize,
 }
 
+/// What the filter row offers for one slice: its attributes and body fields, each with its options.
+fn discover_facets(conn: &rusqlite::Connection, filter: &QuerySpec) -> anyhow::Result<Facets> {
+    let mut facets = crate::store::read::facets(conn, filter)?;
+
+    // **A key that is being filtered has its own filter excluded from its own options**, or the
+    // dropdown collapses to the one value already chosen and the filter becomes a one-way door. Only
+    // the actively-filtered keys need re-asking; for the rest the scoped answer is already right.
+    for (key, _) in &filter.attrs {
+        let widened = crate::store::read::facet_values_excluding(
+            conn,
+            filter,
+            &FieldRef::Attribute(key.clone()),
+        )?;
+        match facets.attrs.iter_mut().find(|a| a.key == *key) {
+            Some(existing) => *existing = widened,
+            // The key is filtered but absent from the slice — a filter that matches nothing. Offering
+            // its other values is exactly how the reader gets back out.
+            None => facets.attrs.push(widened),
+        }
+    }
+    facets.attrs.sort_by(|a, b| a.key.cmp(&b.key));
+
+    // The same widening for body leaves: a filtered field's own options must not be narrowed by its own
+    // filter, whichever half of the measurement it lives in.
+    for (leaf, _) in &filter.body {
+        let widened =
+            crate::store::read::facet_values_excluding(conn, filter, &FieldRef::Body(leaf.clone()))?;
+        if let Some(existing) = facets.fields.iter_mut().find(|f| f.name == *leaf) {
+            existing.values = widened.values;
+            existing.truncated = widened.truncated;
+        }
+    }
+
+    // Numerically where the values are numbers, so a dropdown of sixteen cells reads 1, 2, 3 … rather
+    // than SQL's collation order of 1, 10, 11 … 2. The same function the chart uses to decide series
+    // order, for the same reason: lexicographic order on numbers is not what a reader expects.
+    for facet in &mut facets.attrs {
+        crate::store::read::sort_facet_values(&mut facet.values);
+    }
+    for facet in &mut facets.fields {
+        crate::store::read::sort_facet_values(&mut facet.values);
+    }
+    Ok(facets)
+}
+
 /// Everything a render of the explorer or of one full-page chart needs, from one connection.
 ///
 /// Shared by both handlers so the full-page view cannot disagree with the inline one about the window, the
 /// buckets or the series — they are the same chart at two sizes, and a second copy of this resolution
 /// order is how that would quietly stop being true.
 fn gather(conn: &rusqlite::Connection, p: &Explore, now: i64) -> anyhow::Result<ExploreData> {
-let types = crate::store::read::types(conn)?;
+    let types = crate::store::read::types(conn)?;
 
     // The window, in order of precedence: an explicit bound wins, then a preset, then the extent of
     // the data itself. `all` has to be a query, because the answer is a property of the rows.
@@ -318,47 +363,14 @@ let types = crate::store::read::types(conn)?;
     let window = if window.1 > window.0 { window } else { (window.0, window.0 + SEC) };
 
     let filter = p.filter(window, PAGE_LIMIT);
-    let mut facets = crate::store::read::facets(conn, &filter)?;
+    // **Only with a type.** Facets feed the attribute, field and grouping controls, and those are only
+    // offered once a type is chosen (see `filter_row`); without one, discovery would range over every type
+    // and be thrown away, on the page that is loaded most.
+    let facets = match p.kind {
+        Some(_) => discover_facets(conn, &filter)?,
+        None => Facets::default(),
+    };
     let bucket = bucket_nanos(window.0, window.1, SERIES_BUCKETS);
-
-    // **A key that is being filtered has its own filter excluded from its own options**, or the
-    // dropdown collapses to the one value already chosen and the filter becomes a one-way door. Only
-    // the actively-filtered keys need re-asking; for the rest the scoped answer is already right.
-    for (key, _) in &filter.attrs {
-        let widened = crate::store::read::facet_values_excluding(
-            conn,
-            &filter,
-            &FieldRef::Attribute(key.clone()),
-        )?;
-        match facets.attrs.iter_mut().find(|a| a.key == *key) {
-            Some(existing) => *existing = widened,
-            // The key is filtered but absent from the sample — a filter that matches nothing. Offering
-            // its other values is exactly how the reader gets back out.
-            None => facets.attrs.push(widened),
-        }
-    }
-    facets.attrs.sort_by(|a, b| a.key.cmp(&b.key));
-
-    // The same widening for body leaves: a filtered field's own options must not be narrowed by its own
-    // filter, whichever half of the measurement it lives in.
-    for (leaf, _) in &filter.body {
-        let widened =
-            crate::store::read::facet_values_excluding(conn, &filter, &FieldRef::Body(leaf.clone()))?;
-        if let Some(existing) = facets.fields.iter_mut().find(|f| f.name == *leaf) {
-            existing.values = widened.values;
-            existing.truncated = widened.truncated;
-        }
-    }
-
-    // Numerically where the values are numbers, so a dropdown of sixteen cells reads 1, 2, 3 … rather
-    // than SQL's collation order of 1, 10, 11 … 2. The same function the chart uses to decide series
-    // order, for the same reason: lexicographic order on numbers is not what a reader expects.
-    for facet in &mut facets.attrs {
-        crate::store::read::sort_facet_values(&mut facet.values);
-    }
-    for facet in &mut facets.fields {
-        crate::store::read::sort_facet_values(&mut facet.values);
-    }
 
     // The timeline: counts only, ungrouped, so it renders whatever the bodies contain.
     let timeline = crate::store::read::series(
@@ -486,11 +498,7 @@ fn filter_row(params: &Explore, data: &ExploreData) -> String {
     out.push_str(&html::select(
         "type",
         "type",
-        &data
-            .types
-            .iter()
-            .map(|t| (t.kind.clone(), format!("{} ({})", t.kind, t.count)))
-            .collect::<Vec<_>>(),
+        &data.types.iter().map(|t| (t.clone(), t.clone())).collect::<Vec<_>>(),
         params.kind.as_deref(),
         "any type",
     ));
@@ -615,7 +623,8 @@ fn render_explore(params: &Explore, data: &ExploreData) -> String {
     }
     if data.facets.capped {
         body.push_str(&html::note(&format!(
-            "Filter options come from the newest {} rows in range; filtering itself covers the whole range.",
+            "Options for body fields come from the newest {} rows in range; attribute options and filtering \
+             itself cover the whole range.",
             data.facets.scanned
         )));
     }
@@ -636,7 +645,8 @@ fn render_explore(params: &Explore, data: &ExploreData) -> String {
     body.push_str(&open_chart_link(params, None));
 
     // One plot per field, each with its own y axis. Fields that turned out to have no numeric values in
-    // range are reported rather than silently dropped.
+    // range are reported rather than silently dropped — given a type. Without one nothing is charted, as
+    // nothing is offered (see `gather`), and a `field` that arrived anyway is a stale link, not news.
     for chart in &data.charts {
         body.push_str(&format!("<h2>{}</h2>\n", html::escape(&chart.field)));
         body.push_str(&html::plot(&svg::value_chart(
@@ -652,7 +662,7 @@ fn render_explore(params: &Explore, data: &ExploreData) -> String {
         body.push_str(&chart_notes(chart, &chart.field));
         body.push_str(&open_chart_link(params, Some(&chart.field)));
     }
-    for field in &params.fields {
+    for field in params.fields.iter().filter(|_| params.kind.is_some()) {
         if !data.charts.iter().any(|c| &c.field == field) {
             body.push_str(&html::note(&format!(
                 "{field} has no numeric values in this range — the timeline above still shows when these \

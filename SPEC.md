@@ -745,7 +745,15 @@ that decides where a measurement's identity comes from, and the reason the *next
 be a one-line change rather than a scattered one.
 
 The join is skipped entirely for queries that read neither `type` nor `attributes` — it cannot remove a
-row, so omitting it is result-preserving, and it saves ~85 ms on a landing-page render.
+row, so omitting it is result-preserving, and it saves ~50 ms on the landing page's timeline.
+
+Queries about *series* rather than rows go the other way and start from `series`, reaching `measurement`
+only through a correlated lookup on `measurement_series_event_time_idx`: the explorer's type list, its
+attribute options, the `all` extent, and an attribute-grouped chart (§14.9). Their cost then follows the
+number of series rather than the number of rows, which is the one of the two that grows without bound. On
+a million-row table that took the type list from 90 ms to 3 ms and the extent from 42 ms to 0.25 ms.
+None of them read the `added_*` columns, which would be faster still but answer "what was ever added"
+rather than "what is here".
 
 ### 6.7.1 Foreign keys
 
@@ -1622,6 +1630,14 @@ The explorer (§14.9):
 - **A filtered attribute still offers its other values.** The regression test for a one-way filter: a
   key's options are discovered with that key's own filter excluded, so choosing `cell=2` does not leave
   `2` as the only thing selectable. The other filters still apply, so an option can never match nothing.
+- **Attribute options are exact.** A value whose only row lies behind a full body sample is still offered
+  — the regression test for what sampling attributes used to miss. A series with no row in the window is
+  not, and a body filter narrows them to the series with a matching row. The type list leaves out a type
+  whose rows have all been deleted, though its series remain.
+- **The `all` extent stays a handful of index seeks**, with and without a type or attribute filter. Pinned
+  on SQLite's VM step count over a thousand rows, since the obvious `min(x), max(x)` simplification would
+  walk every row and change no result. The extent folds across a type's series and never reaches another
+  type's. An attribute-grouped chart honours every filter in its per-series form.
 - Two ticked fields render two plots with two headings and three SVGs in total; the control is checkboxes,
   not a multi-select. "One line per" appears only once something is being charted.
 - `/chart` renders **both** geometries and exactly one pair; each mark is a link carrying its own bucket
@@ -2382,6 +2398,13 @@ link that can be bookmarked or pasted, which is worth more here than it costs.
 plots and the table re-render against the same slice, so the numbers below always agree with the picture
 above; per-chart filters would let them disagree.
 
+The type list is every type that still has rows, by name and **without counts**. A count was a walk over
+every row in the table on every render — the most expensive query on the page, and one that grew with the
+database's age rather than with the window — and `series.added_measurements`, the cheap alternative,
+stops meaning "rows here" the moment anything deletes one (§6.7). Nothing that needs a type is computed
+without one: the attribute, field and grouping controls are only offered once a type is chosen, so their
+discovery is skipped on the landing page.
+
 Two details that only exist because there is no JavaScript:
 
 - **An empty value is not a filter.** A `GET` form submits every control it holds, so an unset `<select>`
@@ -2397,20 +2420,26 @@ in a filter name deserves an error; a person following a stale bookmark deserves
 
 #### Facets: what there is to filter on
 
-Discovery reads the newest `FACET_SCAN_LIMIT` (2000) rows **matching the current type, window and
-already-applied filters** — not the whole table, and not globally.
+Discovery is scoped to the slice — **the current type, window and already-applied filters** — not the
+whole table, and not globally. That is more useful *and* cheaper than a global list: a dropdown can never
+offer an option that matches nothing in view.
 
-Scoping to the current slice is more useful *and* cheaper than a global list: a dropdown can never offer
-an option that matches nothing in view, and the cost is bounded by the window already being queried.
-Sampling rather than scanning is about growth, not about today — a full scan of the largest type measures
-145 ms now, but this host projects millions of rows a year, and the same page would take seconds within a
-year of running. What makes it sound is that **attribute keys are uniform per type**: all 32,112
-`bms.status.cell` rows carry the same twelve keys, so a few hundred rows reveal every one.
+The two halves of a measurement are discovered differently, because they live in different places:
 
-**Only discovery is sampled. Filtering is always exact** over the whole window — facets populate the
-controls, they never restrict what a query returns. When the cap is reached the page says so, because
-distinct *values* can be missed where keys cannot: a device that stopped reporting early in a long
-window.
+- **Attribute options are exact.** Attributes belong to the series (§6.7), so "which values occur in this
+  slice" is "which series have a row in it": the `series` rows passing the type and attribute filters, each
+  confirmed by one index probe for a row in the window. That costs per series rather than per row — 2.5 ms
+  against 31 ms for the sample it replaced, on a million rows — and it is complete, where the sample could
+  miss a device that stopped reporting early in a long window. A body filter turns each probe into a walk
+  until a matching row, bounded by the rows in the window.
+- **Body-leaf options are a sample**: the newest `FACET_SCAN_LIMIT` (2000) matching rows. A leaf belongs to
+  each row, so discovering one means reading rows, and a full scan of the largest type measures 145 ms now
+  but grows with a table projected at millions of rows a year. What makes sampling sound is that **body
+  shape is uniform per type**, so a few hundred rows reveal every leaf.
+
+**Only body discovery is sampled. Filtering is always exact** over the whole window — facets populate the
+controls, they never restrict what a query returns. When the sample's cap is reached the page says so,
+because distinct body *values* can be missed where keys cannot.
 
 A key with more distinct values than a dropdown can carry (`MAX_FACET_VALUES`, 40 — a boot id, a clock
 correction in nanoseconds) is offered as a text box instead. Nested attributes are not offered at all,

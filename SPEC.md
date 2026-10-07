@@ -446,20 +446,20 @@ Which OTLP value type to use, given all of the above:
 
 ## 6. Storage
 
-SQLite, one file, one table.
+SQLite, one file. `measurement` as of 4.2; `series` is §6.7, `api_key` §13 and the web tables §14.8.
 
 ```sql
 CREATE TABLE measurement (
-  id             BLOB    PRIMARY KEY, -- content hash (§6.6); INSERT OR IGNORE makes ingest idempotent
+  id             BLOB    NOT NULL,  -- content hash (§6.6)
   event_time     INTEGER NOT NULL,  -- nanoseconds since Unix epoch
   processed_time INTEGER NOT NULL,  -- nanoseconds since Unix epoch
-  type           TEXT    NOT NULL,
   body           TEXT,              -- JSON, NULL when the record had no body
-  attributes     TEXT    NOT NULL DEFAULT '{}'
+  series_id      BLOB    NOT NULL REFERENCES series(id) DEFERRABLE INITIALLY DEFERRED  -- §6.7
 ) STRICT;
 
-CREATE INDEX measurement_type_event_time_idx ON measurement (type, event_time DESC, id DESC);
-CREATE INDEX measurement_event_time_idx      ON measurement (event_time DESC, id DESC);
+-- Unique: what INSERT OR IGNORE deduplicates on, which makes ingest idempotent (§6.6, §6.8).
+CREATE UNIQUE INDEX measurement_event_time_idx        ON measurement (event_time, id);
+CREATE INDEX        measurement_series_event_time_idx ON measurement (series_id, event_time, id);
 ```
 
 - `STRICT` so the column types are enforced rather than advisory.
@@ -471,8 +471,9 @@ CREATE INDEX measurement_event_time_idx      ON measurement (event_time DESC, id
 - `body` and `attributes` are JSON text, queryable with SQLite's JSON1 functions
   (`json_extract`, `json_each`). Validity is enforced by construction — only the serializer
   writes these columns — not by a `CHECK` constraint, which would cost a parse per insert.
-- The two indexes serve the read API's ordering (`event_time DESC, id DESC`), with and without a
-  `type` filter.
+- The two indexes serve the read API's ordering (`event_time DESC, id DESC`, which is either index read
+  backwards), with and without a series filter. Why they ascend, and why the time index is the unique
+  one: §6.8.
 
 ### 6.1 Connection setup
 
@@ -519,6 +520,11 @@ a migration, and accepting a newer minor is only sound while it holds. A minor b
   That binary's `INSERT` does not name the column, so the column must be satisfiable without it. (On a
   STRICT table `ADD COLUMN` requires a declared type, and a `NOT NULL` addition requires a non-null
   default — consistent with this rule.)
+- rebuild a table to change only how it is stored — its indexes, their order, which of them enforces
+  uniqueness — keeping every column, and refusing exactly the rows it refused before. An older binary's
+  `INSERT` names the same columns and is deduplicated the same way, so it cannot tell. The rebuild's own
+  `DROP TABLE` and `RENAME` leave the same table under the same name, so they are not the drop and
+  rename ruled out below.
 
 Everything else is a major bump: dropping or renaming a table or column, changing a column's type,
 adding a constraint an older binary's writes could violate, adding `NOT NULL` without a default, or
@@ -561,6 +567,7 @@ The versions that exist:
 | 3.3 | `measurement_series_event_time_idx`, for the read path's move onto the join (§6.7) | **minor** — the risky half of 4.0, done where it can be reverted |
 | 4.0 | `measurement` rebuilt without `type`/`attributes`, `series_id NOT NULL` + foreign key, `web_session.username` foreign key, foreign keys enabled (§6.7) | **major**, and the second in this project's life |
 | 4.1 | `web_passkey` (§14.10) | **minor** — a 4.0 binary ignores it, and its users' passwords still work |
+| 4.2 | `measurement` rebuilt: unique on `(event_time, id)` instead of `id`, both indexes ascending (§6.8) | **minor** — the first rebuild that is one: a 4.1 binary's insert is deduplicated the same way and its queries plan the same |
 
 ### 6.3 Write path
 
@@ -599,7 +606,12 @@ Three consequences worth recording now, since they constrain choices made here:
 ### 6.6 Content-addressed ids and duplicate handling
 
 **The id is a hash of what the device sent**, so uploading the same measurement twice is a no-op:
-`INSERT OR IGNORE` on the primary key. Ingest is idempotent.
+`INSERT OR IGNORE` against the unique index on `(event_time, id)`. Ingest is idempotent.
+
+Since 4.2 that index rather than `id` alone carries the uniqueness, and it refuses the same rows: the id
+hashes `event_time`, so two measurements with the same id have the same time. The one difference is a
+collision between two *different* times, which now stores both rather than silently dropping one. Why
+the index moved: §6.8.
 
 This is not decoration. The platform's own design invites retries. §4.1 returns a *retryable* `503`
 on storage failure precisely so a device does not discard its only copy, and §6.3 has the handler
@@ -791,6 +803,57 @@ silently unenforced. So it is set in `apply_pragmas`, in `open_write_existing`, 
 have the constraints live. `apply_foreign_keys` then *reads the pragma back* and fails if it did not take,
 because it is a silent no-op inside a transaction. `open_read` deliberately does not set it: a read-only
 connection cannot violate a constraint.
+
+### 6.8 What an insert writes
+
+**Measured on the deployed host at 4.1** (SD card, ~2.3M rows): a 534,133-row import grew the file by
+248 MB, and the receiver wrote 6.3 GB to do it — 12.2 GB at the block layer, 18 minutes at ~6 s per
+3,000-row batch, on 53 s of CPU. In steady state it wrote ~19.5 KB per stored row, ~613 MiB a day.
+
+**The cost is pages, not rows.** A commit writes every page it dirtied to the WAL, and the checkpoint
+writes each again into the file, as scattered 4 KB writes — an SD card's slowest operation. So what
+matters is how many distinct pages a batch touches:
+
+| structure | where a row lands | pages per batch |
+|---|---|---|
+| the table | the end (rowid order) | a few |
+| `measurement_event_time_idx` | one insertion point | a few |
+| `measurement_series_event_time_idx` | one insertion point *per series* | ~one per series in the batch |
+| `id`'s own unique index, until 4.2 | a random page: `id` is a hash | **~one per row** |
+
+4.1's `id BLOB PRIMARY KEY` carried that last one as an implicit index. 4.2 rebuilt `measurement` without
+it and moved uniqueness onto the time index, which refuses the same rows (§6.6). The series index is most
+of what remains, and 4.2 does not change it.
+
+**Both indexes ascend since 4.2.** Rows arrive in time order. An ascending index takes them at its right
+edge, where SQLite's page balancing leaves full pages behind; a descending one takes them at its left
+edge, where it leaves pages about half full. Measured rather than derived — SQLite's append fast path
+(`balance_quick`) is for rowid tables only, so this is the general split. Reads do not care which way an
+index runs: `ORDER BY event_time DESC, id DESC` reads it backwards, and every query plans as before.
+
+**Simulated**, with Python's `sqlite3` and the receiver's pragmas: prefilled to the host's size (85k
+readings of 20 rows, 75 devices × 20 series), then the import (176 batches of ~3,035 rows at older
+timestamps), then 1,000 live batches of 20 rows, counting `wchar`.
+
+| | 4.1 | 4.2 |
+|---|---|---|
+| import, all from one device's series | 5.18 GiB | 0.52 GiB |
+| import, spread over every device's series | 10.04 GiB | 5.00 GiB |
+| live, per stored row | 27–30 KB | 17–18 KB |
+| index pages filled, grown by inserts | 50–57% | ~88% |
+
+The import's gain depends on how many series a batch spans, which the host's 6.3 GB does not settle —
+both models land near it. The live gain, about 40%, is the one that recurs.
+
+**What the rebuild costs**, on the simulated 964 MiB database: 4.7 GiB written, and the file grew to
+1,556 MiB. The old table's ~780 MiB of pages go onto the freelist and are reused by later inserts rather
+than returned to the filesystem, so the file does not shrink, and there is no `VACUUM`: it cannot run in
+the migration's transaction, and the space is reused anyway. The `-wal` file is left about as large as
+the file itself, 1.6 GB, until the writer's `wal_checkpoint(TRUNCATE)` at the next clean stop. So the
+host needs ~2.2 GB free while it runs, and the start-timeout extension (§9.2) is what lets it finish.
+
+The rebuild packs both indexes whichever way they run; ascending is about how they grow after it. Over
+the next 400k simulated rows they grew ~40% less than descending ones.
 
 ## 7. Read API
 
@@ -1513,6 +1576,11 @@ Unit tests (pure functions, no I/O):
   test. The tables 4.0 did not touch still take the same writes.
 - STRICT survives the 4.0 rebuild — a rebuilt table that forgot it would silently start accepting
   anything.
+- **4.2** (§6.8): `measurement`'s whole index list is asserted — unique on `(event_time, id)`, both
+  indexes ascending, nothing keyed on `id` alone and `id` not a primary key — so an index that comes back
+  on `id` fails it. A 4.1 database's rows survive the rebuild unchanged, and it ends with the same
+  indexes a fresh one gets. The 4.1 binary's verbatim `INSERT` still deduplicates against 4.2 and keeps
+  the first arrival's `processed_time`, which is the property that makes 4.2 a minor.
 - Series identity (§6.7): attribute order and nested-object order do not change a `series_id`; both
   halves of the key do; a series id is domain-separated from the measurement id of the same inputs;
   field boundaries are unambiguous, so `("ab", {"c":…})` and `("a", {"bc":…})` differ; and the encoding
@@ -2018,8 +2086,9 @@ fail as soon as another case is added, which is a needlessly confusing way to fi
   "what arrived in the last hour" is not answerable through the API, and a device with a wrong clock
   is invisible to every query — the operational counterpart of the clock discussion above. Deferred
   deliberately for the PoC; inspect arrivals with the `sqlite3` CLI meanwhile. Adding it later is
-  `received_from`/`received_to` plus an index on `(processed_time DESC, id DESC)`, which leaves the
-  pagination cursor keyed on `event_time` and so changes nothing already specified.
+  `received_from`/`received_to` plus an index on `(processed_time, id)` — ascending, as §6.8 explains
+  for a key that only grows — which leaves the pagination cursor keyed on `event_time` and so changes
+  nothing already specified.
 - Attribute filtering is exact-match only. Range and prefix queries on attributes will need either
   the JSON1 expression indexes hinted at in §6, or the normalized attribute table that was
   considered and deferred.

@@ -81,7 +81,7 @@ impl std::fmt::Display for Version {
 }
 
 /// Schema version this binary understands. Tracked in `PRAGMA user_version`.
-pub const SCHEMA_VERSION: Version = Version::new(4, 1);
+pub const SCHEMA_VERSION: Version = Version::new(4, 2);
 
 /// A compile-time guard, not a test, because it is an invariant about a constant and a build is the right
 /// place to lose an argument with one.
@@ -129,6 +129,11 @@ struct Migration {
 ///   That binary's `INSERT` does not name the column, so the column has to be satisfiable without it.
 ///   (On a STRICT table `ADD COLUMN` requires a declared type, and a `NOT NULL` addition requires a
 ///   non-null default — consistent with this rule.)
+/// - rebuild a table to change only how it is stored — its indexes, their order, which of them
+///   enforces uniqueness — keeping every column, and refusing exactly the rows it refused before.
+///   An older binary's `INSERT` names the same columns and is deduplicated the same way, so it
+///   cannot tell. The rebuild's own `DROP TABLE` and `RENAME` leave the same table under the same
+///   name, so they are not the drop and rename ruled out below. 4.2 is the one so far.
 ///
 /// Everything else is a major bump: dropping or renaming a table or column, changing a column's type,
 /// adding a constraint an older binary's writes could violate, adding `NOT NULL` without a default,
@@ -460,6 +465,55 @@ const MIGRATIONS: &[Migration] = &[
     ) STRICT;
 
     CREATE INDEX web_passkey_username_idx ON web_passkey (username);
+    "#,
+    },
+    // → version 4.2: `measurement` stops writing a random page per row (SPEC §6.8).
+    //
+    // `id BLOB PRIMARY KEY` gave `id` a unique index of its own, and `id` is a hash: the one structure in
+    // the file keyed at random, so every insert dirtied a page of it nowhere near the last. On the deployed
+    // host that was most of the 6.3 GB written for a 248 MB import and, simulated, ~40% of the ~19.5 KB
+    // written per stored row. Here `id` is a plain column and the time index enforces uniqueness instead.
+    //
+    // **`(event_time, id)` refuses exactly the rows `id` alone did.** `id` hashes `event_time`
+    // (`crate::content_id`), so two rows with the same id have the same time, and `INSERT OR IGNORE`
+    // deduplicates as before. The one difference is a 128-bit collision between two *different* times,
+    // which now stores both rather than silently dropping one.
+    //
+    // `CREATE UNIQUE INDEX` under the old name rather than a table-level `UNIQUE (event_time, id)`: that
+    // would be an autoindex named `sqlite_autoindex_measurement_1`, which is what the id index was called.
+    //
+    // **Both indexes ascend.** Rows arrive in time order, so an ascending index grows at its right edge and
+    // leaves full pages behind it; a descending one grows at its left edge, where SQLite's page splits leave
+    // pages about half full. Reads do not notice: SQLite scans an index in either direction, so `ORDER BY
+    // event_time DESC, id DESC` is the same index read backwards, and every query plans as before.
+    //
+    // **A minor bump** — the first rebuild that is one; see the rule above `MIGRATIONS`. A 4.1 binary the
+    // nightly reverts to inserts the same columns, is deduplicated the same way and plans the same queries.
+    //
+    // The rest is 4.0's rebuild, for the same reasons, and as self-verifying: every row's `series_id` is
+    // checked again at `COMMIT`. `DROP TABLE` of a table holding a deferred key only deletes row by row if a
+    // violation is outstanding, and none is. It rewrites the whole table, so it runs under the start
+    // timeout `serve` extends for it (SPEC §9.2). The file grows by about the size of the rebuilt table,
+    // and the old pages are reused by later inserts rather than returned to the filesystem: no `VACUUM`.
+    Migration {
+        version: Version::new(4, 2),
+        sql: r#"
+    CREATE TABLE measurement_new (
+      id             BLOB    NOT NULL,
+      event_time     INTEGER NOT NULL,
+      processed_time INTEGER NOT NULL,
+      body           TEXT,
+      series_id      BLOB    NOT NULL REFERENCES series(id) DEFERRABLE INITIALLY DEFERRED
+    ) STRICT;
+
+    INSERT INTO measurement_new (id, event_time, processed_time, body, series_id)
+      SELECT id, event_time, processed_time, body, series_id FROM measurement;
+
+    DROP TABLE measurement;
+    ALTER TABLE measurement_new RENAME TO measurement;
+
+    CREATE UNIQUE INDEX measurement_event_time_idx        ON measurement (event_time, id);
+    CREATE INDEX        measurement_series_event_time_idx ON measurement (series_id, event_time, id);
     "#,
     },
 ];
@@ -830,7 +884,8 @@ mod tests {
         assert_eq!(stored_version(&conn), SCHEMA_VERSION.encode());
         assert!(has_table(&conn, "api_key"), "3.0 must have run too");
 
-        // `id` must now be a BLOB primary key, which is what makes INSERT OR IGNORE deduplicate.
+        // `id` must now be a BLOB holding the content hash, which is what INSERT OR IGNORE deduplicates on
+        // (alone until 4.2, with `event_time` since).
         let ty: String = conn
             .query_row(
                 "SELECT type FROM pragma_table_info('measurement') WHERE name='id'",
@@ -1026,5 +1081,141 @@ mod tests {
             err.to_string().contains("cannot store TEXT value in INTEGER column"),
             "STRICT should have refused the insert; got: {err}"
         );
+    }
+
+    // ------------------------------------------------------------------------------- 4.2
+
+    /// The 4.1 binary's insert, verbatim. A binary the nightly reverts to sends exactly this against a 4.2
+    /// database, which is what makes 4.2 a minor (SPEC §6.2).
+    const INSERT_4_1: &str = "INSERT OR IGNORE INTO measurement \
+                              (id, event_time, processed_time, body, series_id) \
+                              VALUES (?1, ?2, ?3, ?4, ?5)";
+
+    /// A database as the 4.1 binary left it, so 4.2 is tested on the path a real upgrade takes.
+    fn database_at_4_1() -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        for migration in MIGRATIONS.iter().filter(|m| m.version <= Version::new(4, 1)) {
+            conn.execute_batch(migration.sql).unwrap();
+        }
+        conn.pragma_update(None, "user_version", Version::new(4, 1).encode()).unwrap();
+        conn
+    }
+
+    fn add_series(conn: &Connection, id: &[u8]) {
+        conn.execute("INSERT INTO series VALUES (?1, 'cpu', '{}', 1, 1, 1, 1, 1)", [id]).unwrap();
+    }
+
+    /// An index as `(name, unique, [(column, descending)])`.
+    type IndexShape = (String, bool, Vec<(String, bool)>);
+
+    /// Every index on `measurement`.
+    fn measurement_indexes(conn: &Connection) -> Vec<IndexShape> {
+        let mut indexes = conn
+            .prepare(r#"SELECT name, "unique" FROM pragma_index_list('measurement') ORDER BY name"#)
+            .unwrap();
+        let mut columns = conn
+            .prepare("SELECT name, desc FROM pragma_index_xinfo(?1) WHERE key = 1 ORDER BY seqno")
+            .unwrap();
+        indexes
+            .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, bool>(1)?)))
+            .unwrap()
+            .map(|index| {
+                let (name, unique) = index.unwrap();
+                let cols = columns
+                    .query_map([&name], |r| Ok((r.get(0)?, r.get(1)?)))
+                    .unwrap()
+                    .map(Result::unwrap)
+                    .collect();
+                (name, unique, cols)
+            })
+            .collect()
+    }
+
+    /// **What 4.2 is for** (SPEC §6.8): nothing on `measurement` is keyed by `id` alone, the time index is
+    /// what enforces uniqueness, and both indexes ascend. Asserted as the whole index list, so an index
+    /// that comes back on `id` — an autoindex from a restored `PRIMARY KEY`, say — fails it.
+    #[test]
+    fn measurement_is_unique_on_time_and_id_and_its_indexes_ascend() {
+        let conn = Connection::open_in_memory().unwrap();
+        migrate(&conn).unwrap();
+
+        let col = |name: &str| (name.to_owned(), false);
+        assert_eq!(
+            measurement_indexes(&conn),
+            [
+                ("measurement_event_time_idx".to_owned(), true, vec![col("event_time"), col("id")]),
+                (
+                    "measurement_series_event_time_idx".to_owned(),
+                    false,
+                    vec![col("series_id"), col("event_time"), col("id")]
+                ),
+            ]
+        );
+        let pk: i64 = conn
+            .query_row("SELECT pk FROM pragma_table_info('measurement') WHERE name = 'id'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(pk, 0, "`id` must not be a primary key again");
+    }
+
+    /// The rebuild carries every row across unchanged, and leaves exactly the structure a fresh database
+    /// gets — the upgrade and the fresh install must not end up as two different schemas.
+    #[test]
+    fn migrating_from_4_1_keeps_every_row() {
+        let conn = database_at_4_1();
+        add_series(&conn, b"s1");
+        add_series(&conn, b"s2");
+        for (id, event_time, body, series) in [
+            (&b"m1"[..], 10, Some("{\"v\":1}"), &b"s1"[..]),
+            (&b"m2"[..], 10, None, &b"s2"[..]),
+            (&b"m3"[..], 20, Some("{}"), &b"s1"[..]),
+        ] {
+            conn.execute(INSERT_4_1, rusqlite::params![id, event_time, event_time + 1, body, series])
+                .unwrap();
+        }
+        type Row = (Vec<u8>, i64, i64, Option<String>, Vec<u8>);
+        let rows = |conn: &Connection| -> Vec<Row> {
+            conn.prepare(
+                "SELECT id, event_time, processed_time, body, series_id FROM measurement ORDER BY id",
+            )
+            .unwrap()
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect()
+        };
+        let before = rows(&conn);
+
+        migrate(&conn).unwrap();
+
+        assert_eq!(stored_version(&conn), Version::new(4, 2).encode());
+        assert_eq!(rows(&conn), before);
+        let fresh = Connection::open_in_memory().unwrap();
+        migrate(&fresh).unwrap();
+        assert_eq!(measurement_indexes(&conn), measurement_indexes(&fresh));
+    }
+
+    /// **A reverted 4.1 binary still deduplicates**, which is the whole case for 4.2 being a minor. Its
+    /// insert used to meet the primary key and now meets the unique time index, and a retry must still
+    /// store nothing — nor move the first arrival's `processed_time`.
+    #[test]
+    fn a_4_1_binarys_insert_still_deduplicates_against_4_2() {
+        let conn = Connection::open_in_memory().unwrap();
+        migrate(&conn).unwrap();
+        add_series(&conn, b"s1");
+        let insert = |id: &[u8], processed_time: i64| {
+            conn.execute(INSERT_4_1, rusqlite::params![id, 10, processed_time, "{}", &b"s1"[..]])
+                .unwrap()
+        };
+
+        assert_eq!(insert(b"m1", 100), 1);
+        assert_eq!(insert(b"m1", 999), 0, "a retry must store nothing");
+        assert_eq!(insert(b"m2", 100), 1, "a distinct measurement at the same time still stores");
+
+        let pt: i64 = conn
+            .query_row("SELECT processed_time FROM measurement WHERE id = x'6d31'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(pt, 100, "first arrival wins");
     }
 }

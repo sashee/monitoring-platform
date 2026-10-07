@@ -236,8 +236,8 @@ fn where_sql(clauses: &[String]) -> String {
 
 /// Builds the SELECT and its bound parameters.
 ///
-/// Ordering is always `event_time DESC, id DESC`, matching both indexes, with `id` breaking ties so
-/// pagination stays stable when timestamps collide.
+/// Ordering is always `event_time DESC, id DESC`, which is both indexes read backwards (they ascend since
+/// 4.2), with `id` breaking ties so pagination stays stable when timestamps collide.
 pub fn build_query(spec: &QuerySpec) -> (String, Vec<SqlValue>) {
     let mut sql = format!(
         "SELECT m.id, m.event_time, m.processed_time, sr.type, m.body, sr.attributes \

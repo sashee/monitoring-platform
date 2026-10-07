@@ -16,13 +16,16 @@
 //! about the query string, re-read on every request and re-rendered into the controls. That makes every
 //! view a link you can bookmark or paste, which is worth more here than it costs.
 
+pub mod account;
 pub mod html;
 pub mod origin;
+pub mod passkey;
+pub mod passkey_page;
 pub mod session;
 pub mod svg;
 
 use axum::extract::{Form, Query, Request, State};
-use axum::http::{StatusCode, header};
+use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Extension, Router};
@@ -32,7 +35,7 @@ use crate::AppState;
 use crate::api::query::format_nanos;
 use crate::model::StoredMeasurement;
 use crate::store::read::{
-    Facets, FieldRef, MAX_SERIES, Point, QuerySpec, Series, SeriesSpec, TypeCount, bucket_nanos,
+    Facets, FieldRef, MAX_SERIES, Point, QuerySpec, Series, SeriesSpec, bucket_nanos,
 };
 use session::Identity;
 
@@ -52,13 +55,16 @@ const DAY: i64 = 24 * HOUR;
 ///
 /// Presets rather than only a pair of date fields, because the range is the control every reader reaches
 /// for first and nobody wants to type two timestamps to see the last hour.
+///
+/// Labelled as lengths, not as "last 24 hours": a preset ends now only until the reader steps back (see
+/// [`steps`]), and then a label claiming "last" would contradict the heading under it.
 const RANGES: &[(&str, &str, i64)] = &[
-    ("15m", "last 15 min", 15 * MINUTE),
-    ("1h", "last hour", HOUR),
-    ("6h", "last 6 hours", 6 * HOUR),
-    ("24h", "last 24 hours", DAY),
-    ("7d", "last 7 days", 7 * DAY),
-    ("30d", "last 30 days", 30 * DAY),
+    ("15m", "15 min", 15 * MINUTE),
+    ("1h", "1 hour", HOUR),
+    ("6h", "6 hours", 6 * HOUR),
+    ("24h", "24 hours", DAY),
+    ("7d", "7 days", 7 * DAY),
+    ("30d", "30 days", 30 * DAY),
     ("all", "all time", 0),
 ];
 const DEFAULT_RANGE: &str = "24h";
@@ -82,6 +88,10 @@ pub fn routers(state: AppState) -> (Router<AppState>, Router<AppState>) {
         .route("/keys/delete", post(delete_key))
         .route("/sessions", get(sessions))
         .route("/sessions/end", post(end_session))
+        .route("/account", get(account::account))
+        .route("/account/passkeys/create", post(account::add_passkey))
+        .route("/account/passkeys/delete", post(account::remove_passkey))
+        .route("/account/password/remove", post(account::remove_password))
         .route("/logout", post(logout))
         .layer(axum::middleware::from_fn_with_state(state, session::guard))
         // Outside the session layer, so a forged POST is refused before its cookie is even looked up.
@@ -93,6 +103,7 @@ pub fn routers(state: AppState) -> (Router<AppState>, Router<AppState>) {
     // carries the origin check.
     let open = Router::new()
         .route("/login", get(login_form).post(login))
+        .route("/login/passkey", post(passkey_login))
         .route_layer(axum::middleware::from_fn::<_, (Request,)>(origin::guard));
 
     (guarded, open)
@@ -174,13 +185,17 @@ struct Explore {
 fn parse_explore(raw: &[(String, String)]) -> Explore {
     let mut out = Explore { range: DEFAULT_RANGE.to_owned(), ..Default::default() };
     let mut previous_kind = None;
+    let mut range_given = false;
 
     for (key, value) in raw {
         if value.is_empty() {
             continue;
         }
         match key.as_str() {
-            "range" => out.range = value.clone(),
+            "range" => {
+                out.range = value.clone();
+                range_given = true;
+            }
             "from" => out.from = parse_instant(value),
             "to" => out.to = parse_instant(value),
             "type" => out.kind = Some(value.clone()),
@@ -222,6 +237,29 @@ fn parse_explore(raw: &[(String, String)]) -> Explore {
         out.hidden.clear();
         out.cursor = None;
     }
+
+    // **A window has one of three shapes, and a bound that does not belong to its shape is dropped.**
+    //
+    // - `custom`: both ends, `from` and `to` — a chart's drill-down link, or a step from one.
+    // - A preset: its own length, ending at `to`, or now when there is no `to`.
+    // - `all`: the data's extent, so neither bound means anything.
+    //
+    // This is what lets the filter form carry the window (see `filter_row`) without the window overriding
+    // the reader's next choice. Picking `7 days` after a drill-down submits `range=7d` beside the old `from`
+    // and `to`; with `from` dropped, that is seven days ending where the reader was, rather than a custom
+    // window silently winning over the preset they just picked. The form's blank range option submits no
+    // range at all, so a `from` arriving without one is a custom window being carried forward.
+    if !range_given && out.from.is_some() {
+        out.range = "custom".to_owned();
+    }
+    match out.range.as_str() {
+        "custom" => {}
+        "all" => {
+            out.from = None;
+            out.to = None;
+        }
+        _ => out.from = None,
+    }
     out
 }
 
@@ -254,9 +292,12 @@ impl Explore {
 /// snapshot, and separate tasks could each see a different one — the chart would then describe rows the
 /// table does not list.
 struct ExploreData {
-    types: Vec<TypeCount>,
+    types: Vec<String>,
     facets: Facets,
     window: (i64, i64),
+    /// The instant `window` was resolved against — what "live" meant for this render, and so what
+    /// [`steps`] measures a step later against.
+    now: i64,
     bucket: i64,
     timeline: Vec<Point>,
     /// One entry per chosen field: the field, its series, and how many groups exist for it.
@@ -278,13 +319,58 @@ struct Chart {
     total_groups: usize,
 }
 
+/// What the filter row offers for one slice: its attributes and body fields, each with its options.
+fn discover_facets(conn: &rusqlite::Connection, filter: &QuerySpec) -> anyhow::Result<Facets> {
+    let mut facets = crate::store::read::facets(conn, filter)?;
+
+    // **A key that is being filtered has its own filter excluded from its own options**, or the
+    // dropdown collapses to the one value already chosen and the filter becomes a one-way door. Only
+    // the actively-filtered keys need re-asking; for the rest the scoped answer is already right.
+    for (key, _) in &filter.attrs {
+        let widened = crate::store::read::facet_values_excluding(
+            conn,
+            filter,
+            &FieldRef::Attribute(key.clone()),
+        )?;
+        match facets.attrs.iter_mut().find(|a| a.key == *key) {
+            Some(existing) => *existing = widened,
+            // The key is filtered but absent from the slice — a filter that matches nothing. Offering
+            // its other values is exactly how the reader gets back out.
+            None => facets.attrs.push(widened),
+        }
+    }
+    facets.attrs.sort_by(|a, b| a.key.cmp(&b.key));
+
+    // The same widening for body leaves: a filtered field's own options must not be narrowed by its own
+    // filter, whichever half of the measurement it lives in.
+    for (leaf, _) in &filter.body {
+        let widened =
+            crate::store::read::facet_values_excluding(conn, filter, &FieldRef::Body(leaf.clone()))?;
+        if let Some(existing) = facets.fields.iter_mut().find(|f| f.name == *leaf) {
+            existing.values = widened.values;
+            existing.truncated = widened.truncated;
+        }
+    }
+
+    // Numerically where the values are numbers, so a dropdown of sixteen cells reads 1, 2, 3 … rather
+    // than SQL's collation order of 1, 10, 11 … 2. The same function the chart uses to decide series
+    // order, for the same reason: lexicographic order on numbers is not what a reader expects.
+    for facet in &mut facets.attrs {
+        crate::store::read::sort_facet_values(&mut facet.values);
+    }
+    for facet in &mut facets.fields {
+        crate::store::read::sort_facet_values(&mut facet.values);
+    }
+    Ok(facets)
+}
+
 /// Everything a render of the explorer or of one full-page chart needs, from one connection.
 ///
 /// Shared by both handlers so the full-page view cannot disagree with the inline one about the window, the
 /// buckets or the series — they are the same chart at two sizes, and a second copy of this resolution
 /// order is how that would quietly stop being true.
 fn gather(conn: &rusqlite::Connection, p: &Explore, now: i64) -> anyhow::Result<ExploreData> {
-let types = crate::store::read::types(conn)?;
+    let types = crate::store::read::types(conn)?;
 
     // The window, in order of precedence: an explicit bound wins, then a preset, then the extent of
     // the data itself. `all` has to be a query, because the answer is a property of the rows.
@@ -318,47 +404,14 @@ let types = crate::store::read::types(conn)?;
     let window = if window.1 > window.0 { window } else { (window.0, window.0 + SEC) };
 
     let filter = p.filter(window, PAGE_LIMIT);
-    let mut facets = crate::store::read::facets(conn, &filter)?;
+    // **Only with a type.** Facets feed the attribute, field and grouping controls, and those are only
+    // offered once a type is chosen (see `filter_row`); without one, discovery would range over every type
+    // and be thrown away, on the page that is loaded most.
+    let facets = match p.kind {
+        Some(_) => discover_facets(conn, &filter)?,
+        None => Facets::default(),
+    };
     let bucket = bucket_nanos(window.0, window.1, SERIES_BUCKETS);
-
-    // **A key that is being filtered has its own filter excluded from its own options**, or the
-    // dropdown collapses to the one value already chosen and the filter becomes a one-way door. Only
-    // the actively-filtered keys need re-asking; for the rest the scoped answer is already right.
-    for (key, _) in &filter.attrs {
-        let widened = crate::store::read::facet_values_excluding(
-            conn,
-            &filter,
-            &FieldRef::Attribute(key.clone()),
-        )?;
-        match facets.attrs.iter_mut().find(|a| a.key == *key) {
-            Some(existing) => *existing = widened,
-            // The key is filtered but absent from the sample — a filter that matches nothing. Offering
-            // its other values is exactly how the reader gets back out.
-            None => facets.attrs.push(widened),
-        }
-    }
-    facets.attrs.sort_by(|a, b| a.key.cmp(&b.key));
-
-    // The same widening for body leaves: a filtered field's own options must not be narrowed by its own
-    // filter, whichever half of the measurement it lives in.
-    for (leaf, _) in &filter.body {
-        let widened =
-            crate::store::read::facet_values_excluding(conn, &filter, &FieldRef::Body(leaf.clone()))?;
-        if let Some(existing) = facets.fields.iter_mut().find(|f| f.name == *leaf) {
-            existing.values = widened.values;
-            existing.truncated = widened.truncated;
-        }
-    }
-
-    // Numerically where the values are numbers, so a dropdown of sixteen cells reads 1, 2, 3 … rather
-    // than SQL's collation order of 1, 10, 11 … 2. The same function the chart uses to decide series
-    // order, for the same reason: lexicographic order on numbers is not what a reader expects.
-    for facet in &mut facets.attrs {
-        crate::store::read::sort_facet_values(&mut facet.values);
-    }
-    for facet in &mut facets.fields {
-        crate::store::read::sort_facet_values(&mut facet.values);
-    }
 
     // The timeline: counts only, ungrouped, so it renders whatever the bodies contain.
     let timeline = crate::store::read::series(
@@ -446,7 +499,7 @@ let types = crate::store::read::types(conn)?;
     let more = rows.len() as i64 > PAGE_LIMIT;
     rows.truncate(PAGE_LIMIT as usize);
 
-    Ok(ExploreData { types, facets, window, bucket, timeline, charts, rows, more })
+    Ok(ExploreData { types, facets, window, now, bucket, timeline, charts, rows, more })
 }
 
 async fn explore(State(state): State<AppState>, Query(raw): Query<Vec<(String, String)>>) -> Response {
@@ -486,11 +539,7 @@ fn filter_row(params: &Explore, data: &ExploreData) -> String {
     out.push_str(&html::select(
         "type",
         "type",
-        &data
-            .types
-            .iter()
-            .map(|t| (t.kind.clone(), format!("{} ({})", t.kind, t.count)))
-            .collect::<Vec<_>>(),
+        &data.types.iter().map(|t| (t.clone(), t.clone())).collect::<Vec<_>>(),
         params.kind.as_deref(),
         "any type",
     ));
@@ -499,6 +548,14 @@ fn filter_row(params: &Explore, data: &ExploreData) -> String {
     // filter change.
     if let Some(kind) = &params.kind {
         out.push_str(&format!("<input type=\"hidden\" name=\"t0\" value=\"{}\">", html::escape(kind)));
+    }
+
+    // Where the window is, so changing a filter keeps the reader where they stepped to rather than throwing
+    // them back to now. Which bound counts is `parse_explore`'s window shapes' decision, not the form's.
+    for (name, bound) in [("from", params.from), ("to", params.to)] {
+        if let Some(bound) = bound {
+            out.push_str(&format!("<input type=\"hidden\" name=\"{name}\" value=\"{bound}\">"));
+        }
     }
 
     // Attribute filters, one control per discovered key. Only offered once a type is chosen: without one
@@ -615,7 +672,8 @@ fn render_explore(params: &Explore, data: &ExploreData) -> String {
     }
     if data.facets.capped {
         body.push_str(&html::note(&format!(
-            "Filter options come from the newest {} rows in range; filtering itself covers the whole range.",
+            "Options for body fields come from the newest {} rows in range; attribute options and filtering \
+             itself cover the whole range.",
             data.facets.scanned
         )));
     }
@@ -625,6 +683,7 @@ fn render_explore(params: &Explore, data: &ExploreData) -> String {
         html::escape(&format_nanos(data.window.0)),
         html::escape(&format_nanos(data.window.1))
     ));
+    body.push_str(&steps_row(params, data, "/"));
     body.push_str(&html::plot(&svg::timeline(
         &data.timeline,
         data.window.0,
@@ -636,7 +695,8 @@ fn render_explore(params: &Explore, data: &ExploreData) -> String {
     body.push_str(&open_chart_link(params, None));
 
     // One plot per field, each with its own y axis. Fields that turned out to have no numeric values in
-    // range are reported rather than silently dropped.
+    // range are reported rather than silently dropped — given a type. Without one nothing is charted, as
+    // nothing is offered (see `gather`), and a `field` that arrived anyway is a stale link, not news.
     for chart in &data.charts {
         body.push_str(&format!("<h2>{}</h2>\n", html::escape(&chart.field)));
         body.push_str(&html::plot(&svg::value_chart(
@@ -652,7 +712,7 @@ fn render_explore(params: &Explore, data: &ExploreData) -> String {
         body.push_str(&chart_notes(chart, &chart.field));
         body.push_str(&open_chart_link(params, Some(&chart.field)));
     }
-    for field in &params.fields {
+    for field in params.fields.iter().filter(|_| params.kind.is_some()) {
         if !data.charts.iter().any(|c| &c.field == field) {
             body.push_str(&html::note(&format!(
                 "{field} has no numeric values in this range — the timeline above still shows when these \
@@ -850,6 +910,80 @@ fn open_chart_link(params: &Explore, field: Option<&str>) -> String {
     )
 }
 
+/// Where the window can move: one window-length earlier or later, or back to now.
+struct Steps {
+    /// How far a step moves, for the link text: the preset's own label, or `None` for a custom window,
+    /// whose width is whatever a drill-down made it.
+    length: Option<&'static str>,
+    earlier: Explore,
+    /// `None` while the window ends now: there is nothing later yet.
+    later: Option<Explore>,
+    /// Back to the live view. `None` when `later` already gets there, and for a custom window, which has no
+    /// live edge of its own — picking a preset is how a reader returns from one.
+    latest: Option<Explore>,
+}
+
+/// The views one step either side of this one, or `None` for `all`, whose window is the whole extent.
+///
+/// **Sliding steps, each the window's own length**, so they mean the same thing at fifteen minutes and at a
+/// week. Calendar days would need a mode of their own: a fifteen-minute window has no natural midnight.
+///
+/// A step moves only the window. Every filter, field, grouping and hidden series is carried along, but not
+/// the pagination cursor, which belongs to the window it was taken in.
+fn steps(p: &Explore, window: (i64, i64), now: i64) -> Option<Steps> {
+    let (from, to) = window;
+    let at = |from, to| Explore { from, to, cursor: None, ..p.clone() };
+
+    if p.range == "custom" {
+        let width = to - from;
+        return Some(Steps {
+            length: None,
+            earlier: at(Some(from - width), Some(from)),
+            later: (to < now).then(|| at(Some(to), Some(to + width))),
+            latest: None,
+        });
+    }
+
+    let (_, label, span) = RANGES.iter().find(|(id, _, span)| *id == p.range && *span > 0)?;
+    // A step that would reach now lands on the live view rather than on a fixed `to` just short of it —
+    // which would look live and then stop moving.
+    let next = to.saturating_add(*span);
+    Some(Steps {
+        length: Some(label),
+        earlier: at(None, Some(from)),
+        later: p.to.map(|_| at(None, (next < now).then_some(next))),
+        latest: (p.to.is_some() && next < now).then(|| at(None, None)),
+    })
+}
+
+/// The row of links that moves the window, for under the heading that states it. `path` is the page they
+/// return to — the explorer or the full-size chart.
+fn steps_row(p: &Explore, data: &ExploreData, path: &str) -> String {
+    let Some(steps) = steps(p, data.window, data.now) else {
+        return String::new();
+    };
+    let link = |target: &Explore, text: &str| {
+        format!(
+            "<a href=\"{}\">{}</a>",
+            html::escape(&html::query_string(path, &current_params(target))),
+            html::escape(text)
+        )
+    };
+    let (earlier, later) = match steps.length {
+        Some(length) => (format!("← {length} earlier"), format!("{length} later →")),
+        None => ("← earlier".to_owned(), "later →".to_owned()),
+    };
+    let links: Vec<String> = [
+        Some(link(&steps.earlier, &earlier)),
+        steps.later.as_ref().map(|target| link(target, &later)),
+        steps.latest.as_ref().map(|target| link(target, "latest")),
+    ]
+    .into_iter()
+    .flatten()
+    .collect();
+    format!("<p class=\"steps\">{}</p>\n", links.join(" · "))
+}
+
 /// The full-page view of one chart (SPEC §14.9).
 ///
 /// Renders the **same** chart at two geometries and lets a media query choose, which is the no-JavaScript
@@ -893,6 +1027,7 @@ async fn chart(State(state): State<AppState>, Query(raw): Query<Vec<(String, Str
         html::escape(&format_nanos(data.window.0)),
         html::escape(&format_nanos(data.window.1))
     ));
+    body.push_str(&steps_row(&params, &data, "/chart"));
 
     for geo in [&svg::Geometry::FULL_WIDE, &svg::Geometry::FULL_NARROW] {
         match data.charts.first() {
@@ -1035,6 +1170,20 @@ fn short_key(key: &str) -> String {
 
 // ------------------------------------------------------------------------------------ users
 
+/// How a user can sign in, for the users page: `password`, `password, 2 passkeys`, `1 passkey`.
+fn sign_in_methods(has_password: bool, passkeys: Option<i64>) -> String {
+    let passkeys = match passkeys.unwrap_or(0) {
+        0 => None,
+        1 => Some("1 passkey".to_owned()),
+        n => Some(format!("{n} passkeys")),
+    };
+    [has_password.then(|| "password".to_owned()), passkeys]
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 async fn users(State(state): State<AppState>) -> Response {
     render_users(&state, None).await
 }
@@ -1045,26 +1194,27 @@ async fn users(State(state): State<AppState>) -> Response {
 /// server-side flash state, and `?error=…` is a reflected string in a URL that gets pasted around.
 async fn render_users(state: &AppState, error: Option<&str>) -> Response {
     let db_path = state.config.database_path.clone();
-    let listed = tokio::task::spawn_blocking(move || {
+    let listed = tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
         let conn = crate::store::open_read(&db_path)?;
-        crate::store::users::list(&conn)
+        Ok((crate::store::users::list(&conn)?, crate::store::passkeys::counts(&conn)?))
     })
     .await;
 
-    let listed = match listed {
-        Ok(Ok(users)) => users,
+    let (listed, passkeys) = match listed {
+        Ok(Ok(listed)) => listed,
         Ok(Err(e)) => return failed("reading the users", &e),
         Err(e) => return failed("the user query task", &e),
     };
 
     let last = listed.len() <= 1;
     let table = html::table(
-        &["username", "created", ""],
+        &["username", "signs in with", "created", ""],
         &listed
             .iter()
             .map(|u| {
                 vec![
                     html::escape(&u.username),
+                    html::escape(&sign_in_methods(u.has_password, passkeys.get(&u.username).copied())),
                     html::escape(&format_nanos(u.created_at)),
                     if last {
                         // Not rendered rather than rendered disabled: the handler refuses it anyway, and a
@@ -1421,8 +1571,108 @@ async fn end_session(
 
 // ------------------------------------------------------------------------------------ logging in
 
-async fn login_form() -> Response {
-    html(StatusCode::OK, html::login(None))
+async fn login_form(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    html(StatusCode::OK, html::login(None, &passkey_sign_in(&state, &headers)))
+}
+
+/// The login page's passkey section for a page reached at the request's `Host`: a sign-in ceremony and its
+/// button, or — on an address passkeys cannot be bound to — a link to the same page under `localhost`.
+///
+/// Starting a ceremony touches only memory (`web::passkey::Ceremonies`), so this needs no database and no
+/// blocking task.
+fn passkey_sign_in(state: &AppState, headers: &HeaderMap) -> String {
+    let host = headers.get(header::HOST).and_then(|v| v.to_str().ok());
+    match host.and_then(passkey::rp_id_for) {
+        Some(rp_id) => match passkey::start_sign_in(&state.ceremonies, &rp_id) {
+            Ok(options) => passkey_page::sign_in_form(&options),
+            Err(e) => {
+                tracing::warn!(error = %e, "passkey sign-in could not start");
+                html::note(e.message())
+            }
+        },
+        None => passkey_page::not_localhost(host, "/login", "used"),
+    }
+}
+
+#[derive(Deserialize)]
+pub struct PasskeySignIn {
+    /// The browser's answer as WebAuthn JSON, filled in by the page's script.
+    response: String,
+}
+
+/// Signs in with a passkey (SPEC §14.10): verifies the browser's answer, then establishes a session exactly as
+/// a password login does.
+///
+/// The failure messages are specific, unlike the password form's single one: a passkey cannot be guessed, so
+/// saying that this one was removed, or belongs to another address, tells an attacker nothing and tells the
+/// owner what to do.
+async fn passkey_login(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Form(form): Form<PasskeySignIn>,
+) -> Response {
+    let refuse = |state: &AppState, headers: &HeaderMap, message: &str| {
+        html(StatusCode::UNAUTHORIZED, html::login(Some(message), &passkey_sign_in(state, headers)))
+    };
+    // A `POST` gets here only once the origin guard has matched `Origin` to `Host`: this is the page's own
+    // origin, the one the browser signed into the client data.
+    let Some(site) = headers
+        .get(header::ORIGIN)
+        .and_then(|v| v.to_str().ok())
+        .and_then(passkey::Site::from_origin)
+    else {
+        return refuse(&state, &headers, passkey::PasskeyError::NotLocalhost.message());
+    };
+
+    let db_path = state.config.database_path.clone();
+    let ceremonies = state.ceremonies.clone();
+    let verified = tokio::task::spawn_blocking(
+        move || -> anyhow::Result<Result<(String, String), passkey::PasskeyError>> {
+            let assertion = match passkey::Assertion::parse(&form.response) {
+                Ok(assertion) => assertion,
+                Err(e) => return Ok(Err(e)),
+            };
+            let conn = crate::store::open_write_existing(&db_path)?;
+            let stored = crate::store::passkeys::find(&conn, &assertion.credential_id())?;
+            let dynamic_state =
+                match passkey::finish_sign_in(&ceremonies, &site, &assertion, stored.as_ref()) {
+                    Ok(dynamic_state) => dynamic_state,
+                    Err(e) => return Ok(Err(e)),
+                };
+            // `finish_sign_in` has already refused a credential with no stored passkey.
+            let Some(stored) = stored else {
+                return Ok(Err(passkey::PasskeyError::UnknownPasskey));
+            };
+            crate::store::passkeys::record_use(
+                &conn,
+                &stored.credential_id,
+                dynamic_state.as_deref(),
+                crate::now_unix_nanos(),
+            )?;
+            Ok(Ok((stored.username, stored.rp_id)))
+        },
+    )
+    .await;
+
+    let (username, rp_id) = match verified {
+        Ok(Ok(Ok(signed_in))) => signed_in,
+        Ok(Ok(Err(e))) => {
+            tracing::warn!(error = %e, "rejected: passkey sign-in");
+            return refuse(&state, &headers, e.message());
+        }
+        Ok(Err(e)) => return login_unavailable(&e),
+        Err(e) => return login_unavailable(&e),
+    };
+
+    match establish(&state, &username) {
+        Ok(cookie) => {
+            tracing::info!(user = %username, %rp_id, "logged in with a passkey");
+            let mut response = see_other("/");
+            session::set_cookie(&mut response, &cookie);
+            response
+        }
+        Err(e) => login_unavailable(&e),
+    }
 }
 
 /// The login form's fields.
@@ -1444,7 +1694,11 @@ pub struct Credentials {
 /// than implying it was handled.
 const REFUSED: &str = "that username and password did not match.";
 
-async fn login(State(state): State<AppState>, Form(credentials): Form<Credentials>) -> Response {
+async fn login(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Form(credentials): Form<Credentials>,
+) -> Response {
     let db_path = state.config.database_path.clone();
     let username = credentials.username.clone();
     let presented = crate::auth::hash_password(&credentials.password);
@@ -1461,7 +1715,10 @@ async fn login(State(state): State<AppState>, Form(credentials): Form<Credential
         Ok(Ok(true)) => {}
         Ok(Ok(false)) => {
             tracing::warn!(user = %credentials.username, "rejected: login did not match");
-            return html(StatusCode::UNAUTHORIZED, html::login(Some(REFUSED)));
+            return html(
+                StatusCode::UNAUTHORIZED,
+                html::login(Some(REFUSED), &passkey_sign_in(&state, &headers)),
+            );
         }
         Ok(Err(e)) => return login_unavailable(&e),
         Err(e) => return login_unavailable(&e),
@@ -1485,7 +1742,7 @@ fn login_unavailable(error: &dyn std::fmt::Display) -> Response {
     tracing::error!(%error, "could not verify a login");
     html(
         StatusCode::SERVICE_UNAVAILABLE,
-        html::login(Some("the login could not be checked right now; try again.")),
+        html::login(Some("the login could not be checked right now; try again."), ""),
     )
 }
 
@@ -1649,6 +1906,101 @@ mod tests {
         assert_eq!(short_key("resource.attributes.host.name"), "host.name");
         assert_eq!(short_key("scope.name"), "name");
         assert_eq!(short_key("unprefixed"), "unprefixed");
+    }
+
+    // ------------------------------------------------------------------------- the window and its steps
+
+    /// The three window shapes. A preset is its length ending at `to`, so a stray `from` — the filter form
+    /// carrying a drill-down's bounds when the reader picks a preset — must not override the preset.
+    #[test]
+    fn a_bound_that_does_not_belong_to_the_window_s_shape_is_dropped() {
+        let preset = parse_explore(&pairs(&[("range", "7d"), ("from", "100"), ("to", "200")]));
+        assert_eq!((preset.range.as_str(), preset.from, preset.to), ("7d", None, Some(200)));
+
+        let custom = parse_explore(&pairs(&[("range", "custom"), ("from", "100"), ("to", "200")]));
+        assert_eq!((custom.from, custom.to), (Some(100), Some(200)));
+
+        let all = parse_explore(&pairs(&[("range", "all"), ("from", "100"), ("to", "200")]));
+        assert_eq!((all.from, all.to), (None, None));
+    }
+
+    /// The form's blank range option submits nothing, so bounds arriving without a range are a custom
+    /// window carried forward — and so are links and bookmarks that only ever had `from` and `to`.
+    #[test]
+    fn a_from_without_a_range_is_a_custom_window() {
+        let p = parse_explore(&pairs(&[("range", ""), ("from", "100"), ("to", "200")]));
+        assert_eq!((p.range.as_str(), p.from, p.to), ("custom", Some(100), Some(200)));
+    }
+
+    const NOW: i64 = 1_000 * DAY;
+
+    fn live(range: &str) -> Explore {
+        parse_explore(&pairs(&[("range", range), ("type", "t"), ("t0", "t"), ("hide", "3")]))
+    }
+
+    /// From the live view a step goes back exactly one window, and there is nothing later yet.
+    #[test]
+    fn the_live_view_steps_back_one_window_and_no_further_forward() {
+        let p = live("24h");
+        let s = steps(&p, (NOW - DAY, NOW), NOW).expect("a preset can step");
+        assert_eq!(s.length, Some("24 hours"));
+        assert_eq!((s.earlier.from, s.earlier.to), (None, Some(NOW - DAY)));
+        assert!(s.later.is_none());
+        assert!(s.latest.is_none());
+    }
+
+    /// Three days back, a step forward is one day forward, and `latest` returns to now.
+    #[test]
+    fn a_past_window_steps_both_ways_and_back_to_now() {
+        let mut p = live("24h");
+        p.to = Some(NOW - 3 * DAY);
+        let s = steps(&p, (NOW - 4 * DAY, NOW - 3 * DAY), NOW).unwrap();
+        assert_eq!(s.earlier.to, Some(NOW - 4 * DAY));
+        assert_eq!(s.later.as_ref().unwrap().to, Some(NOW - 2 * DAY));
+        assert_eq!(s.latest.as_ref().unwrap().to, None);
+    }
+
+    /// A step that would reach now lands on the live view — a fixed `to` a minute short of now would look
+    /// live and then stop moving — and `latest` is not offered beside it, since it goes to the same place.
+    #[test]
+    fn a_step_that_reaches_now_lands_on_the_live_view() {
+        let mut p = live("24h");
+        p.to = Some(NOW - DAY + MINUTE);
+        let s = steps(&p, (NOW - 2 * DAY + MINUTE, NOW - DAY + MINUTE), NOW).unwrap();
+        assert_eq!(s.later.as_ref().unwrap().to, None);
+        assert!(s.latest.is_none());
+    }
+
+    /// A drill-down window has no preset length, so it steps by its own width, both ends moving together.
+    #[test]
+    fn a_custom_window_steps_by_its_own_width() {
+        let p = parse_explore(&pairs(&[("range", "custom"), ("from", "1000"), ("to", "1360")]));
+        let s = steps(&p, (1_000, 1_360), NOW).unwrap();
+        assert_eq!(s.length, None);
+        assert_eq!((s.earlier.from, s.earlier.to), (Some(640), Some(1_000)));
+        let later = s.later.unwrap();
+        assert_eq!((later.from, later.to), (Some(1_360), Some(1_720)));
+        assert!(s.latest.is_none(), "a custom window has no live edge; a preset is the way back");
+
+        // Once it reaches now there is nothing later.
+        assert!(steps(&p, (NOW - 360, NOW), NOW).unwrap().later.is_none());
+    }
+
+    #[test]
+    fn all_time_has_nowhere_to_step() {
+        assert!(steps(&live("all"), (0, NOW), NOW).is_none());
+    }
+
+    /// A step moves the window and nothing else: the type, its filters and the hidden series all come
+    /// along, while the pagination cursor — which belongs to the old window — does not.
+    #[test]
+    fn a_step_keeps_everything_but_the_window_and_the_cursor() {
+        let mut p = live("24h");
+        p.cursor = Some((NOW - HOUR, [7; 16]));
+        let earlier = steps(&p, (NOW - DAY, NOW), NOW).unwrap().earlier;
+        assert_eq!(earlier.kind.as_deref(), Some("t"));
+        assert_eq!(earlier.hidden, vec!["3".to_owned()]);
+        assert!(earlier.cursor.is_none());
     }
 
     /// Pagination has to carry the whole filter state forward, or page two is a different query from page

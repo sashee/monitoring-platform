@@ -42,8 +42,8 @@ use super::html::escape;
 pub struct Geometry {
     pub width: f64,
     pub pad_left: f64,
+    /// Room for the names at the right-hand end of each line — when they fit; see [`end_labels`].
     pub pad_right: f64,
-    /// Room for the direct labels at the right-hand end of each line.
     pub pad_top: f64,
     /// The x-axis band. Part of the height rather than outside it: a container sized to the plot alone
     /// crops its own axis labels and grows a nested scrollbar.
@@ -52,6 +52,11 @@ pub struct Geometry {
     pub timeline_height: f64,
     pub time_ticks: usize,
     pub value_ticks: usize,
+    /// Size in px of the chart's text — axis labels and line-end names. Here rather than in the stylesheet
+    /// because it is half of whether a label fits: [`tick_labels_fit`] checks it against `pad_left` at
+    /// compile time, and [`end_labels`] measures names against the right margin with it, neither of which a
+    /// CSS rule could take part in.
+    pub label_font: f64,
     /// Extra class on the `<svg>`, which is how the media query chooses between the full-page pair.
     pub class: &'static str,
 }
@@ -69,6 +74,7 @@ impl Geometry {
         timeline_height: 72.0,
         time_ticks: 6,
         value_ticks: 4,
+        label_font: 11.0,
         class: "",
     };
 
@@ -83,14 +89,19 @@ impl Geometry {
         timeline_height: 120.0,
         time_ticks: 7,
         value_ticks: 5,
+        label_font: 11.0,
         class: "wide",
     };
 
     /// The full-page view on a phone. The viewBox is close to a portrait viewport, so the scale is near
     /// 1 and the labels render at their real size. Few ticks, because there is no width to spend.
+    ///
+    /// The larger font is what makes `pad_left` the widest relative to the plot here: 64 rather than 46,
+    /// because [`MAX_TICK_CHARS`] at 13px needs it, and 46 was showing the last five digits of a
+    /// filesystem's free bytes.
     pub const FULL_NARROW: Geometry = Geometry {
         width: 420.0,
-        pad_left: 46.0,
+        pad_left: 64.0,
         pad_right: 14.0,
         pad_top: 14.0,
         pad_bottom: 30.0,
@@ -98,6 +109,7 @@ impl Geometry {
         timeline_height: 96.0,
         time_ticks: 3,
         value_ticks: 4,
+        label_font: 13.0,
         class: "narrow",
     };
 
@@ -129,6 +141,28 @@ const _: () = assert!(
 const _: () =
     assert!(Geometry::FULL_WIDE.width > Geometry::FULL_WIDE.pad_left + Geometry::FULL_WIDE.pad_right);
 
+/// The longest a value-axis label may be, in characters. Every preset's left margin is asserted to hold
+/// this many at its own tick font, so a label within it cannot be clipped — which is exactly what a raw
+/// `17849954304` was, leaving `00000` on screen.
+pub const MAX_TICK_CHARS: usize = 7;
+
+/// Plain notation is kept while every label fits in this many characters; past it, scientific.
+const PLAIN_TICK_CHARS: usize = 6;
+
+/// Space between a value label's right edge and the plot.
+const TICK_GAP: f64 = 6.0;
+
+/// Advance width of one character of the stylesheet's monospace font, as a fraction of its size. The
+/// common faces all measure 0.6em (SF Mono, Menlo, DejaVu Sans Mono, Liberation Mono); 0.62 is the margin.
+const CHAR_EM: f64 = 0.62;
+
+const fn tick_labels_fit(geo: &Geometry) -> bool {
+    geo.pad_left - TICK_GAP >= MAX_TICK_CHARS as f64 * CHAR_EM * geo.label_font
+}
+const _: () = assert!(tick_labels_fit(&Geometry::INLINE), "inline value labels would be clipped");
+const _: () = assert!(tick_labels_fit(&Geometry::FULL_WIDE), "wide value labels would be clipped");
+const _: () = assert!(tick_labels_fit(&Geometry::FULL_NARROW), "narrow value labels would be clipped");
+
 /// Markers are drawn only when they would not merge into a smear. At 8px across, ~40 of them across
 /// 800px is already touching.
 const MAX_MARKERS: usize = 40;
@@ -139,8 +173,17 @@ const MAX_MARKERS: usize = 40;
 /// covers that whole span. A little above the usual 24px floor, because the zones sit edge to edge with no
 /// gaps to aim between.
 const MIN_HIT_WIDTH: f64 = 28.0;
-/// Past this, direct labels collide with each other and the legend carries identity alone.
-const MAX_DIRECT_LABELS: usize = 4;
+/// Past this, line-end names crowd each other and the legend carries identity alone.
+const MAX_END_LABELS: usize = 4;
+
+/// Space between a line's last point and its name.
+const END_LABEL_GAP: f64 = 6.0;
+
+/// How close a name may come to the right edge of the `<svg>`, past which it would be cropped.
+const END_LABEL_EDGE: f64 = 2.0;
+
+/// Two names closer than this many ems apart vertically overlap.
+const LINE_HEIGHT_EM: f64 = 1.2;
 
 /// A linear mapping from data space to pixel space.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -279,14 +322,119 @@ pub fn time_label(nanos: i64, span: i64) -> String {
     }
 }
 
-/// Formats a value for an axis label or a tooltip, trimming the noise off a float.
+/// Formats one value in full, for a tooltip or the timeline's count, trimming the noise off a float.
+///
+/// Not for axis labels — a tooltip has room for every digit and an axis does not; see [`tick_labels`].
+/// At least four decimals and at least four significant digits, so `0.00002` does not read as `0`.
 pub fn value_label(v: f64) -> String {
     if v == v.trunc() && v.abs() < 1e15 {
         return format!("{}", v as i64);
     }
-    let s = format!("{v:.4}");
+    let decimals = if v == 0.0 { 4 } else { (3 - decade(v)).clamp(4, 20) as usize };
+    let s = format!("{v:.decimals$}");
     let s = s.trim_end_matches('0').trim_end_matches('.');
     s.to_owned()
+}
+
+/// The power of ten of a value's leading digit: 2 for 450, -3 for 0.0012.
+///
+/// The `1e-6` absorbs float error, so a step that should be 0.001 and arrives as 0.000999999 still counts
+/// as -3 rather than -4. Nothing that reaches here is legitimately that close below a power of ten: steps
+/// are 1, 2 or 5 × 10ⁿ, and for a lone value the difference is one digit of rounding.
+fn decade(v: f64) -> i32 {
+    (v.abs().log10() + 1e-6).floor() as i32
+}
+
+/// The labels for a value axis, formatted together so they share one notation, one exponent and one
+/// number of decimals — an axis reading `3.29, 3.3, 3.31` or `9.8e9, 1e10` makes the reader line it up.
+///
+/// Returns the ticks to draw, each with its label: every tick, except in the last case below.
+///
+/// - **Plain while it fits**: `3.29`, `0.069`, `12000`. Scientific notation costs the reader something,
+///   so it is only used once a plain label would exceed [`PLAIN_TICK_CHARS`].
+/// - **Otherwise scientific, with the exponent of the largest tick**: `1.80e10  1.85e10`. Not SI prefixes:
+///   a value here can be anything, and `880M` reads as metres or minutes as easily as 880 × 10⁶, whereas
+///   scientific notation cannot be mistaken for a unit.
+/// - **Decimals come from the step**, so adjacent ticks always differ and no label carries digits the
+///   step does not need. A lone tick — a flat series — gets three significant digits.
+/// - **Never longer than [`MAX_TICK_CHARS`].** A large value that barely moves — a megabyte on an 18 GB
+///   filesystem — would need `1.7849950e10` to tell its ticks apart. Rather than clip that, the labels lose
+///   decimals until they fit, and only gridlines whose label is still exact are kept — or, if none is, the
+///   single one nearest its rounded label. Fewer gridlines, but never two whose labels misstate the gap.
+pub fn tick_labels(ticks: &[f64]) -> Vec<(f64, String)> {
+    // `None` for a lone tick, which has no neighbour to be told apart from.
+    let step_decade = match ticks {
+        [a, b, ..] if b != a => Some(decade(b - a)),
+        _ => None,
+    };
+    // A tick that should be zero can arrive as `-1e-17` from accumulated steps, and would print as `-0.0`.
+    let ticks: Vec<f64> = ticks
+        .iter()
+        .map(|t| match step_decade {
+            Some(step) if t.abs() < 10f64.powi(step) * 1e-6 => 0.0,
+            _ => *t,
+        })
+        .collect();
+
+    let plain: Vec<String> = ticks.iter().map(|t| plain_label(*t, step_decade)).collect();
+    if plain.iter().all(|l| l.len() <= PLAIN_TICK_CHARS) {
+        return ticks.into_iter().zip(plain).collect();
+    }
+
+    let exponent = decade(ticks.iter().map(|t| t.abs()).fold(0.0, f64::max));
+    let lone = step_decade.is_none();
+    let at = |decimals: usize| -> Vec<String> {
+        ticks.iter().map(|t| scientific_label(*t, exponent, decimals, lone)).collect()
+    };
+    let wanted = step_decade.map_or(2, |step| (exponent - step).max(0) as usize);
+    // Zero decimals always fits: sign, digit, `e`, and an exponent no f64 takes past three digits.
+    let decimals = (0..=wanted)
+        .rev()
+        .find(|decimals| at(*decimals).iter().all(|l| l.len() <= MAX_TICK_CHARS))
+        .unwrap_or(0);
+    let pairs: Vec<(f64, String)> = ticks.iter().copied().zip(at(decimals)).collect();
+
+    // With the decimals the step wanted, every label is its tick's value exactly. With fewer, labels are
+    // rounded, and two rounded labels imply a scale the gridlines do not have — `1.78e10` and `1.79e10`
+    // two megabytes apart. So only the ticks a label states exactly are kept, which keeps the spacing
+    // honest; failing those, the one tick nearest its label, which on its own implies no scale at all.
+    let unit = 10f64.powi(exponent - decimals as i32);
+    let error = |(t, l): &(f64, String)| (t - l.parse::<f64>().unwrap_or(f64::NAN)).abs();
+    let exact: Vec<(f64, String)> = pairs.iter().filter(|p| error(p) <= unit * 1e-6).cloned().collect();
+    if !exact.is_empty() {
+        return exact;
+    }
+    pairs.into_iter().min_by(|a, b| error(a).total_cmp(&error(b))).into_iter().collect()
+}
+
+/// One tick in plain notation, with the decimals the step needs.
+fn plain_label(t: f64, step_decade: Option<i32>) -> String {
+    match step_decade {
+        Some(step) => format!("{:.*}", (-step).max(0) as usize, t),
+        // A lone value: three significant digits, and trimmed, since there is nothing to align with.
+        None if t == 0.0 => "0".to_owned(),
+        None => trim_decimals(&format!("{t:.*}", (2 - decade(t)).max(0) as usize)).to_owned(),
+    }
+}
+
+/// One tick in scientific notation against the axis-wide `exponent`. Zero is `0` whatever the exponent.
+fn scientific_label(t: f64, exponent: i32, decimals: usize, lone: bool) -> String {
+    if t == 0.0 {
+        return "0".to_owned();
+    }
+    let mantissa = format!("{:.decimals$}", t / 10f64.powi(exponent));
+    // A lone value can round up into the next decade — 9.996e9 to `10.00e9` — so it moves up one. The ticks
+    // of a real axis cannot: the largest one fixed the exponent, and is exact at these decimals.
+    if lone && mantissa.trim_start_matches('-').starts_with("10") {
+        return scientific_label(t, exponent + 1, decimals, lone);
+    }
+    let mantissa = if lone { trim_decimals(&mantissa) } else { &mantissa };
+    format!("{mantissa}e{exponent}")
+}
+
+/// `1.50` to `1.5`, `2.00` to `2`; integers are left alone.
+fn trim_decimals(s: &str) -> &str {
+    if s.contains('.') { s.trim_end_matches('0').trim_end_matches('.') } else { s }
 }
 
 /// How one series is drawn: a validated hue, and a line pattern.
@@ -346,15 +494,16 @@ fn axes(
     if value_axis {
         // Solid hairlines, one shade off the surface. Dashed gridlines read as "threshold" or
         // "projection" when they are just a grid.
-        for tick in value_ticks(y.d0, y.d1, geo.value_ticks) {
+        for (tick, label) in tick_labels(&value_ticks(y.d0, y.d1, geo.value_ticks)) {
             let py = y.map(tick);
             out.push_str(&format!(
                 "<line x1=\"{:.1}\" y1=\"{py:.1}\" x2=\"{right:.1}\" y2=\"{py:.1}\" class=\"grid\"/>\
-                 <text x=\"{:.1}\" y=\"{:.1}\" class=\"tick tick-y\">{}</text>",
+                 <text x=\"{:.1}\" y=\"{:.1}\" font-size=\"{}\" class=\"tick tick-y\">{}</text>",
                 geo.pad_left,
-                geo.pad_left - 6.0,
+                geo.pad_left - TICK_GAP,
                 py + 3.0,
-                escape(&value_label(tick))
+                geo.label_font,
+                escape(&label)
             ));
         }
     }
@@ -369,9 +518,10 @@ fn axes(
         let px = x.map(tick as f64);
         out.push_str(&format!(
             "<line x1=\"{px:.1}\" y1=\"{plot_bottom:.1}\" x2=\"{px:.1}\" y2=\"{:.1}\" class=\"axis\"/>\
-             <text x=\"{px:.1}\" y=\"{:.1}\" class=\"tick tick-x\">{}</text>",
+             <text x=\"{px:.1}\" y=\"{:.1}\" font-size=\"{}\" class=\"tick tick-x\">{}</text>",
             plot_bottom + 4.0,
             plot_bottom + 16.0,
+            geo.label_font,
             escape(&time_label(tick, span))
         ));
     }
@@ -425,10 +575,14 @@ pub fn timeline(
         ));
     }
 
+    // Left-aligned over the plot rather than right-aligned into the label column: with its `/bucket` it
+    // is longer than [`MAX_TICK_CHARS`], and in the column a three-hour bucket of `3000/bucket` already
+    // lost its first digit. Above the plot it has the plot's whole width.
     out.push_str(&format!(
-        "<text x=\"{:.1}\" y=\"{:.1}\" class=\"tick tick-y\">{}/bucket</text>",
+        "<text x=\"{:.1}\" y=\"{:.1}\" font-size=\"{}\" class=\"tick\">{}/bucket</text>",
         geo.pad_left,
         geo.pad_top - 2.0,
+        geo.label_font,
         escape(&value_label(max_count))
     ));
     if let Some(link) = link {
@@ -436,6 +590,45 @@ pub fn timeline(
     }
     out.push_str("</svg>");
     out
+}
+
+/// A line's name, placed just past its last point: `x` is where the text starts, `y` its baseline.
+#[derive(Debug, Clone, PartialEq)]
+pub struct EndLabel {
+    pub x: f64,
+    pub y: f64,
+    pub text: String,
+}
+
+/// Width of `text` in monospace columns, counting anything outside ASCII as two.
+///
+/// Names are device-supplied — an SSID can be CJK or emoji, which a monospace face draws two columns wide.
+/// Over-counting an accented Latin letter only drops a name that might have fitted; under-counting a wide
+/// one would crop it, which is the failure this exists to prevent.
+fn columns(text: &str) -> usize {
+    text.chars().map(|c| if c.is_ascii() { 1 } else { 2 }).sum()
+}
+
+/// The names to print at the ends of the lines: all of them, or none.
+///
+/// **Only when every one is whole and apart from the others.** The names sit in the right margin, which is
+/// 14 units on the phone-sized chart and 96 inline, and they are device-supplied: `/dev/mmcblk0p1` and
+/// `/dev/mmcblk0p2` are fourteen characters that differ only in the last, so a cropped name is not a
+/// shorter name but the wrong one. Two names that overlap are as unreadable as cropped ones. Either way the
+/// legend under the chart — always there for two or more series, with full names — already says which line
+/// is which, so dropping the names loses nothing, where printing them broken would.
+///
+/// All or none rather than per name: a chart where some lines are named and others are not reads as though
+/// the unnamed ones were different in kind.
+pub fn end_labels(candidates: Vec<EndLabel>, geo: &Geometry) -> Vec<EndLabel> {
+    let whole = candidates.iter().all(|l| {
+        l.x + columns(&l.text) as f64 * CHAR_EM * geo.label_font <= geo.width - END_LABEL_EDGE
+    });
+    let mut baselines: Vec<f64> = candidates.iter().map(|l| l.y).collect();
+    baselines.sort_by(f64::total_cmp);
+    let apart = baselines.windows(2).all(|w| w[1] - w[0] >= LINE_HEIGHT_EM * geo.label_font);
+
+    if candidates.len() <= MAX_END_LABELS && whole && apart { candidates } else { Vec::new() }
 }
 
 /// The value chart: average per bucket per series, with the min/max spread behind it.
@@ -485,24 +678,34 @@ pub fn value_chart(
     let mut out = open_svg(geo, height, &format!("{field} over time"));
     out.push_str(&axes(geo, &x, &y, from, to, plot_bottom, true));
 
-    let direct_label = plotted.len() <= MAX_DIRECT_LABELS;
     for (slot, s) in &plotted {
         let (color, dash) = series_style(*slot);
         out.push_str(&band_path(&s.points, &x, &y, &color));
         out.push_str(&line_path(&s.points, &x, &y, &color, dash));
         out.push_str(&markers(&s.points, &x, &y, &color, field, s.group.as_deref()));
+    }
 
-        if let (true, Some(last)) =
-            (direct_label, s.points.iter().rev().find(|p| p.avg.is_some()))
-        {
-            let label = s.group.clone().unwrap_or_else(|| field.to_owned());
-            out.push_str(&format!(
-                "<text x=\"{:.1}\" y=\"{:.1}\" class=\"direct\" fill=\"{color}\">{}</text>",
-                x.map(last.start as f64) + 6.0,
-                y.map(last.avg.expect("filtered to Some")) + 3.0,
-                escape(&label)
-            ));
-        }
+    // In text ink, not the series colour: three of the light palette's slots fall below 3:1 on the surface,
+    // and the line the name sits against already carries the colour.
+    let candidates = plotted
+        .iter()
+        .filter_map(|(_, s)| {
+            let last = s.points.iter().rev().find(|p| p.avg.is_some())?;
+            Some(EndLabel {
+                x: x.map(last.start as f64) + END_LABEL_GAP,
+                y: y.map(last.avg?) + 3.0,
+                text: s.group.clone().unwrap_or_else(|| field.to_owned()),
+            })
+        })
+        .collect();
+    for label in end_labels(candidates, geo) {
+        out.push_str(&format!(
+            "<text x=\"{:.1}\" y=\"{:.1}\" font-size=\"{}\" class=\"direct\">{}</text>",
+            label.x,
+            label.y,
+            geo.label_font,
+            escape(&label.text)
+        ));
     }
 
     if let Some(link) = link {
@@ -778,8 +981,120 @@ mod tests {
         let ticks = value_ticks(3.288, 3.292, 4);
         assert!(ticks.len() >= 3, "{ticks:?}");
         assert!(ticks.iter().all(|t| *t >= 3.288 - 0.001 && *t <= 3.292 + 0.001), "{ticks:?}");
-        // Every tick is a multiple of the step, so the labels are short.
-        assert!(ticks.iter().all(|t| value_label(*t).len() <= 6), "{ticks:?}");
+        // Every tick is a multiple of the step, so the labels are short — and plain.
+        let labels = tick_labels(&ticks);
+        assert_eq!(labels.len(), ticks.len());
+        assert!(labels.iter().all(|(_, l)| l.len() <= 6 && !l.contains('e')), "{labels:?}");
+    }
+
+    fn labels_of(ticks: &[f64]) -> Vec<String> {
+        tick_labels(ticks).into_iter().map(|(_, l)| l).collect()
+    }
+
+    /// Ordinary values stay plain, and share their decimals: `3.290` beside `3.292`, not `3.29` beside it.
+    #[test]
+    fn ordinary_values_stay_plain_with_shared_decimals() {
+        assert_eq!(labels_of(&[3.288, 3.290, 3.292]), ["3.288", "3.290", "3.292"]);
+        assert_eq!(labels_of(&[0.0, 50.0, 100.0]), ["0", "50", "100"]);
+        assert_eq!(labels_of(&[0.06, 0.07, 0.08]), ["0.06", "0.07", "0.08"]);
+        assert_eq!(labels_of(&[-2.0, 0.0, 2.0]), ["-2", "0", "2"]);
+        assert_eq!(labels_of(&[100_000.0, 200_000.0]), ["100000", "200000"], "six characters is still plain");
+    }
+
+    /// **The regression test for `00000`.** The deployed `/` filesystem over 24 h: ticks 500 MB apart around
+    /// 18 GB, which used to print as eleven digits and lose the first six to the margin.
+    #[test]
+    fn large_values_switch_to_scientific_with_the_decimals_the_step_needs() {
+        assert_eq!(labels_of(&[1.80e10, 1.85e10]), ["1.80e10", "1.85e10"]);
+        // `/boot/firmware` over 7 d.
+        assert_eq!(labels_of(&[8.8e8, 9.0e8, 9.2e8]), ["8.8e8", "9.0e8", "9.2e8"]);
+        assert_eq!(labels_of(&[1e6, 2e6, 3e6]), ["1e6", "2e6", "3e6"]);
+    }
+
+    /// One exponent per axis: the largest tick's. `9.8e9` beside `1.00e10` would make the reader rescale
+    /// one of them to compare.
+    #[test]
+    fn an_axis_shares_one_exponent_across_a_decade() {
+        assert_eq!(labels_of(&[9.8e9, 1.0e10, 1.02e10]), ["0.98e10", "1.00e10", "1.02e10"]);
+    }
+
+    #[test]
+    fn tiny_values_switch_to_scientific_too() {
+        assert_eq!(labels_of(&[1e-5, 2e-5, 3e-5]), ["1e-5", "2e-5", "3e-5"]);
+    }
+
+    /// Zero is `0` in either notation, and a tick that should be zero but arrives as float noise does not
+    /// print as `-0.0`.
+    #[test]
+    fn zero_is_zero_in_either_notation() {
+        assert_eq!(labels_of(&[-1.0e10, -0.5e10, 0.0, 0.5e10]), ["-1.0e10", "-0.5e10", "0", "0.5e10"]);
+        assert_eq!(labels_of(&[-0.2, -1e-17, 0.2]), ["-0.2", "0.0", "0.2"]);
+    }
+
+    /// A flat series has one tick and nothing to tell it apart from: three significant digits, trimmed,
+    /// and a value that rounds into the next decade moves up rather than reading `10.00e9`.
+    #[test]
+    fn a_lone_tick_gets_three_significant_digits() {
+        assert_eq!(labels_of(&[17_849_954_304.0]), ["1.78e10"]);
+        assert_eq!(labels_of(&[3.0]), ["3"]);
+        assert_eq!(labels_of(&[3.2873]), ["3.29"]);
+        assert_eq!(labels_of(&[0.0]), ["0"]);
+        assert_eq!(labels_of(&[9.996e9]), ["1e10"]);
+    }
+
+    /// A large value that barely moves cannot be told apart in seven characters. Rounded to fit, its ticks
+    /// would read `1.78e10` and `1.79e10` two megabytes apart — a scale fifty times wrong. So one gridline
+    /// survives, labelled with its value rounded, which on its own implies no scale at all.
+    #[test]
+    fn a_large_value_that_barely_moves_keeps_one_rounded_tick_rather_than_clipping() {
+        let ticks = value_ticks(17_849_000_000.0, 17_851_000_000.0, 4);
+        assert!(ticks.len() > 1, "precondition: several ticks {ticks:?}");
+
+        let labelled = tick_labels(&ticks);
+        assert_eq!(labelled.len(), 1, "{labelled:?}");
+        let (tick, label) = &labelled[0];
+        assert!(label.len() <= MAX_TICK_CHARS, "{label}");
+        let stated: f64 = label.parse().unwrap();
+        assert!((tick - stated).abs() <= 0.5e8, "{label} is not {tick} rounded");
+    }
+
+    /// Where rounding leaves some ticks exact, those are the ones kept: their labels are their values, so
+    /// the gap between them reads true. Here `-5e-13` would round to `-0e-12`.
+    #[test]
+    fn when_some_ticks_survive_rounding_exactly_only_those_are_kept() {
+        assert_eq!(labels_of(&[-1e-12, -5e-13, 0.0]), ["-1e-12", "0"]);
+    }
+
+    /// The property the geometry asserts rest on, over every magnitude and every relative spread an axis
+    /// could plausibly have: no label is longer than [`MAX_TICK_CHARS`], none repeats, they read in the
+    /// order their gridlines stand in — and wherever there are two or more, each states its gridline's
+    /// value exactly, so the gap between them is the gap on screen.
+    #[test]
+    fn every_axis_fits_reads_in_order_and_never_repeats_a_label() {
+        for exponent in -12..=15 {
+            for spread in [0.0, 1e-9, 1e-6, 1e-3, 0.1, 1.0, 10.0] {
+                for sign in [1.0, -1.0] {
+                    let lo = sign * 1.234_567 * 10f64.powi(exponent);
+                    let hi = lo + spread * lo.abs();
+                    let pad = ((hi - lo) * 0.08).max(f64::EPSILON);
+                    let ticks = value_ticks(lo - pad, hi + pad, 4);
+                    let labelled = tick_labels(&ticks);
+                    let case = format!("{lo:e}..{hi:e}: {labelled:?}");
+
+                    assert!(!labelled.is_empty(), "{case}");
+                    assert!(labelled.iter().all(|(_, l)| l.len() <= MAX_TICK_CHARS), "{case}");
+                    let values: Vec<f64> = labelled.iter().map(|(_, l)| l.parse().unwrap()).collect();
+                    assert!(values.windows(2).all(|w| w[0] < w[1]), "{case}");
+                    if let [(first, _), (second, _), ..] = labelled[..] {
+                        let gap = second - first;
+                        assert!(
+                            labelled.iter().zip(&values).all(|((t, _), v)| (t - v).abs() <= gap * 1e-6),
+                            "{case}"
+                        );
+                    }
+                }
+            }
+        }
     }
 
     #[test]
@@ -856,6 +1171,134 @@ mod tests {
         assert_eq!(value_label(3.29), "3.29");
         assert_eq!(value_label(3.29_f64 + f64::EPSILON), "3.29", "float noise is trimmed");
         assert_eq!(value_label(-0.5), "-0.5");
+    }
+
+    fn ends(names: &[&str], x: f64, ys: &[f64]) -> Vec<EndLabel> {
+        names.iter().zip(ys).map(|(n, y)| EndLabel { x, y: *y, text: (*n).to_owned() }).collect()
+    }
+
+    fn margin_start(geo: &Geometry) -> f64 {
+        geo.plot_right() + END_LABEL_GAP
+    }
+
+    /// **The regression test for the cropped device.** The deployed filesystem chart, one line per device:
+    /// fourteen characters differing only in the last, which the inline margin cut exactly there. They are
+    /// left to the legend rather than drawn as the same truncated name twice — and drawn where they fit.
+    #[test]
+    fn names_that_do_not_fit_whole_are_left_to_the_legend() {
+        let devices = ["/dev/mmcblk0p1", "/dev/mmcblk0p2"];
+        let inline = &Geometry::INLINE;
+        assert!(end_labels(ends(&devices, margin_start(inline), &[50.0, 150.0]), inline).is_empty());
+
+        let wide = &Geometry::FULL_WIDE;
+        assert_eq!(end_labels(ends(&devices, margin_start(wide), &[50.0, 150.0]), wide).len(), 2);
+
+        // The phone-sized chart has 14 units of margin: no name fits there.
+        let narrow = &Geometry::FULL_NARROW;
+        assert!(end_labels(ends(&["/"], margin_start(narrow), &[50.0]), narrow).is_empty());
+    }
+
+    #[test]
+    fn short_names_that_fit_are_drawn() {
+        let inline = &Geometry::INLINE;
+        let labels = ends(&["/", "/boot"], margin_start(inline), &[50.0, 150.0]);
+        assert_eq!(end_labels(labels.clone(), inline), labels);
+    }
+
+    /// One name that does not fit takes the others with it: half a chart named reads as though the unnamed
+    /// lines were different in kind.
+    #[test]
+    fn it_is_all_names_or_none() {
+        let inline = &Geometry::INLINE;
+        let labels = ends(&["/", "/dev/mmcblk0p2"], margin_start(inline), &[50.0, 150.0]);
+        assert!(end_labels(labels, inline).is_empty());
+    }
+
+    /// A line that stops before the window does has its name further left, with room to spare.
+    #[test]
+    fn a_line_that_ends_early_has_room_for_a_longer_name() {
+        let inline = &Geometry::INLINE;
+        let labels = ends(&["/dev/mmcblk0p2"], margin_start(inline) - 200.0, &[50.0]);
+        assert_eq!(end_labels(labels, inline).len(), 1);
+    }
+
+    /// Two lines ending at nearly the same value would print their names over each other.
+    #[test]
+    fn names_that_would_overlap_are_left_to_the_legend() {
+        let inline = &Geometry::INLINE;
+        assert!(end_labels(ends(&["a", "b"], margin_start(inline), &[100.0, 105.0]), inline).is_empty());
+        assert_eq!(end_labels(ends(&["a", "b"], margin_start(inline), &[100.0, 114.0]), inline).len(), 2);
+    }
+
+    #[test]
+    fn more_than_four_names_are_left_to_the_legend() {
+        let inline = &Geometry::INLINE;
+        let five = ends(&["a", "b", "c", "d", "e"], margin_start(inline), &[20.0, 60.0, 100.0, 140.0, 180.0]);
+        assert!(end_labels(five, inline).is_empty());
+    }
+
+    /// Device-supplied names can be CJK, which a monospace face draws two columns wide. Counted as one, a
+    /// seven-character SSID would be measured at half its width and cropped.
+    #[test]
+    fn wide_characters_are_measured_as_two_columns() {
+        assert_eq!(columns("cafe"), 4);
+        assert_eq!(columns("咖啡馆"), 6);
+        let inline = &Geometry::INLINE;
+        let x = margin_start(inline);
+        // Seven characters either way; the inline margin holds about twelve columns.
+        assert_eq!(end_labels(ends(&["abcdefg"], x, &[50.0]), inline).len(), 1);
+        assert!(end_labels(ends(&["咖啡馆咖啡馆咖"], x, &[50.0]), inline).is_empty());
+    }
+
+    /// Rendered, not only decided: the names are in text ink rather than the series colour, and absent
+    /// where they would not fit.
+    #[test]
+    fn end_labels_render_in_text_ink_and_only_where_they_fit() {
+        let series: Vec<Series> = [("/dev/mmcblk0p1", 0.88e9), ("/dev/mmcblk0p2", 17.85e9)]
+            .iter()
+            .map(|(name, v)| Series {
+                group: Some((*name).to_owned()),
+                points: vec![point(0, Some(*v)), point(1_000, Some(*v))],
+            })
+            .collect();
+        let render = |geo| value_chart(&series, &slots(2), 0, 1_000, "free_bytes", geo, None);
+
+        let wide = render(&Geometry::FULL_WIDE);
+        assert_eq!(wide.matches("class=\"direct\"").count(), 2, "{wide}");
+        assert!(wide.contains(">/dev/mmcblk0p2</text>"), "{wide}");
+        assert!(!wide.contains("class=\"direct\" fill="), "names are not drawn in the series colour: {wide}");
+
+        let inline = render(&Geometry::INLINE);
+        assert!(!inline.contains("class=\"direct\""), "{inline}");
+    }
+
+    /// A tooltip has room for every digit, so it keeps them: a huge count exactly, and a tiny value with
+    /// enough decimals to be more than `0`.
+    #[test]
+    fn value_labels_keep_large_and_tiny_values_readable() {
+        assert_eq!(value_label(17_849_954_304.0), "17849954304");
+        assert_eq!(value_label(0.00002), "0.00002");
+        assert_eq!(value_label(1.5e-7), "0.00000015");
+        assert_eq!(value_label(3.29333333), "3.2933", "four decimals is still the floor");
+    }
+
+    /// The labels are rendered, not only formatted: a value chart over the filesystem's range carries the
+    /// scientific labels and none of the eleven-digit ones that were clipped.
+    #[test]
+    fn a_value_chart_of_large_values_renders_scientific_labels() {
+        let points = vec![point(0, Some(17.85e9)), point(1_000, Some(18.6e9))];
+        let svg = value_chart(
+            &[Series { group: None, points }],
+            &slots(1),
+            0,
+            2_000,
+            "available_bytes",
+            &Geometry::FULL_NARROW,
+            None,
+        );
+        assert!(svg.contains(">1.80e10</text>") || svg.contains(">1.8e10</text>"), "{svg}");
+        assert!(!svg.contains("18000000000"), "{svg}");
+        assert!(svg.contains("font-size=\"13\""), "the narrow preset's own size: {svg}");
     }
 
     /// The regression test for recolour-on-filter: a series' colour depends on its own position in

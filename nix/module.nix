@@ -195,6 +195,9 @@ in
         # wait mid-flight and produces an accidental failure instead of the deliberate one. The
         # default 90 s would do exactly that. Deriving it means raising maxPolls cannot silently
         # reintroduce the bug.
+        #
+        # A long schema migration is no reason to raise it: `serve` extends the timeout itself while
+        # one runs (SPEC.md §9.2).
         TimeoutStartSec =
           if cfg.clockGate.enable then
             cfg.clockGate.maxPolls * cfg.clockGate.pollIntervalSecs + 120

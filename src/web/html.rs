@@ -84,6 +84,9 @@ td.act{white-space:nowrap;width:1%}\
 .empty{opacity:.7;font-style:italic}\
 .error{color:var(--err);font-weight:600}\
 .note{font-size:.8rem;color:var(--text-2);margin:.25rem 0}\
+/* Padded so each step is a target a thumb can hit, not just the width of its words. */\
+.steps{font-size:.8rem;margin:.25rem 0}\
+.steps a{display:inline-block;padding:.35rem .25rem}\
 button{font:inherit;padding:.4rem .8rem;cursor:pointer}\
 button.link{background:none;border:none;padding:0;color:var(--err);text-decoration:underline;cursor:pointer;font:inherit}\
 select,input{font:inherit;padding:.3rem}\
@@ -111,11 +114,11 @@ width:100%;height:auto}\
    cannot serve a phone and a desktop: the browser scales the text with everything else, so a \
    desktop-sized viewBox squeezed into a portrait viewport renders 11px labels at about 4px. */\
 .plot.narrow{display:none}\
-.plot.narrow .tick{font-size:13px}\
 .plot.narrow .empty-plot{font-size:14px}\
 .grid{stroke:var(--grid);stroke-width:1}\
 .axis{stroke:var(--axis);stroke-width:1}\
-.tick{fill:var(--muted);font-size:11px;font-variant-numeric:tabular-nums}\
+/* No font-size: each preset sets its own on the text, where svg.rs can check the labels fit. */\
+.tick{fill:var(--muted);font-variant-numeric:tabular-nums}\
 .tick-y{text-anchor:end}\
 .tick-x{text-anchor:middle}\
 .col{fill:var(--series-1)}\
@@ -125,7 +128,8 @@ width:100%;height:auto}\
 /* The drill-down zones are invisible until pointed at, which is the only feedback available \
    without scripting — and it is enough to show the chart is clickable. */\
 .hit:hover{fill:var(--grid)!important;fill-opacity:.5}\
-.direct{font-size:11px}\
+/* Text ink, not the series colour: the line it sits against carries that. Sized by the chart's geometry. */\
+.direct{fill:var(--text-2)}\
 .empty-plot{fill:var(--muted);font-size:12px}\
 .legend{list-style:none;display:flex;gap:1rem;flex-wrap:wrap;padding:0;margin:.25rem 0;font-size:.78rem;color:var(--text-2)}\
 .legend a{color:inherit;text-decoration:none}\
@@ -171,6 +175,7 @@ pub fn page(title: &str, current_path: &str, content: &str) -> String {
         ("/keys", "api keys"),
         ("/users", "users"),
         ("/sessions", "sessions"),
+        ("/account", "account"),
     ]
         .iter()
         .map(|(path, label)| {
@@ -212,7 +217,9 @@ const DOCTYPE: &str = "<!doctype html>\n<html lang=\"en\">\n<meta charset=\"utf-
 /// `error` is rendered when a previous attempt failed. It is a fixed string chosen by the caller, never
 /// anything the request supplied — see [`super::login`] for why the message is identical for every way a
 /// login can fail.
-pub fn login(error: Option<&str>) -> String {
+/// The login page. `passkey` is the passkey section, already rendered (`web::passkey_page`), or empty when
+/// there is none to offer — it goes first, since it is one tap where the password is two fields.
+pub fn login(error: Option<&str>, passkey: &str) -> String {
     let message = match error {
         Some(text) => format!("<p class=\"error\">{}</p>\n", escape(text)),
         None => String::new(),
@@ -220,13 +227,13 @@ pub fn login(error: Option<&str>) -> String {
 
     format!(
         "{}<title>log in — monitoring platform</title>\n<style>{}</style>\n\
-         <h1>monitoring platform</h1>\n\
-         <form class=\"login\" method=\"post\" action=\"/login\">\n{}\
+         <h1>monitoring platform</h1>\n{}{}\
+         <form class=\"login\" method=\"post\" action=\"/login\">\n\
          <label>username<input name=\"username\" autocomplete=\"username\" autofocus required></label>\n\
          <label>password<input name=\"password\" type=\"password\" autocomplete=\"current-password\" required></label>\n\
          <button type=\"submit\">log in</button>\n\
          </form>\n",
-        DOCTYPE, STYLE, message
+        DOCTYPE, STYLE, message, passkey
     )
 }
 
@@ -738,7 +745,7 @@ mod tests {
         assert!(rendered.contains("width=device-width"), "{rendered}");
         for blocking in ["user-scalable=no", "user-scalable=0", "maximum-scale"] {
             assert!(!rendered.contains(blocking), "{blocking} would disable pinch-to-zoom");
-            assert!(!login(None).contains(blocking), "{blocking} on the login page");
+            assert!(!login(None, "").contains(blocking), "{blocking} on the login page");
         }
     }
 
@@ -773,15 +780,15 @@ mod tests {
         let rendered = page("measurements", "/", "");
         assert!(!rendered.contains("http://"), "{rendered}");
         assert!(rendered.contains(r#"action="/logout""#));
-        assert!(login(None).contains(r#"action="/login""#));
-        assert!(!login(None).contains("http://"));
+        assert!(login(None, "").contains(r#"action="/login""#));
+        assert!(!login(None, "").contains("http://"));
     }
 
     #[test]
     fn the_login_form_shows_an_error_only_when_there_is_one() {
-        assert!(!login(None).contains("class=\"error\""));
+        assert!(!login(None, "").contains("class=\"error\""));
 
-        let failed = login(Some("that did not work"));
+        let failed = login(Some("that did not work"), "");
         assert!(failed.contains("class=\"error\""));
         assert!(failed.contains("that did not work"));
     }
@@ -789,7 +796,7 @@ mod tests {
     /// No nav and no logout button: every link on it would bounce straight back to the form.
     #[test]
     fn the_login_page_offers_nothing_to_click_through_to() {
-        let rendered = login(None);
+        let rendered = login(None, "");
         assert!(!rendered.contains("<nav"), "{rendered}");
         assert!(!rendered.contains("/logout"), "{rendered}");
     }

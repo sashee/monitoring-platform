@@ -21,12 +21,17 @@ use crate::store::sessions::SessionRecord;
 /// other things also use.
 pub const COOKIE: &str = "mp_session";
 
-/// How long a session lasts, in nanoseconds. Thirty days.
+/// How long a session lasts, in nanoseconds. Four hours (SPEC §14.2).
+///
+/// Thirty days until passkeys (§14.10): when signing in meant typing a long random password, a session that
+/// outlived a working week was the convenient choice. With a passkey it is one tap, so a session can last a
+/// sitting rather than a month — and a cookie that leaks is good for hours, not weeks. Sessions created under a
+/// longer lifetime are cut to this one when the receiver starts (`store::sessions::cap_lifetimes`).
 ///
 /// A constant rather than a module option: it is one operator's own convenience, nothing depends on the
 /// value, and `nix/module.nix` gaining a knob nobody turns is a thing to explain later. If it ever needs
-/// to vary per host, `sessionTtlDays` alongside `logLevel` is where it goes.
-pub const TTL_NANOS: i64 = 30 * 24 * 60 * 60 * 1_000_000_000;
+/// to vary per host, `sessionTtlHours` alongside `logLevel` is where it goes.
+pub const TTL_NANOS: i64 = 4 * 60 * 60 * 1_000_000_000;
 
 /// What the session layer concluded about one request.
 ///
@@ -314,7 +319,7 @@ mod tests {
         assert!(cookie.contains("HttpOnly"), "{cookie}");
         assert!(cookie.contains("SameSite=Strict"), "{cookie}");
         assert!(cookie.contains("Path=/"), "{cookie}");
-        assert!(cookie.contains("Max-Age=2592000"), "30 days in seconds: {cookie}");
+        assert!(cookie.contains("Max-Age=14400"), "four hours in seconds: {cookie}");
     }
 
     /// Pinned, and the comment on [`session_cookie`] says why: the browser reaches this over plain HTTP on

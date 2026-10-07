@@ -23,6 +23,10 @@ pub const MAX_LIMIT: i64 = 1000;
 /// the schema makes that unreachable rather than merely unlikely: `series_id` is `NOT NULL` with a
 /// foreign key, so the absent and the dangling case are both refused at write time. Through 3.2 and 3.3
 /// the same guarantee cost a startup sweep that had to succeed before the socket was bound.
+///
+/// Queries about series rather than rows — the type list, attribute facets, the extent, an attribute
+/// grouping — start from `series sr` instead and reach `measurement` through a correlated lookup on
+/// `measurement_series_event_time_idx`, so their cost follows the number of series rather than of rows.
 const FROM_MEASUREMENT: &str = "FROM measurement m JOIN series sr ON sr.id = m.series_id";
 
 /// The same table without the join, for queries that read neither `type` nor `attributes`.
@@ -31,15 +35,11 @@ const FROM_MEASUREMENT: &str = "FROM measurement m JOIN series sr ON sr.id = m.s
 /// startup precondition above — so an inner join to a primary key matches exactly once, and dropping it
 /// when nothing reads `sr` changes no result.
 ///
-/// Worth the branch on measured cost, not on principle. On the deployed database the unfiltered
-/// `all`-range extent goes 51.6 ms joined → 15.8 ms bare, and the unfiltered timeline 126 ms → 77 ms:
-/// together about 85 ms off a landing-page render, on two queries that read nothing from `series` at all.
-/// Both remain a covering-index scan either way — SQLite applies its min/max index shortcut only to a
-/// single aggregate, never to `min(x), max(x)` in one select — so this is a constant factor on an already
-/// linear scan, not a change in growth.
-///
-/// A *filtered* extent is a different shape and stays joined: driven from the 1,460-row `series` table it
-/// costs 9.0 ms, less than the bare scan it replaces.
+/// Worth the branch on measured cost, not on principle. On the deployed database the unfiltered timeline
+/// goes 126 ms joined → 77 ms bare, on a query that reads nothing from `series` at all. It remains a
+/// covering-index scan either way, so this is a constant factor on an already linear scan, not a change in
+/// growth. The extent was the other beneficiary until it stopped scanning altogether — see
+/// [`build_extent_query`].
 const FROM_MEASUREMENT_ONLY: &str = "FROM measurement m";
 
 /// Whether a filter set reads `series`. `body` is still a `measurement` column, so it does not count.
@@ -93,15 +93,6 @@ impl FieldRef {
         }
     }
 
-    /// The bare column name, for use inside the facet CTE, which projects both halves under its own
-    /// alias.
-    fn column(&self) -> &'static str {
-        match self {
-            FieldRef::Attribute(_) => "attributes",
-            FieldRef::Body(_) => "body",
-        }
-    }
-
     /// The column qualified by the table it now lives in: attributes moved to `series`, the body did
     /// not. Used everywhere the join itself is in scope (see [`FROM_MEASUREMENT`]).
     fn qualified(&self) -> &'static str {
@@ -152,16 +143,28 @@ pub fn json_path(key: &str) -> String {
     out
 }
 
-/// Appends the `type`, time-window and attribute predicates to a query under construction.
+/// Appends the `type`, time-window, attribute and body predicates to a query under construction.
 ///
-/// Shared by the row query ([`build_query`]), the aggregated series query
-/// ([`build_series_query`]) and facet discovery ([`build_facet_sample`]) — deliberately, because a
-/// filter that meant one thing on the table and another on the chart above it would be a chart that
-/// does not describe the rows beneath it. There is one predicate builder so that cannot drift.
+/// Shared by the row query ([`build_query`]), the aggregated series query ([`build_series_query`]), facet
+/// discovery and the extent — whole, or as its two halves where a query is driven from `series` —
+/// deliberately, because a filter that meant one thing on the table and another on the chart above it
+/// would be a chart that does not describe the rows beneath it. There is one predicate builder so that
+/// cannot drift.
 ///
 /// `params` is appended to, and the `?N` placeholders are derived from its length, so this must be
 /// called at the point the caller wants these parameters bound.
 fn push_filters(spec: &QuerySpec, where_clauses: &mut Vec<String>, params: &mut Vec<SqlValue>) {
+    push_series_filters(spec, where_clauses, params);
+    push_measurement_filters(spec, where_clauses, params);
+}
+
+/// The half of [`push_filters`] that constrains `series` (as `sr`): the type and the attributes.
+///
+/// Split out for the queries that are driven from `series` rather than from the rows — attribute facets,
+/// the extent, and an attribute-grouped chart. They apply this half once per series and the other half
+/// inside a correlated lookup on `measurement`, which is what makes their cost depend on how many series
+/// there are rather than on how many rows.
+fn push_series_filters(spec: &QuerySpec, where_clauses: &mut Vec<String>, params: &mut Vec<SqlValue>) {
     if !spec.types.is_empty() {
         let placeholders = spec
             .types
@@ -174,7 +177,15 @@ fn push_filters(spec: &QuerySpec, where_clauses: &mut Vec<String>, params: &mut 
             .join(", ");
         where_clauses.push(format!("sr.type IN ({placeholders})"));
     }
+    push_field_filters("sr.attributes", &spec.attrs, where_clauses, params);
+}
 
+/// The half of [`push_filters`] that constrains `measurement` (as `m`): the window and the body leaves.
+fn push_measurement_filters(
+    spec: &QuerySpec,
+    where_clauses: &mut Vec<String>,
+    params: &mut Vec<SqlValue>,
+) {
     if let Some(from) = spec.from {
         params.push(SqlValue::Integer(from));
         where_clauses.push(format!("m.event_time >= ?{}", params.len()));
@@ -183,37 +194,50 @@ fn push_filters(spec: &QuerySpec, where_clauses: &mut Vec<String>, params: &mut 
         params.push(SqlValue::Integer(to));
         where_clauses.push(format!("m.event_time < ?{}", params.len()));
     }
+    push_field_filters("m.body", &spec.body, where_clauses, params);
+}
 
-    // Attributes and body leaves are the same predicate against different columns (see `FieldRef`), so
-    // they share one builder rather than two that could drift in their guards. They now sit in
-    // different *tables* too, which changes nothing about the predicate.
-    for (column, filters) in [("sr.attributes", &spec.attrs), ("m.body", &spec.body)] {
-        for (key, value) in filters {
-            params.push(SqlValue::Text(json_path(key)));
-            let path_idx = params.len();
-            params.push(SqlValue::Text(value.clone()));
-            let value_idx = params.len();
-            // Two things are load-bearing here:
-            //
-            // The json_type guard keeps nested values out. Without it, json_extract on an object
-            // returns its serialized text, which would match if a caller typed that exact text — an
-            // accidental API resting on SQLite's serialization, and one Postgres would break (SPEC §7.1).
-            //
-            // The CAST is required for the documented "compares as a string" semantics to hold at all:
-            // json_extract yields an INTEGER for `2`, and SQLite never compares an INTEGER equal to the
-            // TEXT parameter '2', so `attr...index=2` would silently match nothing without it.
-            where_clauses.push(format!(
-                "json_type({column}, ?{path_idx}) NOT IN ('object','array') \
-                 AND CAST(json_extract({column}, ?{path_idx}) AS TEXT) = ?{value_idx}"
-            ));
-        }
+/// Equality filters on the leaves of one JSON column.
+///
+/// Attributes and body leaves are the same predicate against different columns (see `FieldRef`), so
+/// they share one builder rather than two that could drift in their guards. They now sit in different
+/// *tables* too, which changes nothing about the predicate.
+fn push_field_filters(
+    column: &str,
+    filters: &[(String, String)],
+    where_clauses: &mut Vec<String>,
+    params: &mut Vec<SqlValue>,
+) {
+    for (key, value) in filters {
+        params.push(SqlValue::Text(json_path(key)));
+        let path_idx = params.len();
+        params.push(SqlValue::Text(value.clone()));
+        let value_idx = params.len();
+        // Two things are load-bearing here:
+        //
+        // The json_type guard keeps nested values out. Without it, json_extract on an object
+        // returns its serialized text, which would match if a caller typed that exact text — an
+        // accidental API resting on SQLite's serialization, and one Postgres would break (SPEC §7.1).
+        //
+        // The CAST is required for the documented "compares as a string" semantics to hold at all:
+        // json_extract yields an INTEGER for `2`, and SQLite never compares an INTEGER equal to the
+        // TEXT parameter '2', so `attr...index=2` would silently match nothing without it.
+        where_clauses.push(format!(
+            "json_type({column}, ?{path_idx}) NOT IN ('object','array') \
+             AND CAST(json_extract({column}, ?{path_idx}) AS TEXT) = ?{value_idx}"
+        ));
     }
+}
+
+/// ` WHERE a AND b …`, or nothing when there are no clauses.
+fn where_sql(clauses: &[String]) -> String {
+    if clauses.is_empty() { String::new() } else { format!(" WHERE {}", clauses.join(" AND ")) }
 }
 
 /// Builds the SELECT and its bound parameters.
 ///
-/// Ordering is always `event_time DESC, id DESC`, matching both indexes, with `id` breaking ties so
-/// pagination stays stable when timestamps collide.
+/// Ordering is always `event_time DESC, id DESC`, which is both indexes read backwards (they ascend since
+/// 4.2), with `id` breaking ties so pagination stays stable when timestamps collide.
 pub fn build_query(spec: &QuerySpec) -> (String, Vec<SqlValue>) {
     let mut sql = format!(
         "SELECT m.id, m.event_time, m.processed_time, sr.type, m.body, sr.attributes \
@@ -238,11 +262,7 @@ pub fn build_query(spec: &QuerySpec) -> (String, Vec<SqlValue>) {
         ));
     }
 
-    if !where_clauses.is_empty() {
-        sql.push_str(" WHERE ");
-        sql.push_str(&where_clauses.join(" AND "));
-    }
-
+    sql.push_str(&where_sql(&where_clauses));
     sql.push_str(" ORDER BY m.event_time DESC, m.id DESC LIMIT ?");
     params.push(SqlValue::Integer(spec.limit.clamp(1, MAX_LIMIT)));
     sql.push_str(&params.len().to_string());
@@ -252,7 +272,8 @@ pub fn build_query(spec: &QuerySpec) -> (String, Vec<SqlValue>) {
 
 // ---------------------------------------------------------------- facets: what is there to filter on
 
-/// How many rows facet discovery reads. See [`facets`] for why this is a sample rather than a scan.
+/// How many rows body-leaf discovery reads. See [`facets`] for why that half is a sample and the attribute
+/// half is not.
 pub const FACET_SCAN_LIMIT: i64 = 2_000;
 
 /// Distinct values to offer for one attribute key before giving up on a dropdown.
@@ -276,13 +297,6 @@ pub const PALETTE_SLOTS: usize = 8;
 /// A bound is still needed — a scan finding four hundred networks is not a chart — and past this the UI
 /// says how many it left out rather than truncating silently.
 pub const MAX_SERIES: usize = PALETTE_SLOTS * 3;
-
-/// One measurement type and how many rows carry it.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct TypeCount {
-    pub kind: String,
-    pub count: i64,
-}
 
 /// One attribute key and the values seen for it, for building a filter control.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -314,88 +328,89 @@ pub struct FieldFacet {
 pub struct Facets {
     pub attrs: Vec<AttrFacet>,
     pub fields: Vec<FieldFacet>,
-    /// Rows examined. Equal to [`FACET_SCAN_LIMIT`] when the cap was reached.
+    /// Rows examined for the body leaves. Equal to [`FACET_SCAN_LIMIT`] when the cap was reached. The
+    /// attributes are exact and read no sample.
     pub scanned: i64,
     pub capped: bool,
 }
 
-/// Every type in the table, with counts, **in name order**.
+/// Every type that has measurements, **in name order**.
 ///
 /// Alphabetical rather than by row count. Count order sounds useful — busiest first — but the thing a reader
 /// does with a list of twenty-nine names is *look for one*, and in count order that means reading all of
 /// them. Name order also brings each family together (`bms.*`, `detected-devices.*`, `system.*`), which is
-/// how these names are actually structured. The count stays in the label, where it is information rather
-/// than a sort key.
+/// how these names are actually structured.
 ///
-/// Exact rather than sampled, and it stays that way through the join: `measurement_series_event_time_idx`
-/// lets this be driven from the 1,458-row `series` table with one index range per series, so it never
-/// visits a table page or touches JSON.
+/// **No counts.** This used to say how many rows each type had, and that made it the most expensive query on
+/// the page: a count is a walk over every entry of `measurement_series_event_time_idx`, so it grew with the
+/// age of the database rather than with anything being viewed — 94 ms at a million rows, on every render.
+/// `series.added_measurements` would answer instantly but answers a different question the moment anything
+/// deletes rows (SPEC §6.7), so the count went rather than become a lie.
 ///
-/// Counts come from `measurement`, not from `series.added_measurements`. The two agree today and will
-/// stop agreeing the moment anything deletes rows — this list describes what is *in* the table, which is
-/// the whole reason those columns are named `added_*` (SPEC §6.7).
-pub fn types(conn: &Connection) -> Result<Vec<TypeCount>> {
+/// Driven from `series`, with one index probe per series to confirm it still has a row. That probe is what
+/// keeps this a list of what is *in* the table rather than of everything ever added: today every series has
+/// rows, and once retention exists one may not.
+pub fn types(conn: &Connection) -> Result<Vec<String>> {
     let mut stmt = conn
-        .prepare(&format!(
-            "SELECT sr.type, count(*) {FROM_MEASUREMENT} GROUP BY sr.type ORDER BY sr.type"
-        ))
+        .prepare(
+            "SELECT DISTINCT sr.type FROM series sr \
+             WHERE EXISTS (SELECT 1 FROM measurement m WHERE m.series_id = sr.id) ORDER BY sr.type",
+        )
         .context("preparing the type listing")?;
     let out = stmt
-        .query_map([], |row| Ok(TypeCount { kind: row.get(0)?, count: row.get(1)? }))
+        .query_map([], |row| row.get(0))
         .context("listing types")?
         .collect::<rusqlite::Result<Vec<_>>>()
         .context("reading the type listing")?;
     Ok(out)
 }
 
-/// The `WITH sample AS (…)` prefix every facet query shares: the newest matching rows, capped.
-fn build_facet_sample(spec: &QuerySpec) -> (String, Vec<SqlValue>) {
-    let mut where_clauses = Vec::new();
-    let mut params = Vec::new();
-    push_filters(spec, &mut where_clauses, &mut params);
-
-    // The CTE projects both halves under its own alias, so everything downstream of it keeps reading
-    // `s.attributes` and `s.body` and does not need to know which table they came from.
-    let mut sql = format!(
-        "WITH sample AS (SELECT sr.attributes AS attributes, m.body AS body {FROM_MEASUREMENT}"
-    );
-    if !where_clauses.is_empty() {
-        sql.push_str(" WHERE ");
-        sql.push_str(&where_clauses.join(" AND "));
+/// Adds one discovered value to a facet's options, or marks them truncated once they are full.
+///
+/// A JSON null reads as no value to filter on rather than as the string "null".
+fn offer(values: &mut Vec<String>, truncated: &mut bool, value: Option<String>) {
+    match value {
+        Some(v) if values.len() < MAX_FACET_VALUES => values.push(v),
+        Some(_) => *truncated = true,
+        None => {}
     }
-    params.push(SqlValue::Integer(FACET_SCAN_LIMIT));
-    sql.push_str(&format!(" ORDER BY m.event_time DESC, m.id DESC LIMIT ?{})", params.len()));
-    (sql, params)
 }
 
-/// Discovers what is filterable and chartable in the slice `spec` describes.
+/// Attribute keys and their values over the slice, optionally for one key only. **Exact, from `series`.**
 ///
-/// **A bounded sample, not a scan, and the distinction is deliberate.** Discovery reads the newest
-/// [`FACET_SCAN_LIMIT`] matching rows. A full scan of the largest type costs 145 ms today, which
-/// would be fine — but that grows with the table, and this host projects millions of rows a year, so
-/// the same page would take seconds within a year of running. Sampling is what makes the cost depend
-/// on the window being viewed rather than on how long the Pi has been up.
+/// Attributes are a property of the series, so the question "which values occur in this slice" is "which
+/// series have a row in it" — one probe of `measurement_series_event_time_idx` per series, rather than
+/// reading rows and parsing the same attribute text once per row. On a million-row table that is 2.5 ms
+/// against 31 ms for the old 2,000-row sample, and it is complete where the sample was not: a device that
+/// stopped reporting early in a long window is still offered.
 ///
-/// What makes it sound is that **attribute keys are uniform per type**: all 32,112 `bms.status.cell`
-/// rows carry the same twelve keys, so a few hundred rows reveal every one. Distinct *values* can be
-/// missed — a device that stopped reporting an hour into a week-long window — which is why
-/// [`Facets::capped`] exists for the UI to say so.
+/// A body filter makes the probe a walk: each series is read until a row matches, so a series that matches
+/// nothing is read across the whole window. That bounds it by the rows in the window, which is still no more
+/// than the sample had to read to find its matches.
 ///
-/// **Only discovery is sampled. Filtering is always exact** over the whole window: these facets
-/// populate the controls, they never restrict what a query returns.
-pub fn facets(conn: &Connection, spec: &QuerySpec) -> Result<Facets> {
-    let (prefix, base_params) = build_facet_sample(spec);
+/// The json_type guard matches what `push_filters` will accept as a filter, so the UI cannot offer an
+/// option that provably matches nothing (SPEC §7.1).
+fn attribute_facets(conn: &Connection, spec: &QuerySpec, key: Option<&str>) -> Result<Vec<AttrFacet>> {
+    let mut params = Vec::new();
+    let mut series_where = Vec::new();
+    push_series_filters(spec, &mut series_where, &mut params);
+    let mut row_where = vec!["m.series_id = sr.id".to_owned()];
+    push_measurement_filters(spec, &mut row_where, &mut params);
+    series_where.push(format!("EXISTS (SELECT 1 FROM measurement m{})", where_sql(&row_where)));
+    series_where.push("j.type NOT IN ('object','array')".to_owned());
+    if let Some(key) = key {
+        params.push(SqlValue::Text(key.to_owned()));
+        series_where.push(format!("j.key = ?{}", params.len()));
+    }
 
-    // Attribute keys and their values. The json_type guard matches what `push_filters` will accept as
-    // a filter, so the UI cannot offer an option that provably matches nothing (SPEC §7.1).
-    let attr_sql = format!(
-        "{prefix} SELECT j.key, CAST(j.value AS TEXT), count(*) \
-         FROM sample s, json_each(s.attributes) j \
-         WHERE j.type NOT IN ('object','array') GROUP BY 1, 2 ORDER BY 1, 2"
+    let sql = format!(
+        "SELECT j.key, CAST(j.value AS TEXT) FROM series sr, json_each(sr.attributes) j{} \
+         GROUP BY 1, 2 ORDER BY 1, 2",
+        where_sql(&series_where)
     );
-    let mut stmt = conn.prepare(&attr_sql).context("preparing the attribute facet query")?;
+    let mut stmt = conn.prepare(&sql).context("preparing the attribute facet query")?;
     let rows = stmt
-        .query_map(rusqlite::params_from_iter(base_params.clone()), |row| {
+        .query_map(rusqlite::params_from_iter(params), |row| {
             Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?))
         })
         .context("running the attribute facet query")?;
@@ -408,20 +423,54 @@ pub fn facets(conn: &Connection, spec: &QuerySpec) -> Result<Facets> {
             attrs.push(AttrFacet { key, values: Vec::new(), truncated: false });
         }
         let facet = attrs.last_mut().expect("just pushed");
-        match value {
-            Some(v) if facet.values.len() < MAX_FACET_VALUES => facet.values.push(v),
-            // A JSON null reads as no value to filter on rather than the string "null".
-            Some(_) => facet.truncated = true,
-            None => {}
-        }
+        offer(&mut facet.values, &mut facet.truncated, value);
     }
+    Ok(attrs)
+}
 
-    // Body leaves. `json_type(s.body) = 'object'` guards both a NULL body and the scalar case: every
-    // type on this host has an object body today, but json_each over a scalar yields one keyless row
-    // that would show up as a field named nothing.
-    // Body leaves, with their values, exactly as the attributes above: same grouping, same cap, same
-    // reason. The `numeric` flag rides along because it decides what can be *plotted* rather than what can
-    // be filtered.
+/// The `WITH sample AS (…)` prefix every body-facet query shares: the newest matching rows, capped.
+///
+/// Joins `series` only when the filters read it, for the reason [`FROM_MEASUREMENT_ONLY`] gives.
+fn build_body_sample(spec: &QuerySpec) -> (String, Vec<SqlValue>) {
+    let mut where_clauses = Vec::new();
+    let mut params = Vec::new();
+    push_filters(spec, &mut where_clauses, &mut params);
+
+    params.push(SqlValue::Integer(FACET_SCAN_LIMIT));
+    let sql = format!(
+        "WITH sample AS (SELECT m.body AS body {}{} ORDER BY m.event_time DESC, m.id DESC LIMIT ?{})",
+        from_clause(filters_need_series(spec)),
+        where_sql(&where_clauses),
+        params.len()
+    );
+    (sql, params)
+}
+
+/// Discovers what is filterable and chartable in the slice `spec` describes.
+///
+/// **Attributes are exact; body leaves are a bounded sample.** Attributes belong to the series, and there
+/// are orders of magnitude fewer series than rows — see [`attribute_facets`]. A body leaf belongs to each
+/// row, so discovering one means reading rows, and a full scan of the largest type costs 145 ms today and
+/// grows with the table: this host projects millions of rows a year, so the same page would take seconds
+/// within a year of running. So body discovery reads the newest [`FACET_SCAN_LIMIT`] matching rows, which
+/// makes its cost depend on the window being viewed rather than on how long the Pi has been up.
+///
+/// What makes that sound is that **body shape is uniform per type**: every row of a type carries the same
+/// leaves, so a few hundred rows reveal every one. Distinct *values* can be missed, which is why
+/// [`Facets::capped`] exists for the UI to say so.
+///
+/// **Only discovery is sampled. Filtering is always exact** over the whole window: these facets
+/// populate the controls, they never restrict what a query returns.
+pub fn facets(conn: &Connection, spec: &QuerySpec) -> Result<Facets> {
+    let attrs = attribute_facets(conn, spec, None)?;
+    let (prefix, base_params) = build_body_sample(spec);
+
+    // Body leaves, with their values: the same grouping and cap as the attributes. The `numeric` flag rides
+    // along because it decides what can be *plotted* rather than what can be filtered.
+    //
+    // `json_type(s.body) = 'object'` guards both a NULL body and the scalar case: every type on this host
+    // has an object body today, but json_each over a scalar yields one keyless row that would show up as a
+    // field named nothing.
     let field_sql = format!(
         "{prefix} SELECT j.key, CAST(j.value AS TEXT), max(j.type IN ('integer','real')) \
          FROM sample s, json_each(s.body) j \
@@ -444,14 +493,10 @@ pub fn facets(conn: &Connection, spec: &QuerySpec) -> Result<Facets> {
         let facet = fields.last_mut().expect("just pushed");
         // Numeric if it was numeric in *any* sampled row: a leaf that is sometimes null is still chartable.
         facet.numeric |= numeric;
-        match value {
-            Some(v) if facet.values.len() < MAX_FACET_VALUES => facet.values.push(v),
-            Some(_) => facet.truncated = true,
-            None => {}
-        }
+        offer(&mut facet.values, &mut facet.truncated, value);
     }
 
-    // How much was actually looked at, so the UI can say whether the options are complete.
+    // How much was actually looked at, so the UI can say whether the body options are complete.
     let count_sql = format!("{prefix} SELECT count(*) FROM sample");
     let scanned: i64 = conn
         .query_row(&count_sql, rusqlite::params_from_iter(base_params), |row| row.get(0))
@@ -460,7 +505,7 @@ pub fn facets(conn: &Connection, spec: &QuerySpec) -> Result<Facets> {
     Ok(Facets { attrs, fields, scanned, capped: scanned >= FACET_SCAN_LIMIT })
 }
 
-/// The values to offer for one attribute key, discovered with **that key's own filter removed**.
+/// The values to offer for one field, discovered with **that field's own filter removed**.
 ///
 /// Without this, a filter is a one-way door. [`facets`] scopes discovery to every applied filter, which is
 /// what keeps the options relevant — but applied to the key being filtered it is circular: once
@@ -470,13 +515,16 @@ pub fn facets(conn: &Connection, spec: &QuerySpec) -> Result<Facets> {
 /// so its own filter is the one thing excluded from the question.
 ///
 /// Only called for keys that actually have a filter applied — for the rest [`facets`] is already correct —
-/// so the extra cost is one query per active filter, not per key.
+/// so the extra cost is one query per active filter, not per key. Discovered the same way [`facets`]
+/// discovers that half: exactly from `series` for an attribute, from the sample for a body leaf.
 pub fn facet_values_excluding(
     conn: &Connection,
     spec: &QuerySpec,
     field: &FieldRef,
 ) -> Result<AttrFacet> {
     let key = field.name();
+    let empty = || AttrFacet { key: key.to_owned(), values: Vec::new(), truncated: false };
+
     // The same slice, minus this field's own constraint — and only its own: the other half's filters still
     // apply, as do the other keys in this half.
     let widened = match field {
@@ -489,14 +537,16 @@ pub fn facet_values_excluding(
             ..spec.clone()
         },
     };
-    let (prefix, mut params) = build_facet_sample(&widened);
+    if let FieldRef::Attribute(_) = field {
+        return Ok(attribute_facets(conn, &widened, Some(key))?.into_iter().next().unwrap_or_else(empty));
+    }
 
+    let (prefix, mut params) = build_body_sample(&widened);
     params.push(SqlValue::Text(key.to_owned()));
-    let key_param = params.len();
-    let column = field.column();
     let sql = format!(
-        "{prefix} SELECT CAST(j.value AS TEXT) FROM sample s, json_each(s.{column}) j \
-         WHERE j.key = ?{key_param} AND j.type NOT IN ('object','array') GROUP BY 1 ORDER BY 1"
+        "{prefix} SELECT CAST(j.value AS TEXT) FROM sample s, json_each(s.body) j \
+         WHERE j.key = ?{} AND j.type NOT IN ('object','array') GROUP BY 1 ORDER BY 1",
+        params.len()
     );
 
     let mut stmt = conn.prepare(&sql).context("preparing the widened facet query")?;
@@ -506,13 +556,9 @@ pub fn facet_values_excluding(
         .collect::<rusqlite::Result<Vec<_>>>()
         .context("reading the widened facet values")?;
 
-    let mut facet = AttrFacet { key: key.to_owned(), values: Vec::new(), truncated: false };
-    for value in values.into_iter().flatten() {
-        if facet.values.len() < MAX_FACET_VALUES {
-            facet.values.push(value);
-        } else {
-            facet.truncated = true;
-        }
+    let mut facet = empty();
+    for value in values {
+        offer(&mut facet.values, &mut facet.truncated, value);
     }
     Ok(facet)
 }
@@ -544,20 +590,56 @@ pub fn sort_facet_values(values: &mut [String]) {
 
 /// `(min, max)` of `event_time` over a filtered slice, for the "all time" range.
 ///
-/// Its own tiny query rather than a scan, because both bounds come straight off the `event_time` index.
+/// **Index seeks, not a scan.** SQLite answers `min(x)` or `max(x)` with one seek on an index over `x`, but
+/// only when the aggregate stands alone — `SELECT min(x), max(x)` is a full scan, 83 ms at a million rows.
+/// So each bound is its own scalar subquery:
+///
+/// - with no type or attribute filter, two seeks on `measurement_event_time_idx`;
+/// - with one, two seeks per matching series on `measurement_series_event_time_idx`, folded by an outer
+///   `min`/`max` — 1.9 ms for `bms.status.cell`'s 112 series, against 43 ms for the joined scan.
+///
+/// Exact either way, so it stays true once rows are deleted — unlike `series.added_event_time_*`, which
+/// would answer as fast but describes what was ever added (SPEC §6.7).
+///
+/// **A body filter falls back to the scan.** It turns each seek into a walk that stops at the first matching
+/// row, and for a series where none matches that is every row it has, twice over. The explorer never asks
+/// for that — its `all` window deliberately ignores the value filters — but a caller who does should get the
+/// one-pass scan rather than the trap.
 pub fn build_extent_query(spec: &QuerySpec) -> (String, Vec<SqlValue>) {
-    let mut where_clauses = Vec::new();
     let mut params = Vec::new();
-    push_filters(spec, &mut where_clauses, &mut params);
 
-    let mut sql = format!(
-        "SELECT min(m.event_time), max(m.event_time) {}",
-        from_clause(filters_need_series(spec))
-    );
-    if !where_clauses.is_empty() {
-        sql.push_str(" WHERE ");
-        sql.push_str(&where_clauses.join(" AND "));
+    if !spec.body.is_empty() {
+        let mut where_clauses = Vec::new();
+        push_filters(spec, &mut where_clauses, &mut params);
+        let sql = format!(
+            "SELECT min(m.event_time), max(m.event_time) {}{}",
+            from_clause(filters_need_series(spec)),
+            where_sql(&where_clauses)
+        );
+        return (sql, params);
     }
+
+    let mut series_where = Vec::new();
+    push_series_filters(spec, &mut series_where, &mut params);
+    let mut row_where = Vec::new();
+    if !series_where.is_empty() {
+        row_where.push("m.series_id = sr.id".to_owned());
+    }
+    push_measurement_filters(spec, &mut row_where, &mut params);
+    // Both subqueries bind the same parameters: the placeholders are numbered, not positional.
+    let bound =
+        |agg: &str| format!("(SELECT {agg}(m.event_time) FROM measurement m{})", where_sql(&row_where));
+
+    let sql = if series_where.is_empty() {
+        format!("SELECT {}, {}", bound("min"), bound("max"))
+    } else {
+        format!(
+            "SELECT min({}), max({}) FROM series sr{}",
+            bound("min"),
+            bound("max"),
+            where_sql(&series_where)
+        )
+    };
     (sql, params)
 }
 
@@ -639,39 +721,45 @@ pub fn bucket_nanos(from: i64, to: i64, buckets: i64) -> i64 {
 /// - **`count(*)` and `count(<field>)` are both returned.** The first is the timeline (every matching
 ///   row); the second is how many actually had a number. A bucket where they differ is a bucket whose
 ///   average speaks for only part of it, and the UI can say so.
+///
+/// And two that are about not repeating work on every row, which is where the time goes on a long window —
+/// together they take thirty days of sixteen cells from 1.4 s to 0.76 s on a million-row table:
+///
+/// - **The value is extracted once per row.** Written into each of the four aggregates, it was extracted
+///   four times. The row source `r` computes it once, as a column, and is `MATERIALIZED` so SQLite cannot
+///   inline it back into the aggregates. Only when there is a value, though: for the count-only timeline
+///   the materialisation is pure overhead (40% on a 30-day window), so there it is inlined.
+/// - **An attribute group is resolved once per series**, since it is a property of the series. `sg` reads it
+///   off the `series` rows that pass the series-level filters, and the rows join to that — `MATERIALIZED`
+///   for the same reason as `r`.
 pub fn build_series_query(spec: &SeriesSpec) -> (String, Vec<SqlValue>) {
     let mut where_clauses = Vec::new();
     let mut params: Vec<SqlValue> = Vec::new();
-    push_filters(&spec.filter, &mut where_clauses, &mut params);
 
-    // The group expression, and the restriction to the chosen group values. Nested values resolve to
-    // NULL rather than to their serialized text, for the reason `push_filters` gives: matching on
-    // SQLite's serialization would be an accidental API.
-    let group_expr = match &spec.group {
-        Some(field) => {
-            let column = field.qualified();
-            params.push(SqlValue::Text(json_path(field.name())));
-            let p = params.len();
-            if !spec.groups.is_empty() {
-                let placeholders = spec
-                    .groups
-                    .iter()
-                    .map(|g| {
-                        params.push(SqlValue::Text(g.clone()));
-                        format!("?{}", params.len())
-                    })
-                    .collect::<Vec<_>>()
-                    .join(", ");
-                where_clauses.push(format!(
-                    "CAST(json_extract({column}, ?{p}) AS TEXT) IN ({placeholders})"
-                ));
-            }
-            format!(
-                "CASE WHEN json_type({column}, ?{p}) IN ('object','array') THEN NULL \
-                 ELSE CAST(json_extract({column}, ?{p}) AS TEXT) END"
+    // Where the group comes from decides what the rows are read from.
+    let (series_cte, from, group_expr) = match &spec.group {
+        Some(field @ FieldRef::Attribute(_)) => {
+            let mut series_where = Vec::new();
+            push_series_filters(&spec.filter, &mut series_where, &mut params);
+            let expr = push_group(field, &spec.groups, &mut series_where, &mut params);
+            push_measurement_filters(&spec.filter, &mut where_clauses, &mut params);
+            (
+                format!(
+                    "sg AS MATERIALIZED (SELECT sr.id AS id, {expr} AS g FROM series sr{}), ",
+                    where_sql(&series_where)
+                ),
+                "FROM measurement m JOIN sg ON sg.id = m.series_id",
+                "sg.g".to_owned(),
             )
         }
-        None => "NULL".to_owned(),
+        group => {
+            push_filters(&spec.filter, &mut where_clauses, &mut params);
+            let expr = match group {
+                Some(field) => push_group(field, &spec.groups, &mut where_clauses, &mut params),
+                None => "NULL".to_owned(),
+            };
+            (String::new(), from_clause(filters_need_series(&spec.filter)), expr)
+        }
     };
 
     let value_expr = match &spec.field {
@@ -689,25 +777,49 @@ pub fn build_series_query(spec: &SeriesSpec) -> (String, Vec<SqlValue>) {
     params.push(SqlValue::Integer(spec.bucket_nanos.max(1)));
     let bucket_param = params.len();
 
-    let mut sql = format!(
-        "SELECT {group_expr} AS g, \
-         (m.event_time / ?{bucket_param}) * ?{bucket_param} AS bucket_start, \
-         count(*), count({value_expr}), avg({value_expr}), min({value_expr}), max({value_expr}) \
-         {from}",
-        from = from_clause(
-            filters_need_series(&spec.filter)
-                || matches!(spec.group, Some(FieldRef::Attribute(_)))
-        )
-    );
-    if !where_clauses.is_empty() {
-        sql.push_str(" WHERE ");
-        sql.push_str(&where_clauses.join(" AND "));
-    }
+    let materialized = if spec.field.is_some() { "MATERIALIZED" } else { "NOT MATERIALIZED" };
     // Grouped by the bucket's start rather than its index so the value selected is the one plotted,
     // and ordered so `series` can fold consecutive rows into one series without a map.
-    sql.push_str(" GROUP BY g, bucket_start ORDER BY g, bucket_start");
+    let sql = format!(
+        "WITH {series_cte}r AS {materialized} \
+         (SELECT {group_expr} AS g, m.event_time AS t, {value_expr} AS v {from}{where_}) \
+         SELECT g, (t / ?{bucket_param}) * ?{bucket_param} AS bucket_start, \
+         count(*), count(v), avg(v), min(v), max(v) \
+         FROM r GROUP BY g, bucket_start ORDER BY g, bucket_start",
+        where_ = where_sql(&where_clauses)
+    );
 
     (sql, params)
+}
+
+/// The expression a chart is split by, restricting `where_clauses` to the requested group values if any.
+///
+/// Nested values resolve to NULL rather than to their serialized text, for the reason `push_filters`
+/// gives: matching on SQLite's serialization would be an accidental API.
+fn push_group(
+    field: &FieldRef,
+    groups: &[String],
+    where_clauses: &mut Vec<String>,
+    params: &mut Vec<SqlValue>,
+) -> String {
+    let column = field.qualified();
+    params.push(SqlValue::Text(json_path(field.name())));
+    let p = params.len();
+    if !groups.is_empty() {
+        let placeholders = groups
+            .iter()
+            .map(|g| {
+                params.push(SqlValue::Text(g.clone()));
+                format!("?{}", params.len())
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        where_clauses.push(format!("CAST(json_extract({column}, ?{p}) AS TEXT) IN ({placeholders})"));
+    }
+    format!(
+        "CASE WHEN json_type({column}, ?{p}) IN ('object','array') THEN NULL \
+         ELSE CAST(json_extract({column}, ?{p}) AS TEXT) END"
+    )
 }
 
 /// Runs the aggregated query and folds it into one [`Series`] per group.
@@ -876,7 +988,7 @@ mod tests {
         assert_eq!(rows[0].kind, "gps");
         assert_eq!(rows[0].attributes["record.attributes.unit"], json!("wgs84"));
 
-        assert_eq!(types(&conn).unwrap(), vec![TypeCount { kind: "gps".into(), count: 1 }]);
+        assert_eq!(types(&conn).unwrap(), vec!["gps".to_owned()]);
 
         let by_type = QuerySpec { types: vec!["gps".into()], limit: 10, ..Default::default() };
         assert_eq!(query(&conn, &by_type).unwrap().len(), 1);
@@ -1210,21 +1322,30 @@ mod tests {
     /// Name order, not count order: with twenty-nine types the reader is looking one up, and count order
     /// means reading the whole list to find it.
     #[test]
-    fn types_are_listed_by_name_with_their_counts() {
+    fn types_are_listed_by_name() {
         let conn = db_with(vec![
             m("zebra", 10, json!({})),
             m("zebra", 20, json!({})),
-            m("zebra", 25, json!({})),
+            m("zebra", 25, json!({ "other": "series" })),
             m("apple", 30, json!({})),
         ]);
-        assert_eq!(
-            types(&conn).unwrap(),
-            vec![
-                // `apple` is rarer but comes first, which is the point.
-                TypeCount { kind: "apple".into(), count: 1 },
-                TypeCount { kind: "zebra".into(), count: 3 },
-            ]
-        );
+        // `apple` is rarer but comes first, which is the point — and `zebra`'s two series list it once.
+        assert_eq!(types(&conn).unwrap(), vec!["apple".to_owned(), "zebra".to_owned()]);
+    }
+
+    /// **The list describes what is in the table, not what was ever added.** A series outlives its rows —
+    /// its `added_*` bookkeeping is the only record of what it carried (SPEC §6.7) — so once retention
+    /// deletes them, a type listed from `series` alone would offer a choice that shows nothing.
+    #[test]
+    fn a_type_whose_rows_are_all_gone_is_not_listed() {
+        let conn = db_with(vec![m("kept", 10, json!({})), m("expired", 20, json!({}))]);
+        conn.execute(
+            "DELETE FROM measurement WHERE series_id IN (SELECT id FROM series WHERE type = 'expired')",
+            [],
+        )
+        .unwrap();
+
+        assert_eq!(types(&conn).unwrap(), vec!["kept".to_owned()]);
     }
 
     #[test]
@@ -1329,6 +1450,56 @@ mod tests {
         assert!(boot.truncated, "a dropdown must not silently omit options");
     }
 
+    /// **The regression test for the gap sampling left.** Attribute options used to come from the newest
+    /// [`FACET_SCAN_LIMIT`] rows, so a device that stopped reporting early in the window was not offered —
+    /// nor drawn when grouping by it, since a chart's groups are these options. They come from `series` now,
+    /// and are exact however many rows bury it.
+    #[test]
+    fn attribute_options_are_exact_beyond_the_sample() {
+        let mut rows: Vec<Measurement> = (1..=FACET_SCAN_LIMIT)
+            .map(|i| mb("c", 1_000 + i, json!({ "v": i }), json!({"cell": "1"})))
+            .collect();
+        rows.push(mb("c", 10, json!({"v": 0}), json!({"cell": "2"})));
+        let conn = db_with(rows);
+
+        let f = facets(&conn, &QuerySpec { types: vec!["c".into()], ..Default::default() }).unwrap();
+        assert!(f.capped, "precondition: the body sample is full and does not reach cell 2's row");
+        let cell = f.attrs.iter().find(|a| a.key == "cell").expect("cell");
+        assert_eq!(cell.values, vec!["1", "2"]);
+    }
+
+    /// Exact must still mean *in this slice*: a series whose rows all fall outside the window is not offered.
+    #[test]
+    fn attribute_options_are_scoped_to_the_window() {
+        let conn = db_with(vec![
+            mb("c", 10, json!({"v": 1}), json!({"cell": "1"})),
+            mb("c", 20, json!({"v": 2}), json!({"cell": "2"})),
+            mb("c", 30, json!({"v": 3}), json!({"cell": "3"})),
+        ]);
+        let spec = QuerySpec { from: Some(15), to: Some(30), ..Default::default() };
+
+        let f = facets(&conn, &spec).unwrap();
+        let cell = f.attrs.iter().find(|a| a.key == "cell").expect("cell");
+        assert_eq!(cell.values, vec!["2"], "10 is before the window, 30 is its exclusive end");
+    }
+
+    /// A body filter is a property of rows, not of series, so it has to reach into the per-series lookup:
+    /// a series is only offered if one of *its rows* matches.
+    #[test]
+    fn attribute_options_honour_body_filters() {
+        let conn = db_with(vec![
+            mb("wifi", 10, json!({"ssid": "home"}), json!({"bssid": "aa"})),
+            mb("wifi", 11, json!({"ssid": "cafe"}), json!({"bssid": "bb"})),
+            mb("wifi", 12, json!({"ssid": "home"}), json!({"bssid": "cc"})),
+        ]);
+        let spec =
+            QuerySpec { body: vec![("ssid".to_owned(), "home".to_owned())], ..Default::default() };
+
+        let f = facets(&conn, &spec).unwrap();
+        let bssid = f.attrs.iter().find(|a| a.key == "bssid").expect("bssid");
+        assert_eq!(bssid.values, vec!["aa", "cc"]);
+    }
+
     #[test]
     fn field_facets_report_which_leaves_are_numeric() {
         let conn = db_with(vec![
@@ -1352,6 +1523,82 @@ mod tests {
         ]);
         let f = facets(&conn, &QuerySpec::default()).unwrap();
         assert!(f.fields.iter().find(|x| x.name == "ago").expect("ago").numeric);
+    }
+
+    // ------------------------------------------------------------------------------- extent
+
+    /// Two series of one type, one of another. The per-series form has to fold across series and must not
+    /// reach the other type; the bare form has to cover everything.
+    #[test]
+    fn the_extent_spans_every_matching_series_and_nothing_else() {
+        let conn = db_with(vec![
+            m("t", 10, json!({"unit": "a"})),
+            m("t", 50, json!({"unit": "b"})),
+            m("other", 5, json!({})),
+            m("other", 100, json!({})),
+        ]);
+        let of = |spec: QuerySpec| extent(&conn, &spec).unwrap();
+
+        assert_eq!(of(QuerySpec::default()), Some((5, 100)));
+        assert_eq!(of(QuerySpec { types: vec!["t".into()], ..Default::default() }), Some((10, 50)));
+        assert_eq!(
+            of(QuerySpec {
+                types: vec!["t".into()],
+                attrs: vec![("unit".into(), "b".into())],
+                ..Default::default()
+            }),
+            Some((50, 50))
+        );
+        assert_eq!(
+            of(QuerySpec { types: vec!["t".into()], from: Some(20), ..Default::default() }),
+            Some((50, 50)),
+            "the window applies inside each series' lookup"
+        );
+        assert_eq!(of(QuerySpec { types: vec!["nope".into()], ..Default::default() }), None);
+    }
+
+    /// The body-filtered fallback answers the same question by the other route.
+    #[test]
+    fn a_body_filtered_extent_still_answers() {
+        let conn = db_with(vec![
+            mb("wifi", 10, json!({"ssid": "home"}), json!({})),
+            mb("wifi", 20, json!({"ssid": "cafe"}), json!({})),
+            mb("wifi", 30, json!({"ssid": "home"}), json!({})),
+        ]);
+        let spec = QuerySpec {
+            types: vec!["wifi".into()],
+            body: vec![("ssid".to_owned(), "home".to_owned())],
+            ..Default::default()
+        };
+        assert_eq!(extent(&conn, &spec).unwrap(), Some((10, 30)));
+    }
+
+    /// **The extent must stay a handful of seeks.** `SELECT min(x), max(x)` reads naturally and walks every
+    /// row — SQLite's min/max shortcut only applies to an aggregate on its own — so the regression this
+    /// guards against is the obvious simplification, and it would not change a single result. Pinned on the
+    /// work done instead: a thousand rows, and fewer virtual-machine steps than that. Not on the query plan,
+    /// which reads `SEARCH` for the per-series walk this replaced just as it does for the seeks.
+    #[test]
+    fn the_extent_does_not_walk_the_rows() {
+        const ROWS: i64 = 1_000;
+        let conn = db_with((0..ROWS).map(|i| m("t", i, json!({ "unit": i % 2 }))).collect());
+        let window = QuerySpec { from: Some(i64::MIN), to: Some(i64::MAX), ..Default::default() };
+
+        for spec in [
+            QuerySpec::default(),
+            window.clone(),
+            QuerySpec { types: vec!["t".into()], ..window.clone() },
+            QuerySpec { attrs: vec![("unit".into(), "1".into())], ..window },
+        ] {
+            let (sql, params) = build_extent_query(&spec);
+            let mut stmt = conn.prepare(&sql).unwrap();
+            let (min, max): (i64, i64) = stmt
+                .query_row(rusqlite::params_from_iter(params), |r| Ok((r.get(0)?, r.get(1)?)))
+                .unwrap();
+            assert!(min < max, "{spec:?} found no extent");
+            let steps = stmt.get_status(rusqlite::StatementStatus::VmStep);
+            assert!(i64::from(steps) < ROWS, "{spec:?} took {steps} steps over {ROWS} rows: {sql}");
+        }
     }
 
     // ------------------------------------------------------------------------------- series
@@ -1499,6 +1746,44 @@ mod tests {
 
         assert_eq!(points[0].count, 1, "only the one row matching type AND attribute");
         assert_eq!(points[0].avg, Some(1.0));
+    }
+
+    /// The same, for the shape an attribute grouping takes: the type and attribute filters move into the
+    /// per-series CTE while the window and body filters stay on the rows, and each must still bind to its
+    /// own parameter.
+    #[test]
+    fn an_attribute_grouping_honours_every_row_filter() {
+        let conn = db_with(vec![
+            mb("c", 10, json!({"v": 1.0, "ok": "y"}), json!({"cell": "1", "pack": "a"})),
+            mb("c", 11, json!({"v": 2.0, "ok": "n"}), json!({"cell": "1", "pack": "a"})),
+            mb("c", 12, json!({"v": 3.0, "ok": "y"}), json!({"cell": "2", "pack": "a"})),
+            mb("c", 13, json!({"v": 4.0, "ok": "y"}), json!({"cell": "3", "pack": "b"})),
+            mb("c", 99, json!({"v": 5.0, "ok": "y"}), json!({"cell": "1", "pack": "a"})),
+            mb("other", 10, json!({"v": 9.0, "ok": "y"}), json!({"cell": "1", "pack": "a"})),
+        ]);
+        let spec = SeriesSpec {
+            filter: QuerySpec {
+                types: vec!["c".into()],
+                attrs: vec![("pack".into(), "a".into())],
+                body: vec![("ok".into(), "y".into())],
+                from: Some(0),
+                to: Some(50),
+                ..Default::default()
+            },
+            field: Some("v".into()),
+            group: Some(FieldRef::Attribute("cell".into())),
+            groups: vec!["1".into(), "2".into(), "3".into()],
+            bucket_nanos: 100,
+        };
+        let got = series(&conn, &spec).unwrap();
+
+        let summary: Vec<_> =
+            got.iter().map(|s| (s.group.clone().unwrap(), s.points[0].count, s.points[0].avg)).collect();
+        assert_eq!(
+            summary,
+            vec![("1".to_owned(), 1, Some(1.0)), ("2".to_owned(), 1, Some(3.0))],
+            "cell 3 is pack b; v=2 fails the body filter; v=5 is outside the window; `other` is another type"
+        );
     }
 
     /// With no field, the query is still useful: it is the timeline.

@@ -8,6 +8,7 @@
 #   nix-build nix -A tests.platform      # the shared-VM cases
 #   nix-build nix -A tests.restart       # one isolated case
 #   nix-build nix -A evalChecks          # harness evaluates against real host configs (no VM)
+#   nix-build nix -A tests.browser-passkeys  # passkeys in Chromium against the package (no VM)
 #
 # Prefer `make run-tests` over the bare top level in CI: this derivation gates the
 # package on *every* test, which means one nix process evaluates every NixOS machine
@@ -22,7 +23,13 @@
 }:
 let
   package = pkgs.callPackage ./package.nix { };
-  tests = import ./tests { inherit pkgs; };
+  # The VM tests, and beside them the one test that needs a browser rather than a machine. In this set so that
+  # `make run-tests` builds it with the rest; a derivation of its own rather than part of the package's
+  # checkPhase, because the package is what the host builds for itself on every deploy, and a browser is not
+  # something installing the receiver should need.
+  tests = import ./tests { inherit pkgs; } // {
+    browser-passkeys = import ./tests/browser.nix { inherit pkgs package; };
+  };
   evalChecks = import ./tests/eval-checks.nix { inherit pkgs; };
 in
 pkgs.symlinkJoin {

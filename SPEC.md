@@ -1120,8 +1120,8 @@ A `NOTIFY_SOCKET` that is absent (development, tests, non-systemd hosts) makes t
 The cost is that a stalled migration is caught after six hours rather than seven minutes. Tying the
 extension to measured progress, using SQLite's progress handler, was considered and rejected. `DROP TABLE`
 and `COMMIT`, including the WAL checkpoint that follows a large commit, make no progress callbacks at all,
-and on the deployed host's SD card each can take minutes. `nix/tests/cases/migration-timeout.nix` holds a
-migration past a 1.5 s `TimeoutStartSec` and checks that it completes.
+and on the deployed host's SD card each can take minutes. `nix/tests/cases/migration-timeout.nix` pauses a
+migration past `TimeoutStartSec` and checks that it completes.
 
 **Socket permissions.** §8.1 sets mode `0660` *after* `bind()`. Between those two calls the socket
 carries `0777 & ~umask` — typically `0755`, i.e. world-connectable. The window is short but real,

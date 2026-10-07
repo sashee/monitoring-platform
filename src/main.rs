@@ -270,8 +270,9 @@ async fn serve(args: ServeArgs) -> Result<()> {
     );
 
     // Migrations run before the socket is bound, so a schema failure is a clean startup failure
-    // rather than a service that accepts requests it cannot store.
-    let conn = store::open_write(&config.database_path)?;
+    // rather than a service that accepts requests it cannot store. A migration may take longer than
+    // the unit's start timeout, so it extends that timeout for itself first (SPEC §9.2).
+    let conn = store::schema::open_write_with(&config.database_path, extend_start_timeout)?;
 
     // Nothing between the migration and the writer: the invariant the read path's inner join needs is
     // enforced by the schema (`series_id NOT NULL` with a foreign key, SPEC §6.7), not repaired at
@@ -310,8 +311,12 @@ async fn serve(args: ServeArgs) -> Result<()> {
     // Only now is the service genuinely ready: schema current, socket accepting. Telling systemd
     // any earlier would let a dependent unit race our bind() (SPEC §9.2).
     // `notify` returns Ok(()) when NOTIFY_SOCKET is unset, so this is inert outside systemd —
-    // no branch needed for development runs or tests.
-    if let Err(e) = sd_notify::notify(&[sd_notify::NotifyState::Ready]) {
+    // no branch needed for development runs or tests. The empty STATUS= clears a migration's status
+    // line, which `systemctl status` would otherwise go on showing after the migration had finished.
+    if let Err(e) = sd_notify::notify(&[
+        sd_notify::NotifyState::Ready,
+        sd_notify::NotifyState::Status(""),
+    ]) {
         tracing::warn!(error = %e, "failed to send readiness notification to systemd");
     }
     tracing::info!("ready");
@@ -334,6 +339,31 @@ async fn serve(args: ServeArgs) -> Result<()> {
     result
 }
 
+/// How long a schema migration may hold up startup (SPEC §9.2). Generous on purpose: what this bounds is
+/// a migration that has stalled, and the alternative to waiting is a kill that rolls the work back and
+/// starts it over.
+const MIGRATION_START_BUDGET: std::time::Duration = std::time::Duration::from_secs(6 * 60 * 60);
+
+/// Gives a pending migration [`MIGRATION_START_BUDGET`] on top of systemd's start timeout, and says why
+/// in `systemctl status`. Sent once: an extension moves the deadline to now plus the budget, so nothing
+/// has to keep it alive.
+fn extend_start_timeout(from: store::schema::Version, to: store::schema::Version) {
+    let status = format!("applying schema migration from {from} to {to}");
+    let extend = extend_timeout_usec(MIGRATION_START_BUDGET);
+    if let Err(e) = sd_notify::notify(&[
+        sd_notify::NotifyState::Status(&status),
+        sd_notify::NotifyState::Custom(&extend),
+    ]) {
+        tracing::warn!(error = %e, "failed to extend the systemd start timeout for the migration");
+    }
+}
+
+/// Written by hand rather than with `NotifyState::ExtendTimeoutUsec`, which takes a `u32` and so tops out
+/// at about 71 minutes. systemd parses the value as 64-bit.
+fn extend_timeout_usec(budget: std::time::Duration) -> String {
+    format!("EXTEND_TIMEOUT_USEC={}", budget.as_micros())
+}
+
 async fn shutdown_signal() {
     use tokio::signal::unix::{SignalKind, signal};
 
@@ -348,5 +378,18 @@ async fn shutdown_signal() {
     tokio::select! {
         _ = tokio::signal::ctrl_c() => tracing::info!("SIGINT received; shutting down"),
         _ = sigterm.recv() => tracing::info!("SIGTERM received; shutting down"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The budget does not fit the `u32` sd-notify's own variant would have taken, which is the reason the
+    /// message is written by hand.
+    #[test]
+    fn the_migration_budget_is_sent_whole() {
+        assert_eq!(extend_timeout_usec(MIGRATION_START_BUDGET), "EXTEND_TIMEOUT_USEC=21600000000");
+        assert!(MIGRATION_START_BUDGET.as_micros() > u128::from(u32::MAX));
     }
 }

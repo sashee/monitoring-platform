@@ -681,6 +681,7 @@ let
     clock-gate = import ./cases/clock-gate.nix { inherit pkgs; };
     clock-gate-nts = import ./cases/clock-gate-nts.nix { inherit pkgs; };
     clock-gate-minsources = import ./cases/clock-gate-minsources.nix { inherit pkgs; };
+    migration-timeout = import ./cases/migration-timeout.nix { inherit pkgs; };
   }
   // lib.optionalAttrs collector {
     collector = import ./cases/collector.nix { inherit pkgs; };

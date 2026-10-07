@@ -503,10 +503,18 @@ fn apply_pragmas(conn: &Connection) -> Result<()> {
 
 /// Opens the single write connection and brings the schema up to date.
 pub fn open_write(path: &Path) -> Result<Connection> {
+    open_write_with(path, |_, _| {})
+}
+
+/// [`open_write`], with `before_migrating` called as [`migrate_with`] describes.
+pub fn open_write_with(
+    path: &Path,
+    before_migrating: impl FnOnce(Version, Version),
+) -> Result<Connection> {
     let conn = Connection::open(path)
         .with_context(|| format!("opening database {}", path.display()))?;
     apply_pragmas(&conn)?;
-    migrate(&conn)?;
+    migrate_with(&conn, before_migrating)?;
     Ok(conn)
 }
 
@@ -563,6 +571,15 @@ pub fn open_read(path: &Path) -> Result<Connection> {
 ///   ignoring what it has never heard of. This is the case the major/minor split exists for.
 /// - Anything older is migrated forward.
 pub fn migrate(conn: &Connection) -> Result<()> {
+    migrate_with(conn, |_, _| {})
+}
+
+/// [`migrate`], calling `before_migrating(from, to)` once just before the migration transaction begins.
+///
+/// Only when there is something to apply: a current database, or one at a newer minor version, never calls
+/// it. That is what lets `serve` extend systemd's start timeout for a migration without extending it for
+/// every start (SPEC §9.2).
+pub fn migrate_with(conn: &Connection, before_migrating: impl FnOnce(Version, Version)) -> Result<()> {
     // Enforcement is per-connection, so a declared foreign key is only real on a connection that asked
     // for it — and the connection that just built or upgraded the schema is precisely the one that must.
     // Doing it here rather than only in [`apply_pragmas`] means every path that reaches a current schema
@@ -599,6 +616,9 @@ pub fn migrate(conn: &Connection) -> Result<()> {
         return Ok(());
     }
 
+    before_migrating(current, SCHEMA_VERSION);
+    let started = std::time::Instant::now();
+
     conn.execute_batch("BEGIN")?;
     let result = (|| -> Result<()> {
         // Relies on MIGRATIONS being sorted, which `migrations_are_sorted_and_end_at_the_declared_version`
@@ -620,7 +640,16 @@ pub fn migrate(conn: &Connection) -> Result<()> {
         // transaction open rather than unwinding it. Returning here without the rollback would leave the
         // connection inside a live transaction holding the write lock.
         Ok(()) => match conn.execute_batch("COMMIT") {
-            Ok(()) => Ok(()),
+            Ok(()) => {
+                // How long it took is what sizes the start-timeout budget `serve` grants (SPEC §9.2).
+                tracing::info!(
+                    from_version = %current,
+                    to_version = %SCHEMA_VERSION,
+                    elapsed_ms = started.elapsed().as_millis(),
+                    "schema migrated"
+                );
+                Ok(())
+            }
             Err(e) => {
                 let _ = conn.execute_batch("ROLLBACK");
                 Err(anyhow::Error::from(e).context("committing the migration"))
@@ -867,6 +896,48 @@ mod tests {
 
         assert_eq!(stored_version(&conn), after_first);
         assert_eq!(after_first, SCHEMA_VERSION.encode());
+    }
+
+    /// `serve` extends systemd's start timeout from this callback (SPEC §9.2), so it has to come before any
+    /// of the migration's work, and come once: the timeout it extends is the one the migration runs under.
+    #[test]
+    fn a_pending_migration_is_announced_once_before_it_begins() {
+        let conn = Connection::open_in_memory().unwrap();
+        let mut calls = Vec::new();
+
+        migrate_with(&conn, |from, to| {
+            // No transaction open and nothing written yet.
+            calls.push((from, to, conn.is_autocommit(), stored_version(&conn)));
+        })
+        .unwrap();
+
+        assert_eq!(calls, [(Version::new(0, 0), SCHEMA_VERSION, true, 0)]);
+        assert_eq!(stored_version(&conn), SCHEMA_VERSION.encode());
+    }
+
+    /// And never for a start that migrates nothing, which therefore keeps the unit's own start timeout
+    /// rather than the hours a migration is allowed.
+    #[test]
+    fn nothing_is_announced_when_there_is_nothing_to_migrate() {
+        fn must_not_migrate(from: Version, to: Version) {
+            panic!("announced a migration from {from} to {to}");
+        }
+
+        let current = Connection::open_in_memory().unwrap();
+        migrate(&current).unwrap();
+        migrate_with(&current, must_not_migrate).unwrap();
+
+        let newer_minor = Connection::open_in_memory().unwrap();
+        migrate(&newer_minor).unwrap();
+        let future = Version::new(SCHEMA_VERSION.major, SCHEMA_VERSION.minor + 1);
+        newer_minor.pragma_update(None, "user_version", future.encode()).unwrap();
+        migrate_with(&newer_minor, must_not_migrate).unwrap();
+
+        let newer_major = Connection::open_in_memory().unwrap();
+        newer_major
+            .pragma_update(None, "user_version", Version::new(SCHEMA_VERSION.major + 1, 0).encode())
+            .unwrap();
+        assert!(migrate_with(&newer_major, must_not_migrate).is_err());
     }
 
     /// A 3.0 database's *other* tables survive the whole way to 4.0. Measurements are covered by

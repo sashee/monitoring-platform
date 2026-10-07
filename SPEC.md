@@ -490,7 +490,8 @@ noise implying a constraint that does not exist.)
 ### 6.2 Migrations
 
 Schema version tracked in `PRAGMA user_version` as **`major.minor`**. On startup, migrations run
-forward from the current version to the latest inside a transaction.
+forward from the current version to the latest inside a transaction. This happens before readiness, so
+a migration extends systemd's start timeout for itself (§9.2).
 
 **Why the version has two components.** A blanket "a newer database is fatal" rule is right for a
 change that rewrites data — version 2 dropped and recreated `measurement` — and wrong for one that
@@ -1039,6 +1040,25 @@ socket is listening. Under `Type=simple` systemd considers the service started t
 forks, so any dependent unit can race a client connection against our `bind()`. `sd-notify` 0.5
 depends only on `libc` — no `libsystemd`, no `pkg-config` — so it costs nothing in the Nix build.
 A `NOTIFY_SOCKET` that is absent (development, tests, non-systemd hosts) makes the call a no-op.
+
+**Long migrations.** Readiness comes after migrations (§6.2), so a migration runs under
+`TimeoutStartSec`. One that outlasts it is killed, rolled back, and retried from scratch every
+`RestartSec`, forever. So rather than raising `TimeoutStartSec` for every start, `serve` sends
+`EXTEND_TIMEOUT_USEC=` for **6 hours**, once, just before a migration's transaction begins. It sends a
+`STATUS=` naming the two versions with it, and `READY=1` clears that status again.
+
+- A start with nothing to migrate sends nothing, so it keeps the unit's own timeout.
+- One message is enough, because systemd moves the deadline to *now* plus the extension, never earlier.
+- The message is written by hand. sd-notify's `ExtendTimeoutUsec` takes a `u32`, which tops out at about
+  71 minutes, while systemd parses the value as 64-bit.
+- systemd re-arms the start timeout for each phase, so the clock gate's `ExecStartPre=` wait (§9.4) does
+  not use up any of the migration's time.
+
+The cost is that a stalled migration is caught after six hours rather than seven minutes. Tying the
+extension to measured progress, using SQLite's progress handler, was considered and rejected. `DROP TABLE`
+and `COMMIT`, including the WAL checkpoint that follows a large commit, make no progress callbacks at all,
+and on the deployed host's SD card each can take minutes. `nix/tests/cases/migration-timeout.nix` holds a
+migration past a 1.5 s `TimeoutStartSec` and checks that it completes.
 
 **Socket permissions.** §8.1 sets mode `0660` *after* `bind()`. Between those two calls the socket
 carries `0777 & ~umask` — typically `0755`, i.e. world-connectable. The window is short but real,

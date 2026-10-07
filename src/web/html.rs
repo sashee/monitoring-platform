@@ -111,11 +111,11 @@ width:100%;height:auto}\
    cannot serve a phone and a desktop: the browser scales the text with everything else, so a \
    desktop-sized viewBox squeezed into a portrait viewport renders 11px labels at about 4px. */\
 .plot.narrow{display:none}\
-.plot.narrow .tick{font-size:13px}\
 .plot.narrow .empty-plot{font-size:14px}\
 .grid{stroke:var(--grid);stroke-width:1}\
 .axis{stroke:var(--axis);stroke-width:1}\
-.tick{fill:var(--muted);font-size:11px;font-variant-numeric:tabular-nums}\
+/* No font-size: each preset sets its own on the text, where svg.rs can check the labels fit. */\
+.tick{fill:var(--muted);font-variant-numeric:tabular-nums}\
 .tick-y{text-anchor:end}\
 .tick-x{text-anchor:middle}\
 .col{fill:var(--series-1)}\
@@ -125,7 +125,8 @@ width:100%;height:auto}\
 /* The drill-down zones are invisible until pointed at, which is the only feedback available \
    without scripting — and it is enough to show the chart is clickable. */\
 .hit:hover{fill:var(--grid)!important;fill-opacity:.5}\
-.direct{font-size:11px}\
+/* Text ink, not the series colour: the line it sits against carries that. Sized by the chart's geometry. */\
+.direct{fill:var(--text-2)}\
 .empty-plot{fill:var(--muted);font-size:12px}\
 .legend{list-style:none;display:flex;gap:1rem;flex-wrap:wrap;padding:0;margin:.25rem 0;font-size:.78rem;color:var(--text-2)}\
 .legend a{color:inherit;text-decoration:none}\

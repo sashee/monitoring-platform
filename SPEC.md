@@ -1645,6 +1645,18 @@ The explorer (§14.9):
   containing `&` cannot change what the link means. The page is behind the session guard like every other.
 - Structured cells render as `key: value` lines, never as stringified JSON; object keys are sorted;
   nothing renders as `null` or `{}`.
+- **Axis labels fit their margin** (§14.9). Large values switch to scientific notation with one exponent
+  per axis — the deployed filesystem's ticks read `1.80e10 1.85e10` rather than eleven digits clipped to
+  `00000` — and ordinary values stay plain with shared decimals. A sweep over magnitudes 10⁻¹² … 10¹⁵ and
+  spreads from flat to tenfold checks that every label fits, none repeats, they ascend, and that wherever
+  two or more are drawn each states its gridline exactly; a barely-moving large value keeps one rounded
+  gridline rather than two that misstate their gap. Each preset's margin is asserted at compile time to
+  hold the longest label at its own font size.
+- **A line's name is whole or absent** (§14.9). The deployed filesystem's two devices — fourteen
+  characters differing only in the last — are left to the legend inline and named on the wide chart; no
+  name fits the phone-sized chart's margin; one name that does not fit takes the others with it; two that
+  would overlap are both dropped, as are five or more; CJK counts two columns, so seven such characters do
+  not fit where seven ASCII ones do. Rendered names carry text ink, not the series colour.
 - The geometry presets differ where it counts — asserted at **compile time**, since they are constants and
   the media-query swap is decoration if they ever converge.
 - **A dense chart is still clickable although it has no markers** — the regression test for linking marks
@@ -2501,7 +2513,7 @@ Two guards in that query carry most of the correctness:
 | Series | Treatment |
 |---|---|
 | 1 | one hue, **no legend** — the heading names it |
-| 2–8 | the palette's slots in fixed order, legend always present, ≤4 also direct-labelled at the line end |
+| 2–8 | the palette's slots in fixed order, legend always present, ≤4 also named at the line end — when every name fits whole and apart |
 | 9–24 | the same eight hues, **paired with a line pattern** — dashed for 9–16, dotted for 17–24 |
 | >24 | the first 24 by sorted group value, and a visible "showing 24 of N" note |
 
@@ -2610,6 +2622,39 @@ All follow from §14.6's no-JavaScript rule, and each is a trade rather than an 
 ordinary unit-tested functions. Ticks are round: values on a 1 / 2 / 5 × 10ⁿ ladder, instants on a fixed
 ladder of 1 s … 30 d steps aligned to the epoch, because those are the only intervals that land on round
 wall-clock times.
+
+**A value label is never wider than its margin.** Labels used to be the raw number, right-aligned into a
+margin that holds five to ten characters, so a filesystem's free bytes — eleven digits — showed only their
+last five: `00000`. Now an axis is labelled as a set, sharing one notation, one exponent and one number of
+decimals:
+
+- **Plain while every label fits in six characters**: `3.290 3.292`, `0.069`, `12000`.
+- **Otherwise scientific, with the exponent of the largest tick**: `1.80e10 1.85e10`, `0.98e10 1.00e10`.
+  Scientific rather than SI prefixes because a value here can be anything: `880M` reads as metres or
+  minutes as easily as 880 × 10⁶, and scientific notation cannot be mistaken for a unit.
+- **Decimals come from the tick step**, so adjacent labels always differ and none carries digits the
+  step does not need. A flat series has one tick, labelled to three significant digits.
+- **Seven characters at most**, and each preset's left margin is asserted at compile time to hold seven at
+  its own tick font — which is why the font size lives in the geometry rather than the stylesheet, and why
+  the phone-sized chart's margin is 64 rather than 46. A large value that barely moves would need more
+  (`1.7849950e10`), so its labels lose decimals until they fit and only the gridlines they still state
+  exactly are kept — or, if none, the one nearest its rounded label. Two rounded labels would misstate
+  the gap between their gridlines, and one cannot.
+
+**A line's name at its end is drawn whole or not at all.** The names sit in the right margin — 96 units
+inline, 14 on the phone-sized chart — and they are device-supplied: `/dev/mmcblk0p1` and `/dev/mmcblk0p2`
+are fourteen characters differing only in the last, which is exactly where the inline margin cut them. A
+cropped name is not a shorter name but the wrong one, and two that overlap are as unreadable. So each name
+is measured against the margin at the chart's own font size, counting anything outside ASCII as two
+columns since a monospace face draws CJK that wide, and the names are drawn only if all of them fit and
+none overlaps another — all or none, since half a chart named reads as though the unnamed lines were
+different in kind. Otherwise the legend, which is always there for two or more series, carries identity
+alone, as it already does past four. The names are in text ink rather than the series colour: three light
+slots fall below 3:1 on the surface, and the line the name sits against already carries the colour.
+
+Tooltips are not bound by any of this and keep every digit, with at least four significant ones so a
+small value does not read as `0`. The timeline's `N/bucket` sits above the plot rather than in the label
+column, which a three-hour bucket of `3000/bucket` had already outgrown.
 
 **A bucket with no value breaks the line rather than being interpolated across.** Joining across a gap
 draws a straight line through a period when nothing was reported, which is the most common way a

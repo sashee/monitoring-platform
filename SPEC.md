@@ -1675,16 +1675,23 @@ The explorer (§14.9):
   no ceremony starts and the page links to `localhost`; a username containing `</script>` does not end the
   embedded options early; both routes are origin-checked. In unit tests: only loopback names can hold a
   passkey, the user handle is stable per user, and the options carry ES256, no `credProtect`, and required
-  user verification and resident key. The page's script was also run in Chromium with a virtual
-  authenticator: through its own button, with and without `toJSON`, and against an excluded device.
+  user verification and resident key.
 - **Passkey sign-in** (§14.10), with the same software authenticator. A passkey registered from the phone's
   address signs in there, the session opens the pages, and the use is recorded. Refused with `401`, no cookie
   and a reason, each in its own case: client data for another origin or another port, a signature for another
   RP ID, another key under a stored credential id, another user's handle, and a credential never registered. A
   passkey is refused at another of the site's addresses; a signed response cannot be replayed; a removed passkey
   no longer signs in and says so; the login page offers the button on a loopback name and a `localhost` link on
-  `127.0.0.1`, the password form being there either way; the route is origin-checked. In Chromium: log out,
-  press the button, signed in — with and without `toJSON`.
+  `127.0.0.1`, the password form being there either way; the route is origin-checked.
+- **Passkeys in a real browser** (§14.10; `nix-build nix -A tests.browser-passkeys`, built by `make run-tests`
+  with the VM tests on both architectures, and not part of the package's checkPhase, which the host runs).
+  The pages' scripts in headless Chromium, with Chromium's own WebAuthn behind a virtual authenticator, against
+  the release package behind socat as the tunnel shim: a passkey added through the account page's button is
+  listed and bound to the page's host; the same device again is refused by the browser and the page says why;
+  after logging out the login page's button signs back in and the use is recorded; with `toJSON` removed, the
+  scripts' own JSON registers and signs in too; at `127.0.0.1` neither page offers a passkey and both link to
+  `localhost`. A sandboxed build, not a VM. A step whose navigation never comes reports the page's own status
+  line, so a broken script fails with its error message rather than a timeout.
 - **Four-hour sessions** (§14.2). The cookie's `Max-Age` is four hours. In a unit test, sessions longer than the
   lifetime are cut to it from their own creation, sooner ones keep their expiry, and a second pass changes
   nothing; through the real binary, a session stored with thirty days left is cut to four hours from its

@@ -473,3 +473,101 @@ fn starts_against_a_newer_minor_schema() {
     let stored: i64 = conn.pragma_query_value(None, "user_version", |r| r.get(0)).unwrap();
     assert_eq!(stored, future.encode());
 }
+
+/// Runs the CLI with `stdin` piped in, as its documentation tells an operator to.
+fn cli_with_stdin(args: &[&str], db: &Path, stdin: &str) -> std::process::Output {
+    let mut child = Command::new(env!("CARGO_BIN_EXE_monitoring-platform"))
+        .args(args)
+        .arg("--db")
+        .arg(db)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    child.stdin.take().unwrap().write_all(stdin.as_bytes()).unwrap();
+    child.wait_with_output().unwrap()
+}
+
+/// SPEC §14.10: **`set-password` is the way back in.** A user who removed their password — and then lost
+/// their passkeys — gets one again from the host, read from stdin like `create-user`'s; `list-users` shows
+/// who has none; and a user that does not exist is an error rather than a quiet success.
+#[test]
+fn set_password_gives_a_user_a_password_back() {
+    use monitoring_platform::{auth, store};
+
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("mp.db");
+    let created = cli_with_stdin(&["create-user", "--username", "sashee"], &db, "first-password");
+    assert!(created.status.success(), "{}", String::from_utf8_lossy(&created.stderr));
+
+    // As the account page leaves it: a passkey, and no password.
+    {
+        let conn = store::open_write(&db).unwrap();
+        let passkey = store::passkeys::NewPasskey {
+            credential_id: vec![1; 16],
+            rp_id: "localhost".into(),
+            static_state: vec![1],
+            dynamic_state: vec![2],
+        };
+        store::passkeys::insert(&conn, "sashee", &passkey, "phone", 1).unwrap();
+        store::users::remove_password(&conn, "sashee").unwrap();
+    }
+    let listed = Command::new(env!("CARGO_BIN_EXE_monitoring-platform"))
+        .args(["list-users", "--db"])
+        .arg(&db)
+        .output()
+        .unwrap();
+    let listed = String::from_utf8_lossy(&listed.stdout);
+    assert!(listed.contains("sashee  no password, 1 passkey"), "{listed}");
+
+    let set = cli_with_stdin(&["set-password", "--username", "sashee"], &db, "second-password\n");
+    assert!(set.status.success(), "{}", String::from_utf8_lossy(&set.stderr));
+    let conn = store::open_read(&db).unwrap();
+    assert_eq!(
+        store::users::password_hash(&conn, "sashee").unwrap(),
+        Some(auth::hash_password("second-password")),
+        "the new password, without its line ending"
+    );
+
+    let unknown = cli_with_stdin(&["set-password", "--username", "nobody"], &db, "x");
+    assert!(!unknown.status.success());
+    assert!(String::from_utf8_lossy(&unknown.stderr).contains("no user \"nobody\""));
+}
+
+/// SPEC §14.2: **a shorter session lifetime holds from the first start**, not weeks later. A session issued
+/// under the thirty days before passkeys is cut, when the receiver starts, to the current lifetime counted
+/// from its creation — so a cookie from last week stops working at deploy.
+#[test]
+fn sessions_from_a_longer_lifetime_are_cut_at_startup() {
+    use monitoring_platform::{auth, store, web::session::TTL_NANOS};
+
+    let dir = tempfile::tempdir().unwrap();
+    let socket = dir.path().join("mp.sock");
+    let db = dir.path().join("mp.db");
+    let authorization = common::issue_key(&db);
+    let token = auth::SessionToken::from_random(&[3; auth::TOKEN_BYTES]);
+    let created = T;
+    {
+        let conn = store::open_write(&db).unwrap();
+        store::users::insert(&conn, "sashee", &auth::hash_password("pw"), T).unwrap();
+        let thirty_days = 30 * 24 * 60 * 60 * 1_000_000_000;
+        store::sessions::insert(&conn, token.id(), &token.secret_hash(), "sashee", created, created + thirty_days)
+            .unwrap();
+    }
+
+    let child = Command::new(env!("CARGO_BIN_EXE_monitoring-platform"))
+        .args(["serve", "--socket"])
+        .arg(&socket)
+        .arg("--db")
+        .arg(&db)
+        .args(["--log-level", "warn"])
+        .spawn()
+        .expect("spawning the server binary");
+    let mut server = Server { child, socket, db: db.clone(), authorization, _dir: dir };
+    server.wait_until_ready();
+
+    let conn = store::open_read(&db).unwrap();
+    let session = store::sessions::lookup(&conn, token.id()).unwrap().unwrap();
+    assert_eq!(session.expires_at, created + TTL_NANOS);
+}

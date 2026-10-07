@@ -1,4 +1,5 @@
 pub mod keys;
+pub mod passkeys;
 pub mod read;
 pub mod schema;
 pub mod series;

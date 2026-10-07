@@ -175,6 +175,7 @@ pub fn page(title: &str, current_path: &str, content: &str) -> String {
         ("/keys", "api keys"),
         ("/users", "users"),
         ("/sessions", "sessions"),
+        ("/account", "account"),
     ]
         .iter()
         .map(|(path, label)| {
@@ -216,7 +217,9 @@ const DOCTYPE: &str = "<!doctype html>\n<html lang=\"en\">\n<meta charset=\"utf-
 /// `error` is rendered when a previous attempt failed. It is a fixed string chosen by the caller, never
 /// anything the request supplied — see [`super::login`] for why the message is identical for every way a
 /// login can fail.
-pub fn login(error: Option<&str>) -> String {
+/// The login page. `passkey` is the passkey section, already rendered (`web::passkey_page`), or empty when
+/// there is none to offer — it goes first, since it is one tap where the password is two fields.
+pub fn login(error: Option<&str>, passkey: &str) -> String {
     let message = match error {
         Some(text) => format!("<p class=\"error\">{}</p>\n", escape(text)),
         None => String::new(),
@@ -224,13 +227,13 @@ pub fn login(error: Option<&str>) -> String {
 
     format!(
         "{}<title>log in — monitoring platform</title>\n<style>{}</style>\n\
-         <h1>monitoring platform</h1>\n\
-         <form class=\"login\" method=\"post\" action=\"/login\">\n{}\
+         <h1>monitoring platform</h1>\n{}{}\
+         <form class=\"login\" method=\"post\" action=\"/login\">\n\
          <label>username<input name=\"username\" autocomplete=\"username\" autofocus required></label>\n\
          <label>password<input name=\"password\" type=\"password\" autocomplete=\"current-password\" required></label>\n\
          <button type=\"submit\">log in</button>\n\
          </form>\n",
-        DOCTYPE, STYLE, message
+        DOCTYPE, STYLE, message, passkey
     )
 }
 
@@ -742,7 +745,7 @@ mod tests {
         assert!(rendered.contains("width=device-width"), "{rendered}");
         for blocking in ["user-scalable=no", "user-scalable=0", "maximum-scale"] {
             assert!(!rendered.contains(blocking), "{blocking} would disable pinch-to-zoom");
-            assert!(!login(None).contains(blocking), "{blocking} on the login page");
+            assert!(!login(None, "").contains(blocking), "{blocking} on the login page");
         }
     }
 
@@ -777,15 +780,15 @@ mod tests {
         let rendered = page("measurements", "/", "");
         assert!(!rendered.contains("http://"), "{rendered}");
         assert!(rendered.contains(r#"action="/logout""#));
-        assert!(login(None).contains(r#"action="/login""#));
-        assert!(!login(None).contains("http://"));
+        assert!(login(None, "").contains(r#"action="/login""#));
+        assert!(!login(None, "").contains("http://"));
     }
 
     #[test]
     fn the_login_form_shows_an_error_only_when_there_is_one() {
-        assert!(!login(None).contains("class=\"error\""));
+        assert!(!login(None, "").contains("class=\"error\""));
 
-        let failed = login(Some("that did not work"));
+        let failed = login(Some("that did not work"), "");
         assert!(failed.contains("class=\"error\""));
         assert!(failed.contains("that did not work"));
     }
@@ -793,7 +796,7 @@ mod tests {
     /// No nav and no logout button: every link on it would bounce straight back to the form.
     #[test]
     fn the_login_page_offers_nothing_to_click_through_to() {
-        let rendered = login(None);
+        let rendered = login(None, "");
         assert!(!rendered.contains("<nav"), "{rendered}");
         assert!(!rendered.contains("/logout"), "{rendered}");
     }

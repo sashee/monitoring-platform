@@ -16,13 +16,16 @@
 //! about the query string, re-read on every request and re-rendered into the controls. That makes every
 //! view a link you can bookmark or paste, which is worth more here than it costs.
 
+pub mod account;
 pub mod html;
 pub mod origin;
+pub mod passkey;
+pub mod passkey_page;
 pub mod session;
 pub mod svg;
 
 use axum::extract::{Form, Query, Request, State};
-use axum::http::{StatusCode, header};
+use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Extension, Router};
@@ -85,6 +88,10 @@ pub fn routers(state: AppState) -> (Router<AppState>, Router<AppState>) {
         .route("/keys/delete", post(delete_key))
         .route("/sessions", get(sessions))
         .route("/sessions/end", post(end_session))
+        .route("/account", get(account::account))
+        .route("/account/passkeys/create", post(account::add_passkey))
+        .route("/account/passkeys/delete", post(account::remove_passkey))
+        .route("/account/password/remove", post(account::remove_password))
         .route("/logout", post(logout))
         .layer(axum::middleware::from_fn_with_state(state, session::guard))
         // Outside the session layer, so a forged POST is refused before its cookie is even looked up.
@@ -96,6 +103,7 @@ pub fn routers(state: AppState) -> (Router<AppState>, Router<AppState>) {
     // carries the origin check.
     let open = Router::new()
         .route("/login", get(login_form).post(login))
+        .route("/login/passkey", post(passkey_login))
         .route_layer(axum::middleware::from_fn::<_, (Request,)>(origin::guard));
 
     (guarded, open)
@@ -1162,6 +1170,20 @@ fn short_key(key: &str) -> String {
 
 // ------------------------------------------------------------------------------------ users
 
+/// How a user can sign in, for the users page: `password`, `password, 2 passkeys`, `1 passkey`.
+fn sign_in_methods(has_password: bool, passkeys: Option<i64>) -> String {
+    let passkeys = match passkeys.unwrap_or(0) {
+        0 => None,
+        1 => Some("1 passkey".to_owned()),
+        n => Some(format!("{n} passkeys")),
+    };
+    [has_password.then(|| "password".to_owned()), passkeys]
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 async fn users(State(state): State<AppState>) -> Response {
     render_users(&state, None).await
 }
@@ -1172,26 +1194,27 @@ async fn users(State(state): State<AppState>) -> Response {
 /// server-side flash state, and `?error=…` is a reflected string in a URL that gets pasted around.
 async fn render_users(state: &AppState, error: Option<&str>) -> Response {
     let db_path = state.config.database_path.clone();
-    let listed = tokio::task::spawn_blocking(move || {
+    let listed = tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
         let conn = crate::store::open_read(&db_path)?;
-        crate::store::users::list(&conn)
+        Ok((crate::store::users::list(&conn)?, crate::store::passkeys::counts(&conn)?))
     })
     .await;
 
-    let listed = match listed {
-        Ok(Ok(users)) => users,
+    let (listed, passkeys) = match listed {
+        Ok(Ok(listed)) => listed,
         Ok(Err(e)) => return failed("reading the users", &e),
         Err(e) => return failed("the user query task", &e),
     };
 
     let last = listed.len() <= 1;
     let table = html::table(
-        &["username", "created", ""],
+        &["username", "signs in with", "created", ""],
         &listed
             .iter()
             .map(|u| {
                 vec![
                     html::escape(&u.username),
+                    html::escape(&sign_in_methods(u.has_password, passkeys.get(&u.username).copied())),
                     html::escape(&format_nanos(u.created_at)),
                     if last {
                         // Not rendered rather than rendered disabled: the handler refuses it anyway, and a
@@ -1548,8 +1571,108 @@ async fn end_session(
 
 // ------------------------------------------------------------------------------------ logging in
 
-async fn login_form() -> Response {
-    html(StatusCode::OK, html::login(None))
+async fn login_form(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    html(StatusCode::OK, html::login(None, &passkey_sign_in(&state, &headers)))
+}
+
+/// The login page's passkey section for a page reached at the request's `Host`: a sign-in ceremony and its
+/// button, or — on an address passkeys cannot be bound to — a link to the same page under `localhost`.
+///
+/// Starting a ceremony touches only memory (`web::passkey::Ceremonies`), so this needs no database and no
+/// blocking task.
+fn passkey_sign_in(state: &AppState, headers: &HeaderMap) -> String {
+    let host = headers.get(header::HOST).and_then(|v| v.to_str().ok());
+    match host.and_then(passkey::rp_id_for) {
+        Some(rp_id) => match passkey::start_sign_in(&state.ceremonies, &rp_id) {
+            Ok(options) => passkey_page::sign_in_form(&options),
+            Err(e) => {
+                tracing::warn!(error = %e, "passkey sign-in could not start");
+                html::note(e.message())
+            }
+        },
+        None => passkey_page::not_localhost(host, "/login", "used"),
+    }
+}
+
+#[derive(Deserialize)]
+pub struct PasskeySignIn {
+    /// The browser's answer as WebAuthn JSON, filled in by the page's script.
+    response: String,
+}
+
+/// Signs in with a passkey (SPEC §14.10): verifies the browser's answer, then establishes a session exactly as
+/// a password login does.
+///
+/// The failure messages are specific, unlike the password form's single one: a passkey cannot be guessed, so
+/// saying that this one was removed, or belongs to another address, tells an attacker nothing and tells the
+/// owner what to do.
+async fn passkey_login(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Form(form): Form<PasskeySignIn>,
+) -> Response {
+    let refuse = |state: &AppState, headers: &HeaderMap, message: &str| {
+        html(StatusCode::UNAUTHORIZED, html::login(Some(message), &passkey_sign_in(state, headers)))
+    };
+    // A `POST` gets here only once the origin guard has matched `Origin` to `Host`: this is the page's own
+    // origin, the one the browser signed into the client data.
+    let Some(site) = headers
+        .get(header::ORIGIN)
+        .and_then(|v| v.to_str().ok())
+        .and_then(passkey::Site::from_origin)
+    else {
+        return refuse(&state, &headers, passkey::PasskeyError::NotLocalhost.message());
+    };
+
+    let db_path = state.config.database_path.clone();
+    let ceremonies = state.ceremonies.clone();
+    let verified = tokio::task::spawn_blocking(
+        move || -> anyhow::Result<Result<(String, String), passkey::PasskeyError>> {
+            let assertion = match passkey::Assertion::parse(&form.response) {
+                Ok(assertion) => assertion,
+                Err(e) => return Ok(Err(e)),
+            };
+            let conn = crate::store::open_write_existing(&db_path)?;
+            let stored = crate::store::passkeys::find(&conn, &assertion.credential_id())?;
+            let dynamic_state =
+                match passkey::finish_sign_in(&ceremonies, &site, &assertion, stored.as_ref()) {
+                    Ok(dynamic_state) => dynamic_state,
+                    Err(e) => return Ok(Err(e)),
+                };
+            // `finish_sign_in` has already refused a credential with no stored passkey.
+            let Some(stored) = stored else {
+                return Ok(Err(passkey::PasskeyError::UnknownPasskey));
+            };
+            crate::store::passkeys::record_use(
+                &conn,
+                &stored.credential_id,
+                dynamic_state.as_deref(),
+                crate::now_unix_nanos(),
+            )?;
+            Ok(Ok((stored.username, stored.rp_id)))
+        },
+    )
+    .await;
+
+    let (username, rp_id) = match verified {
+        Ok(Ok(Ok(signed_in))) => signed_in,
+        Ok(Ok(Err(e))) => {
+            tracing::warn!(error = %e, "rejected: passkey sign-in");
+            return refuse(&state, &headers, e.message());
+        }
+        Ok(Err(e)) => return login_unavailable(&e),
+        Err(e) => return login_unavailable(&e),
+    };
+
+    match establish(&state, &username) {
+        Ok(cookie) => {
+            tracing::info!(user = %username, %rp_id, "logged in with a passkey");
+            let mut response = see_other("/");
+            session::set_cookie(&mut response, &cookie);
+            response
+        }
+        Err(e) => login_unavailable(&e),
+    }
 }
 
 /// The login form's fields.
@@ -1571,7 +1694,11 @@ pub struct Credentials {
 /// than implying it was handled.
 const REFUSED: &str = "that username and password did not match.";
 
-async fn login(State(state): State<AppState>, Form(credentials): Form<Credentials>) -> Response {
+async fn login(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Form(credentials): Form<Credentials>,
+) -> Response {
     let db_path = state.config.database_path.clone();
     let username = credentials.username.clone();
     let presented = crate::auth::hash_password(&credentials.password);
@@ -1588,7 +1715,10 @@ async fn login(State(state): State<AppState>, Form(credentials): Form<Credential
         Ok(Ok(true)) => {}
         Ok(Ok(false)) => {
             tracing::warn!(user = %credentials.username, "rejected: login did not match");
-            return html(StatusCode::UNAUTHORIZED, html::login(Some(REFUSED)));
+            return html(
+                StatusCode::UNAUTHORIZED,
+                html::login(Some(REFUSED), &passkey_sign_in(&state, &headers)),
+            );
         }
         Ok(Err(e)) => return login_unavailable(&e),
         Err(e) => return login_unavailable(&e),
@@ -1612,7 +1742,7 @@ fn login_unavailable(error: &dyn std::fmt::Display) -> Response {
     tracing::error!(%error, "could not verify a login");
     html(
         StatusCode::SERVICE_UNAVAILABLE,
-        html::login(Some("the login could not be checked right now; try again.")),
+        html::login(Some("the login could not be checked right now; try again."), ""),
     )
 }
 

@@ -111,6 +111,20 @@ pub fn delete_expired(conn: &Connection, now: i64) -> Result<usize> {
         .context("deleting expired sessions")
 }
 
+/// Cuts every session that would outlive `lifetime` from its creation down to it, returning how many.
+///
+/// Run when the receiver starts, so a shorter session lifetime takes effect at deploy instead of once the
+/// last cookie issued under the old one has expired by itself — weeks, when the old one was thirty days. Only
+/// ever shortens: a session already due sooner keeps its own expiry. Independent of the clock, so it is the
+/// same statement on every start, and a start after a revert to a binary with a longer lifetime cuts again.
+pub fn cap_lifetimes(conn: &Connection, lifetime: i64) -> Result<usize> {
+    conn.execute(
+        "UPDATE web_session SET expires_at = created_at + ?1 WHERE expires_at > created_at + ?1",
+        [lifetime],
+    )
+    .context("shortening sessions to the current lifetime")
+}
+
 /// Every session, newest first. Carries no hashes.
 pub fn list(conn: &Connection) -> Result<Vec<StoredSession>> {
     let mut statement = conn
@@ -279,6 +293,22 @@ mod tests {
                 },
             ]
         );
+    }
+
+    /// Sessions longer than the lifetime are cut to it, counted from their own creation; shorter ones keep
+    /// their expiry; and a second run changes nothing.
+    #[test]
+    fn sessions_are_cut_to_the_lifetime_from_their_creation() {
+        let conn = db();
+        let long = SessionToken::from_random(&[1; TOKEN_BYTES]);
+        let short = SessionToken::from_random(&[2; TOKEN_BYTES]);
+        insert(&conn, long.id(), &long.secret_hash(), "sashee", 1_000, 1_000 + 30_000).unwrap();
+        insert(&conn, short.id(), &short.secret_hash(), "sashee", 2_000, 2_000 + 100).unwrap();
+
+        assert_eq!(cap_lifetimes(&conn, 4_000).unwrap(), 1);
+        assert_eq!(lookup(&conn, long.id()).unwrap().unwrap().expires_at, 5_000);
+        assert_eq!(lookup(&conn, short.id()).unwrap().unwrap().expires_at, 2_100, "already sooner");
+        assert_eq!(cap_lifetimes(&conn, 4_000).unwrap(), 0, "nothing left to cut");
     }
 
     #[test]

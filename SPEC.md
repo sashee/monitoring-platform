@@ -559,6 +559,7 @@ The versions that exist:
 | 3.2 | `series` + a nullable `measurement.series_id` + the transitional fill index (§6.7) | **minor**, first of three steps |
 | 3.3 | `measurement_series_event_time_idx`, for the read path's move onto the join (§6.7) | **minor** — the risky half of 4.0, done where it can be reverted |
 | 4.0 | `measurement` rebuilt without `type`/`attributes`, `series_id NOT NULL` + foreign key, `web_session.username` foreign key, foreign keys enabled (§6.7) | **major**, and the second in this project's life |
+| 4.1 | `web_passkey` (§14.10) | **minor** — a 4.0 binary ignores it, and its users' passwords still work |
 
 ### 6.3 Write path
 
@@ -992,6 +993,7 @@ monitoring-platform wait-for-clock       # the §9.4 boot gate; exit 1 if the cl
 ```
 monitoring-platform create-api-key --label <name>   # §13.3; prints the token to stdout once
 monitoring-platform create-user --username <name>   # §14.7; password on stdin, never in argv
+monitoring-platform set-password --username <name> # §14.10; a user's password back, on stdin
 monitoring-platform list-users                      # §14
 monitoring-platform list-sessions                   # §14
 monitoring-platform delete-user --username <name>   # §14; removes their sessions too
@@ -1664,6 +1666,36 @@ The explorer (§14.9):
   name fits the phone-sized chart's margin; one name that does not fit takes the others with it; two that
   would overlap are both dropped, as are five or more; CJK counts two columns, so seven such characters do
   not fit where seven ASCII ones do. Rendered names carry text ink, not the series colour.
+- **Passkey registration** (§14.10), through the router with a software authenticator shaped like the phone
+  app's — ES256, `none` attestation, a counter of zero, the full `toJSON` field set. The page at the phone's
+  address embeds options whose RP ID is that host; the answered ceremony stores the passkey against it and the
+  users page counts it. A response for another origin, another RP ID or another port is refused and stores
+  nothing; a response posted twice adds one passkey; a ceremony started on one account cannot be finished on
+  another; existing passkeys on the same site are excluded and those on another site are not; on `127.0.0.1`
+  no ceremony starts and the page links to `localhost`; a username containing `</script>` does not end the
+  embedded options early; both routes are origin-checked. In unit tests: only loopback names can hold a
+  passkey, the user handle is stable per user, and the options carry ES256, no `credProtect`, and required
+  user verification and resident key. The page's script was also run in Chromium with a virtual
+  authenticator: through its own button, with and without `toJSON`, and against an excluded device.
+- **Passkey sign-in** (§14.10), with the same software authenticator. A passkey registered from the phone's
+  address signs in there, the session opens the pages, and the use is recorded. Refused with `401`, no cookie
+  and a reason, each in its own case: client data for another origin or another port, a signature for another
+  RP ID, another key under a stored credential id, another user's handle, and a credential never registered. A
+  passkey is refused at another of the site's addresses; a signed response cannot be replayed; a removed passkey
+  no longer signs in and says so; the login page offers the button on a loopback name and a `localhost` link on
+  `127.0.0.1`, the password form being there either way; the route is origin-checked. In Chromium: log out,
+  press the button, signed in — with and without `toJSON`.
+- **Four-hour sessions** (§14.2). The cookie's `Max-Age` is four hours. In a unit test, sessions longer than the
+  lifetime are cut to it from their own creation, sooner ones keep their expiry, and a second pass changes
+  nothing; through the real binary, a session stored with thirty days left is cut to four hours from its
+  creation by the time the receiver answers its first request.
+- **Passkeys only** (§14.10). With a passkey, removing the password stops the password form signing that user
+  in while the passkey still does, and both pages say so; without one, removing it is refused and the password
+  still works. With no password, one of two passkeys can go but the last cannot, and its button is not
+  rendered. In unit tests the same guards hold at the store, inside their transactions, and a password set again
+  re-enables the last passkey's removal. Through the real binary: `create-user`, then the account page's
+  removal, `list-users` reporting `no password, 1 passkey`, and `set-password` from stdin storing the new
+  password without its line ending — and failing for a user that does not exist.
 - The geometry presets differ where it counts — asserted at **compile time**, since they are constants and
   the media-query swap is decoration if they ever converge.
 - **A dense chart is still clickable although it has no markers** — the regression test for linking marks
@@ -2126,6 +2158,7 @@ operator's own view, not a product surface: no dashboards, no charts, no JavaScr
 |---|---|---|---|
 | `/login` | `GET` | none | the form |
 | `/login` | `POST` | none | success → `303` to `/` with a session cookie; failure → the form again, `401` |
+| `/login/passkey` | `POST` | none | the browser's WebAuthn answer → the same session as a password login (§14.10) |
 | `/logout` | `POST` | session | delete the row, clear the cookie, `303` to `/login` |
 | `/` | `GET` | session | the measurement explorer (§14.9) |
 | `/chart` | `GET` | session | one chart, full page, with clickable points (§14.9) |
@@ -2137,6 +2170,10 @@ operator's own view, not a product surface: no dashboards, no charts, no JavaScr
 | `/keys/delete` | `POST` | session | `id` → revoke, i.e. delete the row |
 | `/sessions` | `GET` | session | the `web_session` table |
 | `/sessions/end` | `POST` | session | `id` → delete that session |
+| `/account` | `GET` | session | your own passkeys, with an add form (§14.10) |
+| `/account/passkeys/create` | `POST` | session | `label` + the browser's WebAuthn response → a new passkey |
+| `/account/passkeys/delete` | `POST` | session | `credential` → remove one of your own passkeys, unless it is your last way in |
+| `/account/password/remove` | `POST` | session | remove your own password, while a passkey remains |
 
 Every mutation is a `POST` and answers `303` back to the page it came from, so a reload does not
 resubmit. None is a link: a `GET` that changes something is a URL a prefetcher or an `<img src>` can
@@ -2182,7 +2219,7 @@ presented as a cookie and as a bearer token hash *differently*, so one stored ha
 both surfaces. Without that, §14.4's separation would hold in the router and leak through the database.
 
 ```
-Set-Cookie: mp_session=mps_<id>.<secret>; HttpOnly; SameSite=Strict; Path=/; Max-Age=2592000
+Set-Cookie: mp_session=mps_<id>.<secret>; HttpOnly; SameSite=Strict; Path=/; Max-Age=14400
 ```
 
 - `HttpOnly` — script cannot read it, so an injection anywhere in these pages cannot exfiltrate the
@@ -2200,7 +2237,13 @@ Set-Cookie: mp_session=mps_<id>.<secret>; HttpOnly; SameSite=Strict; Path=/; Max
   unix socket inside a 0750 group-owned directory. **Adding `Secure` is what to do the day this is
   served over TLS, and not before.**
 
-**Expiry is absolute**, thirty days from creation, and never moves. A sliding window would mean writing
+**Expiry is absolute**, four hours from creation, and never moves. It was thirty days until passkeys
+(§14.10): when signing in meant typing a long random password, a session outlasting a working week was the
+convenient choice, and with a passkey signing in is one tap — so a session lasts a sitting, and a cookie that
+leaks is good for hours rather than weeks. The receiver cuts any session that would outlive the current
+lifetime, counted from its own creation, each time it starts (`store::sessions::cap_lifetimes`): a shorter
+lifetime then holds from the deploy on, rather than once the last thirty-day cookie expires by itself, and a
+start after a revert to a binary with the longer one cuts again. A sliding window would mean writing
 to the database on every page load to record activity nothing reads — turning the read path into a
 writer, which for a receiver whose single storage writer carries measurement throughput is a poor trade
 for a one-operator UI. There is no `last_seen_at` column for the same reason.
@@ -2210,7 +2253,7 @@ the table can grow. An expired row left lying around is inert regardless — the
 decides, not the row's presence.
 
 The TTL is a constant in code, not a module option. Nothing depends on the value, and `nix/module.nix`
-gaining a knob nobody turns is a thing to explain later; `sessionTtlDays` beside `logLevel` is where it
+gaining a knob nobody turns is a thing to explain later; `sessionTtlHours` beside `logLevel` is where it
 goes if a host ever needs to differ.
 
 ### 14.3 What is *not* defended, and why
@@ -2225,7 +2268,8 @@ an oversight:
   happens, so it is measurably faster than a wrong password. The *response* is identical either way —
   one message for every failure, so the form is not an oracle — but the timing is not equalised. With
   one operator whose username is not secret, closing that would be machinery guarding nothing.
-- **No password change page.** `create-user` and `delete-user` are the interface; a form would need the
+- **No password change page.** `create-user`, `set-password` and `delete-user` are the interface — the account
+  page can *remove* a password once a passkey exists (§14.10), but not set one; a form would need the
   old password, a confirmation field and a re-login path, for something done about once.
 - **A session is full authority.** Creating and deleting users needs nothing beyond being logged in — no
   re-entered password. So a stolen cookie can mint a second login and make its access outlive the
@@ -2333,6 +2377,12 @@ in only one position is an invitation to use it in the other.
 This is not hypothetical. A device is free to send `<script>` as an `event_name` or an attribute key,
 and §5.2 stores both verbatim by design — nothing upstream of the rendering rejects it.
 
+**Two pages carry a script: `/account` and `/login`** (§14.10). WebAuthn has no HTML-form API, so adding a
+passkey or signing in with one is impossible without one. Each is inline, only bridges
+`navigator.credentials` to an ordinary form `POST`, and both live in `web::passkey_page`. Without them the
+account page still lists and removes passkeys and the login page's password form still works. Every other page
+is still script-free.
+
 ### 14.7 Passwords
 
 Stored as `blake3(password domain ‖ password)`. §13.2's argument for a fast hash carries over, **but
@@ -2353,6 +2403,11 @@ reasoning as the collector's `apiKeyFile` (§13.4).
 ```sh
 printf %s "$PASSWORD" | monitoring-platform create-user --db <path> --username sashee
 ```
+
+**No password is an empty `password_hash`** (§14.10), not `NULL`: the column is `NOT NULL`, and relaxing that is a
+rebuild and so a major. Every binary since 3.1 reads a stored hash that is not 32 bytes as no password, so one
+the nightly upgrade reverts to refuses that user's password logins rather than failing on them. `set-password`
+gives one back, from stdin like `create-user`.
 
 There is no terminal echo suppression: that needs `termios` raw-mode handling with a restore-on-signal
 path, or a Ctrl-C leaves the operator's shell echo-less, and piping is the documented usage precisely so
@@ -2704,3 +2759,125 @@ time-series chart lies.
 
 SVG is XML, so the same escaping applies as in §14.6: an unescaped `<` in a group label — and group
 labels are device-supplied — is as dangerous in a `<title>` as in an element body.
+
+### 14.10 Passkeys
+
+A user can sign in with a password, with passkeys, or with both, and can remove the password once a passkey
+exists. Built in four phases, each deployed and checked on the host before the next: registering passkeys,
+signing in with them, removing the password, and shortening sessions to four hours (§14.2) now that signing in
+is one tap.
+
+**A passkey is bound to the host it was registered from.** Each device reaches the UI at its own loopback
+name: a laptop at `localhost:PORT`, the Android app (sashee/iroh-webview-app) at `<label>.localhost:<port>`,
+the label derived from the tunnel's endpoint id. There is no one host they share, and the app refuses any RP
+ID other than its own host. So the RP ID is taken from the request's `Host`, each passkey records it, and a
+sign-in is checked against the passkey's own. The port is never part of it: an RP ID has none, and the
+tunnel's local port is whatever was free.
+
+**Taking the RP ID from the request is safe because only loopback names are accepted** — `localhost` and
+`*.localhost`, which always resolve to the device the browser runs on, so no remote site can serve a page
+there to phish a registration. `127.0.0.1` is not among them, and could not be: browsers refuse WebAuthn on an
+IP address. The page reached there says so and links to the same address under `localhost`. The response is
+verified against the request's own origin, port included — which the origin check (§14.3.1) has already
+matched to `Host` — so a page on another port cannot finish a ceremony this one started.
+
+**The options are the ones the phone app can satisfy.** Its authenticator signs with ES256 only, returns `none`
+attestation, keeps a sign counter of zero, sets user-present and user-verified, and stores discoverable
+credentials. So the server offers ES256 among its algorithms, asks for `none`, requires a resident key and user
+verification, and accepts a counter that never moves (the check only applies once a credential has reported a
+positive count). The library's default `credProtect` extension is turned off: the app does not implement it
+and enforcing it would fail every registration there, while user verification — what its strictest level
+would add — is required anyway.
+
+**The user handle is derived from the username**, as `blake3(domain ‖ username)` stretched to 64 bytes, not
+stored. It must be the same for every passkey of a user — an authenticator holds one credential per site and
+handle, so a second registration from the same device is recognised rather than added — and deriving it leaves
+no column to keep in step. It is not a secret. The user's existing credential ids on the same site are sent as
+`excludeCredentials`, so that device says it already has one, and the page relays that.
+
+**Ceremonies in progress are held in memory**, in the library's bounded set (32 slots, each expiring after
+five minutes), not in a table. A ceremony means nothing after a restart, so persisting it would only add a write
+per page view and a sweep to forget it again; a prompt open across a restart fails and is tapped again. A
+challenge is taken out of the set before it is verified, so it answers one response whatever the outcome.
+
+`webauthn_rp` does the verification — pure Rust on RustCrypto (`p256`, `ed25519-dalek`, `rsa`), chosen over
+`webauthn-rs` because that one brings OpenSSL and the package otherwise needs nothing but a C compiler. Its
+`rsa` 0.9 carries RUSTSEC-2023-0071, a timing attack on private-key operations; nothing here holds an RSA
+private key — only public keys are used, to verify — so it does not apply, though an audit will list it.
+
+```sql
+-- 4.1
+CREATE TABLE web_passkey (
+  credential_id BLOB    PRIMARY KEY,
+  username      TEXT    NOT NULL REFERENCES web_user(username) ON DELETE CASCADE,
+  rp_id         TEXT    NOT NULL,
+  static_state  BLOB    NOT NULL,   -- the public key, in webauthn_rp's binary encoding
+  dynamic_state BLOB    NOT NULL,   -- sign counter and flags, updated at each sign-in
+  label         TEXT    NOT NULL,
+  created_at    INTEGER NOT NULL,
+  last_used_at  INTEGER
+) STRICT;
+```
+
+A passkey is removed only by its owner — the owner is part of the `DELETE`, not a check before it — and with
+its user, by the foreign key. The users page lists how each user signs in (`password, 2 passkeys`).
+
+#### Signing in with a passkey
+
+The login page offers **sign in with a passkey** above the password form: one tap, where the password is two
+fields. It is a **discoverable** ceremony — no `allowCredentials`, no username typed — so the authenticator
+offers whichever passkey it holds for the page's host, and the chosen one names its user by its handle. On an
+address passkeys cannot be bound to, the page links to the same login under `localhost` instead, and the
+password form is there either way.
+
+Finishing it, in order:
+
+1. **The ceremony is taken out of the set before anything is checked**, the unknown-credential case included,
+   so a challenge answers exactly one response.
+2. The credential id is looked up. None stored — most likely a passkey removed on the account page that the
+   device still holds — is refused as such.
+3. The passkey's recorded site must be the page's own host. Verification would refuse a mismatch anyway, since
+   the authenticator data carries the hash of the RP ID it signed for, but naming it tells the journal which
+   passkey went where.
+4. `webauthn_rp` verifies the signature with the stored public key, the client data against the request's own
+   origin (port included) and the challenge, user presence and verification, and the response's user handle
+   against the one derived for the passkey's owner — so a passkey cannot be presented under someone else's.
+5. `last_used_at` is recorded, with the new dynamic state when verification changed it (the phone app's counter
+   stays at zero, so for it this is only ever the timestamp), and a session is established exactly as for a
+   password.
+
+The refusals say what went wrong — removed, another address, expired, not verified — unlike the password form's
+single message. A passkey cannot be guessed, so naming the reason tells an attacker nothing and tells the owner
+what to do. The password form's indistinguishability (§14.3) is unaffected: a refused password re-renders the
+page with a fresh challenge in it, and the two refusals are compared with that masked.
+
+Sign-in ceremonies get their own set of 64 slots, twice the registrations', because every visit to the login
+page starts one, including each redirect there from an expired session. Reaching the page at all takes the
+tunnel's own authentication (§14.5), so the bound is about memory rather than strangers, and a full set refuses
+only the passkey button.
+
+#### Passkeys only
+
+Once a user has a passkey, the account page can remove their password. From then on the password form refuses
+them like any wrong password, their passkeys sign them in, and the users page and `list-users` say so
+(`1 passkey`; `no password, 1 passkey`).
+
+**Two guards keep a user from locking themselves out**, each checked in the same `BEGIN IMMEDIATE` transaction
+as the change it guards:
+
+- **No password is removed without a passkey.** Nothing would sign the user in afterwards.
+- **No passkey is removed when it is the last one and there is no password**, for the same reason. The page
+  does not render its button, as the users page does not render the last user's delete — and the handler
+  refuses it regardless, since the page may be older than the password's removal.
+
+`IMMEDIATE` because the two are the same hazard from opposite ends. Checked in deferred transactions, removing
+the password and removing the last passkey could each see the other still there, both pass, and together leave
+nothing — so each takes the write lock before it counts.
+
+**The way back is on the host.** There is no form to set a password, as there has never been one to change it
+(§14.3). `set-password` reads one from stdin and replaces whatever the user had, which covers both a lost phone
+and a change of mind. It opens the database without creating it, so a mistyped `--db` fails instead of
+reporting that the user does not exist in a new empty file.
+
+Existing sessions are untouched by either change. A session does not record how it was created, and one made
+with a password is no less the user's than one made with a passkey; ending sessions is the sessions page's job.

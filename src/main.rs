@@ -37,6 +37,10 @@ fn main() -> Result<()> {
             init_tracing_on_stderr(&args.common.log_level);
             create_user(&args)
         }
+        Command::SetPassword(args) => {
+            init_tracing_on_stderr(&args.common.log_level);
+            set_password(&args)
+        }
         Command::ListUsers(args) => {
             init_tracing_on_stderr(&args.log_level);
             list_users(&args)
@@ -127,6 +131,21 @@ fn create_user(args: &CreateUserArgs) -> Result<()> {
     Ok(())
 }
 
+/// Sets an existing user's password, from stdin: the way back in when passkeys are lost (SPEC §14.10).
+///
+/// `open_write_existing`, not `open_write`: there is a user to change, so there is a database, and a mistyped
+/// `--db` should fail here rather than create an empty one and report that the user does not exist in it.
+fn set_password(args: &CreateUserArgs) -> Result<()> {
+    let path = args.common.database_path();
+    let password = read_password()?;
+    let conn = store::open_write_existing(&path)?;
+    if !store::users::set_password(&conn, &args.username, &auth::hash_password(&password))? {
+        anyhow::bail!("no user {:?} in {}", args.username, path.display());
+    }
+    eprintln!("set the password of user {:?} in {}", args.username, path.display());
+    Ok(())
+}
+
 /// The password, from stdin.
 ///
 /// **Never from argv**, for the reason on `Command::CreateUser`. Not from an environment variable either:
@@ -173,8 +192,17 @@ fn read_password() -> Result<String> {
 
 fn list_users(args: &ApiKeyArgs) -> Result<()> {
     let conn = store::open_read(&args.database_path())?;
+    let passkeys = store::passkeys::counts(&conn)?;
     for user in store::users::list(&conn)? {
-        println!("{}  {}", api::query::format_nanos(user.created_at), user.username);
+        // How each user signs in, so a recovery starts by seeing who has no password.
+        let passkeys = passkeys.get(&user.username).copied().unwrap_or(0);
+        let password = if user.has_password { "password" } else { "no password" };
+        println!(
+            "{}  {}  {password}, {passkeys} passkey{}",
+            api::query::format_nanos(user.created_at),
+            user.username,
+            if passkeys == 1 { "" } else { "s" }
+        );
     }
     Ok(())
 }
@@ -261,6 +289,15 @@ async fn serve(args: ServeArgs) -> Result<()> {
         ),
         Ok(keys) => tracing::info!(keys, "API keys loaded"),
         Err(e) => tracing::warn!(error = %e, "could not count the API keys"),
+    }
+
+    // Sessions issued under a longer lifetime than this binary's — the thirty days before passkeys — are cut
+    // to it, so a shorter lifetime holds from this start on (SPEC §14.2). Not fatal, like the key count: if it
+    // fails, those sessions simply last until their own expiry.
+    match store::sessions::cap_lifetimes(&conn, monitoring_platform::web::session::TTL_NANOS) {
+        Ok(0) => {}
+        Ok(capped) => tracing::info!(capped, "shortened sessions to the current lifetime"),
+        Err(e) => tracing::warn!(error = %e, "could not shorten older sessions"),
     }
 
     let (writer, writer_done) = store::write::spawn(conn);

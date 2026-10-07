@@ -53,6 +53,10 @@ serde_json = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
+# Passkeys for the web UI (SPEC §14.10). Pure Rust on RustCrypto, so the package still needs nothing but a
+# C compiler (nix/package.nix); `webauthn-rs` would have brought OpenSSL. `serde_relaxed` parses the
+# standard WebAuthn JSON leniently, which is what real clients send.
+webauthn_rp = { version = "0.3.0", features = ["serde_relaxed"] }
 
 [dev-dependencies]
 http-body-util = "0.1.4"
@@ -60,4 +64,8 @@ http-body-util = "0.1.4"
 # to need this at build time now lives in mp-host.
 libc = { workspace = true }
 tempfile = { workspace = true }
+# A software authenticator for the passkey tests, shaped like the phone app's: ES256 over P-256, signed
+# with SHA-256. The same versions webauthn_rp already pulls in, so nothing new is built.
+p256 = { version = "0.13.2", features = ["ecdsa", "pkcs8"] }
+sha2 = "0.10.9"
 tower = { version = "0.5.3", features = ["util"] }

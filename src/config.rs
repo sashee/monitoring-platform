@@ -56,7 +56,14 @@ pub enum Command {
     /// `apiKeyFile` rather than a key.
     CreateUser(CreateUserArgs),
 
-    /// List the web interface users, by name and creation time.
+    /// Give an existing web interface user a password, reading it from stdin (SPEC §14.10).
+    ///
+    /// The way back in for a user whose passkeys are lost, or who removed their password and wants it back —
+    /// the web interface has no form for setting one. Replaces any password the user had. From stdin, never a
+    /// flag, for the reason on `create-user`.
+    SetPassword(CreateUserArgs),
+
+    /// List the web interface users, by name, creation time and how they sign in.
     ///
     /// Never prints a password, because none is stored.
     ListUsers(ApiKeyArgs),

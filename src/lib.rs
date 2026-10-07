@@ -19,16 +19,19 @@ use std::sync::Arc;
 pub use config::Config;
 pub use store::Writer;
 
-/// Shared handler state. Cheap to clone: a channel sender and an `Arc`.
+/// Shared handler state. Cheap to clone: a channel sender and `Arc`s.
 #[derive(Clone)]
 pub struct AppState {
     pub config: Arc<Config>,
     pub writer: Writer,
+    /// Passkey ceremonies in progress (SPEC §14.10). The one piece of in-memory state the web UI keeps,
+    /// because a ceremony is minutes long and meaningless after a restart; see `web::passkey::Ceremonies`.
+    pub ceremonies: Arc<web::passkey::Ceremonies>,
 }
 
 impl AppState {
     pub fn new(config: Config, writer: Writer) -> Self {
-        Self { config: Arc::new(config), writer }
+        Self { config: Arc::new(config), writer, ceremonies: Arc::default() }
     }
 }
 

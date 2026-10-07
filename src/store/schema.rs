@@ -81,7 +81,7 @@ impl std::fmt::Display for Version {
 }
 
 /// Schema version this binary understands. Tracked in `PRAGMA user_version`.
-pub const SCHEMA_VERSION: Version = Version::new(4, 0);
+pub const SCHEMA_VERSION: Version = Version::new(4, 1);
 
 /// A compile-time guard, not a test, because it is an invariant about a constant and a build is the right
 /// place to lose an argument with one.
@@ -103,8 +103,11 @@ pub const SCHEMA_VERSION: Version = Version::new(4, 0);
 ///
 /// The ordering was the whole point: it left 4.0 as a table rebuild with no read-path changes, which is the
 /// only shape worth having in a migration that cannot be rehearsed on the host or reverted once applied.
+///
+/// Only the major is pinned. A minor only adds (see [`MIGRATIONS`]), so it strands nothing and needs no
+/// such ceremony; pinning it too would only make every minor edit this line for no reason.
 const _: () = assert!(
-    SCHEMA_VERSION.major == 4 && SCHEMA_VERSION.minor == 0,
+    SCHEMA_VERSION.major == 4,
     "a major bump strands every receiver still running the previous one; see SPEC.md §6.2"
 );
 
@@ -424,6 +427,39 @@ const MIGRATIONS: &[Migration] = &[
     ALTER TABLE web_session_new RENAME TO web_session;
 
     CREATE INDEX web_session_expires_at_idx ON web_session (expires_at);
+    "#,
+    },
+    // → version 4.1: passkeys for the web UI (SPEC §14.10).
+    //
+    // **A minor bump.** One new table, which a 4.0 binary neither reads nor writes: reverted to it, a user's
+    // passkeys simply do nothing until the next roll-forward, and their password still works.
+    //
+    // What a passkey row holds is what `webauthn_rp` needs to verify a later sign-in: the credential id
+    // the authenticator returns, and the credential's static state (its public key) and dynamic state (sign
+    // counter and flags), in the library's own binary encodings. The user handle is not stored: it is
+    // derived from the username (see `web::passkey::user_handle`), so there is nothing to keep in step.
+    //
+    // `rp_id` is the host the passkey was registered from, without a port. Each device reaches this page at
+    // its own `localhost` or `<label>.localhost` and binds its passkeys there, so a sign-in is only ever
+    // checked against the site its passkey belongs to.
+    //
+    // `ON DELETE CASCADE`: deleting a user deletes their passkeys, in every binary that deletes users, since
+    // all of them run with foreign keys on (4.0).
+    Migration {
+        version: Version::new(4, 1),
+        sql: r#"
+    CREATE TABLE web_passkey (
+      credential_id BLOB    PRIMARY KEY,
+      username      TEXT    NOT NULL REFERENCES web_user(username) ON DELETE CASCADE,
+      rp_id         TEXT    NOT NULL,
+      static_state  BLOB    NOT NULL,
+      dynamic_state BLOB    NOT NULL,
+      label         TEXT    NOT NULL,
+      created_at    INTEGER NOT NULL,
+      last_used_at  INTEGER
+    ) STRICT;
+
+    CREATE INDEX web_passkey_username_idx ON web_passkey (username);
     "#,
     },
 ];

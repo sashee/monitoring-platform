@@ -1620,6 +1620,13 @@ The explorer (§14.9):
   timeline and offers no chart field at all. Sixteen groups render exactly eight series, use all eight
   slots and never a ninth, and the legend lists them in **numeric** order (1–8, not 1, 10, 11 …).
 - Switching type drops the previous type's filters and the new type's rows appear.
+- **Stepping through time** (§14.9), end to end: on a 24-hour view the table lists that day's row and not
+  the day before's, the step back lists the day before's and not that day's, and the step forward from there
+  returns to the original `to`. The live view offers only the step back. The filter form carries the window
+  as hidden bounds, and the full-size chart's steps stay on the chart page. In unit tests: a bound that does
+  not belong to the window's shape is dropped (a preset ignores `from`, `all` both); bounds with no range are
+  a custom window; a step that reaches now lands on the live view with no redundant `latest` beside it; a
+  custom window steps by its own width; and a step keeps every filter and hidden series but not the cursor.
 - Partial coverage is reported whether or not markers were drawn, since markers are dropped on precisely
   the dense charts that have most buckets to be partially covered.
 - An empty range says so rather than rendering an axis with nothing on it. Device-supplied group labels
@@ -2429,6 +2436,41 @@ Two details that only exist because there is no JavaScript:
 
 Unknown parameters are **ignored** here, unlike §7.1's read API which rejects them. A device with a typo
 in a filter name deserves an error; a person following a stale bookmark deserves a page.
+
+#### Stepping through time
+
+Under the heading that states the window, a row of links moves it: `← 24 hours earlier · 24 hours later →
+· latest`, on the explorer and on the full-size chart alike.
+
+**Each step is the window's own length, sliding from wherever the reader is**, so a step means the same at
+fifteen minutes and at a week. Calendar days were the alternative, and would need a mode of their own: a
+fifteen-minute window has no natural midnight. A drill-down window steps by its own width, as `earlier` and
+`later`. `all` has no steps, since its window is everything there is. The live view offers only the step
+back; a step forward that would reach now lands on the live view rather than on a fixed end just short of
+it, which would look live and then stop moving; and `latest` returns there from anywhere further back.
+
+It is all in the URL. A window has one of three shapes, and a bound that does not belong to its shape is
+dropped when the query string is read:
+
+| `range` | window | bounds read |
+|---|---|---|
+| a preset | its length, ending at `to`, or now without one | `to` |
+| `custom` | `from` to `to` | both |
+| `all` | the data's extent | neither |
+
+A step therefore just sets `to` (or shifts both ends of a custom window), and every position is still a link.
+`from` arriving with no range — the form's blank option, or a bookmark that only ever had bounds — is a custom
+window.
+
+**The filter form carries the window**, as hidden `from` and `to`. Without them, ticking a field two days
+back threw the reader to now, and so did any filter change after a chart drill-down. The shapes are what make
+carrying both safe: picking `7 days` after a drill-down submits `range=7d` beside the old bounds, and with
+`from` dropped for a preset that is seven days ending where the reader was — not the custom window silently
+winning over the preset just picked. The presets are labelled as lengths (`24 hours`, not `last 24 hours`)
+for the same reason: a window that has been stepped back is not the last of anything.
+
+A step moves only the window. The type, its filters, the charted fields, the grouping and the hidden series
+all come along; the pagination cursor does not, since it belongs to the window it was taken in.
 
 #### Facets: what there is to filter on
 

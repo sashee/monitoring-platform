@@ -52,13 +52,16 @@ const DAY: i64 = 24 * HOUR;
 ///
 /// Presets rather than only a pair of date fields, because the range is the control every reader reaches
 /// for first and nobody wants to type two timestamps to see the last hour.
+///
+/// Labelled as lengths, not as "last 24 hours": a preset ends now only until the reader steps back (see
+/// [`steps`]), and then a label claiming "last" would contradict the heading under it.
 const RANGES: &[(&str, &str, i64)] = &[
-    ("15m", "last 15 min", 15 * MINUTE),
-    ("1h", "last hour", HOUR),
-    ("6h", "last 6 hours", 6 * HOUR),
-    ("24h", "last 24 hours", DAY),
-    ("7d", "last 7 days", 7 * DAY),
-    ("30d", "last 30 days", 30 * DAY),
+    ("15m", "15 min", 15 * MINUTE),
+    ("1h", "1 hour", HOUR),
+    ("6h", "6 hours", 6 * HOUR),
+    ("24h", "24 hours", DAY),
+    ("7d", "7 days", 7 * DAY),
+    ("30d", "30 days", 30 * DAY),
     ("all", "all time", 0),
 ];
 const DEFAULT_RANGE: &str = "24h";
@@ -174,13 +177,17 @@ struct Explore {
 fn parse_explore(raw: &[(String, String)]) -> Explore {
     let mut out = Explore { range: DEFAULT_RANGE.to_owned(), ..Default::default() };
     let mut previous_kind = None;
+    let mut range_given = false;
 
     for (key, value) in raw {
         if value.is_empty() {
             continue;
         }
         match key.as_str() {
-            "range" => out.range = value.clone(),
+            "range" => {
+                out.range = value.clone();
+                range_given = true;
+            }
             "from" => out.from = parse_instant(value),
             "to" => out.to = parse_instant(value),
             "type" => out.kind = Some(value.clone()),
@@ -222,6 +229,29 @@ fn parse_explore(raw: &[(String, String)]) -> Explore {
         out.hidden.clear();
         out.cursor = None;
     }
+
+    // **A window has one of three shapes, and a bound that does not belong to its shape is dropped.**
+    //
+    // - `custom`: both ends, `from` and `to` — a chart's drill-down link, or a step from one.
+    // - A preset: its own length, ending at `to`, or now when there is no `to`.
+    // - `all`: the data's extent, so neither bound means anything.
+    //
+    // This is what lets the filter form carry the window (see `filter_row`) without the window overriding
+    // the reader's next choice. Picking `7 days` after a drill-down submits `range=7d` beside the old `from`
+    // and `to`; with `from` dropped, that is seven days ending where the reader was, rather than a custom
+    // window silently winning over the preset they just picked. The form's blank range option submits no
+    // range at all, so a `from` arriving without one is a custom window being carried forward.
+    if !range_given && out.from.is_some() {
+        out.range = "custom".to_owned();
+    }
+    match out.range.as_str() {
+        "custom" => {}
+        "all" => {
+            out.from = None;
+            out.to = None;
+        }
+        _ => out.from = None,
+    }
     out
 }
 
@@ -257,6 +287,9 @@ struct ExploreData {
     types: Vec<String>,
     facets: Facets,
     window: (i64, i64),
+    /// The instant `window` was resolved against — what "live" meant for this render, and so what
+    /// [`steps`] measures a step later against.
+    now: i64,
     bucket: i64,
     timeline: Vec<Point>,
     /// One entry per chosen field: the field, its series, and how many groups exist for it.
@@ -458,7 +491,7 @@ fn gather(conn: &rusqlite::Connection, p: &Explore, now: i64) -> anyhow::Result<
     let more = rows.len() as i64 > PAGE_LIMIT;
     rows.truncate(PAGE_LIMIT as usize);
 
-    Ok(ExploreData { types, facets, window, bucket, timeline, charts, rows, more })
+    Ok(ExploreData { types, facets, window, now, bucket, timeline, charts, rows, more })
 }
 
 async fn explore(State(state): State<AppState>, Query(raw): Query<Vec<(String, String)>>) -> Response {
@@ -507,6 +540,14 @@ fn filter_row(params: &Explore, data: &ExploreData) -> String {
     // filter change.
     if let Some(kind) = &params.kind {
         out.push_str(&format!("<input type=\"hidden\" name=\"t0\" value=\"{}\">", html::escape(kind)));
+    }
+
+    // Where the window is, so changing a filter keeps the reader where they stepped to rather than throwing
+    // them back to now. Which bound counts is `parse_explore`'s window shapes' decision, not the form's.
+    for (name, bound) in [("from", params.from), ("to", params.to)] {
+        if let Some(bound) = bound {
+            out.push_str(&format!("<input type=\"hidden\" name=\"{name}\" value=\"{bound}\">"));
+        }
     }
 
     // Attribute filters, one control per discovered key. Only offered once a type is chosen: without one
@@ -634,6 +675,7 @@ fn render_explore(params: &Explore, data: &ExploreData) -> String {
         html::escape(&format_nanos(data.window.0)),
         html::escape(&format_nanos(data.window.1))
     ));
+    body.push_str(&steps_row(params, data, "/"));
     body.push_str(&html::plot(&svg::timeline(
         &data.timeline,
         data.window.0,
@@ -860,6 +902,80 @@ fn open_chart_link(params: &Explore, field: Option<&str>) -> String {
     )
 }
 
+/// Where the window can move: one window-length earlier or later, or back to now.
+struct Steps {
+    /// How far a step moves, for the link text: the preset's own label, or `None` for a custom window,
+    /// whose width is whatever a drill-down made it.
+    length: Option<&'static str>,
+    earlier: Explore,
+    /// `None` while the window ends now: there is nothing later yet.
+    later: Option<Explore>,
+    /// Back to the live view. `None` when `later` already gets there, and for a custom window, which has no
+    /// live edge of its own — picking a preset is how a reader returns from one.
+    latest: Option<Explore>,
+}
+
+/// The views one step either side of this one, or `None` for `all`, whose window is the whole extent.
+///
+/// **Sliding steps, each the window's own length**, so they mean the same thing at fifteen minutes and at a
+/// week. Calendar days would need a mode of their own: a fifteen-minute window has no natural midnight.
+///
+/// A step moves only the window. Every filter, field, grouping and hidden series is carried along, but not
+/// the pagination cursor, which belongs to the window it was taken in.
+fn steps(p: &Explore, window: (i64, i64), now: i64) -> Option<Steps> {
+    let (from, to) = window;
+    let at = |from, to| Explore { from, to, cursor: None, ..p.clone() };
+
+    if p.range == "custom" {
+        let width = to - from;
+        return Some(Steps {
+            length: None,
+            earlier: at(Some(from - width), Some(from)),
+            later: (to < now).then(|| at(Some(to), Some(to + width))),
+            latest: None,
+        });
+    }
+
+    let (_, label, span) = RANGES.iter().find(|(id, _, span)| *id == p.range && *span > 0)?;
+    // A step that would reach now lands on the live view rather than on a fixed `to` just short of it —
+    // which would look live and then stop moving.
+    let next = to.saturating_add(*span);
+    Some(Steps {
+        length: Some(label),
+        earlier: at(None, Some(from)),
+        later: p.to.map(|_| at(None, (next < now).then_some(next))),
+        latest: (p.to.is_some() && next < now).then(|| at(None, None)),
+    })
+}
+
+/// The row of links that moves the window, for under the heading that states it. `path` is the page they
+/// return to — the explorer or the full-size chart.
+fn steps_row(p: &Explore, data: &ExploreData, path: &str) -> String {
+    let Some(steps) = steps(p, data.window, data.now) else {
+        return String::new();
+    };
+    let link = |target: &Explore, text: &str| {
+        format!(
+            "<a href=\"{}\">{}</a>",
+            html::escape(&html::query_string(path, &current_params(target))),
+            html::escape(text)
+        )
+    };
+    let (earlier, later) = match steps.length {
+        Some(length) => (format!("← {length} earlier"), format!("{length} later →")),
+        None => ("← earlier".to_owned(), "later →".to_owned()),
+    };
+    let links: Vec<String> = [
+        Some(link(&steps.earlier, &earlier)),
+        steps.later.as_ref().map(|target| link(target, &later)),
+        steps.latest.as_ref().map(|target| link(target, "latest")),
+    ]
+    .into_iter()
+    .flatten()
+    .collect();
+    format!("<p class=\"steps\">{}</p>\n", links.join(" · "))
+}
+
 /// The full-page view of one chart (SPEC §14.9).
 ///
 /// Renders the **same** chart at two geometries and lets a media query choose, which is the no-JavaScript
@@ -903,6 +1019,7 @@ async fn chart(State(state): State<AppState>, Query(raw): Query<Vec<(String, Str
         html::escape(&format_nanos(data.window.0)),
         html::escape(&format_nanos(data.window.1))
     ));
+    body.push_str(&steps_row(&params, &data, "/chart"));
 
     for geo in [&svg::Geometry::FULL_WIDE, &svg::Geometry::FULL_NARROW] {
         match data.charts.first() {
@@ -1659,6 +1776,101 @@ mod tests {
         assert_eq!(short_key("resource.attributes.host.name"), "host.name");
         assert_eq!(short_key("scope.name"), "name");
         assert_eq!(short_key("unprefixed"), "unprefixed");
+    }
+
+    // ------------------------------------------------------------------------- the window and its steps
+
+    /// The three window shapes. A preset is its length ending at `to`, so a stray `from` — the filter form
+    /// carrying a drill-down's bounds when the reader picks a preset — must not override the preset.
+    #[test]
+    fn a_bound_that_does_not_belong_to_the_window_s_shape_is_dropped() {
+        let preset = parse_explore(&pairs(&[("range", "7d"), ("from", "100"), ("to", "200")]));
+        assert_eq!((preset.range.as_str(), preset.from, preset.to), ("7d", None, Some(200)));
+
+        let custom = parse_explore(&pairs(&[("range", "custom"), ("from", "100"), ("to", "200")]));
+        assert_eq!((custom.from, custom.to), (Some(100), Some(200)));
+
+        let all = parse_explore(&pairs(&[("range", "all"), ("from", "100"), ("to", "200")]));
+        assert_eq!((all.from, all.to), (None, None));
+    }
+
+    /// The form's blank range option submits nothing, so bounds arriving without a range are a custom
+    /// window carried forward — and so are links and bookmarks that only ever had `from` and `to`.
+    #[test]
+    fn a_from_without_a_range_is_a_custom_window() {
+        let p = parse_explore(&pairs(&[("range", ""), ("from", "100"), ("to", "200")]));
+        assert_eq!((p.range.as_str(), p.from, p.to), ("custom", Some(100), Some(200)));
+    }
+
+    const NOW: i64 = 1_000 * DAY;
+
+    fn live(range: &str) -> Explore {
+        parse_explore(&pairs(&[("range", range), ("type", "t"), ("t0", "t"), ("hide", "3")]))
+    }
+
+    /// From the live view a step goes back exactly one window, and there is nothing later yet.
+    #[test]
+    fn the_live_view_steps_back_one_window_and_no_further_forward() {
+        let p = live("24h");
+        let s = steps(&p, (NOW - DAY, NOW), NOW).expect("a preset can step");
+        assert_eq!(s.length, Some("24 hours"));
+        assert_eq!((s.earlier.from, s.earlier.to), (None, Some(NOW - DAY)));
+        assert!(s.later.is_none());
+        assert!(s.latest.is_none());
+    }
+
+    /// Three days back, a step forward is one day forward, and `latest` returns to now.
+    #[test]
+    fn a_past_window_steps_both_ways_and_back_to_now() {
+        let mut p = live("24h");
+        p.to = Some(NOW - 3 * DAY);
+        let s = steps(&p, (NOW - 4 * DAY, NOW - 3 * DAY), NOW).unwrap();
+        assert_eq!(s.earlier.to, Some(NOW - 4 * DAY));
+        assert_eq!(s.later.as_ref().unwrap().to, Some(NOW - 2 * DAY));
+        assert_eq!(s.latest.as_ref().unwrap().to, None);
+    }
+
+    /// A step that would reach now lands on the live view — a fixed `to` a minute short of now would look
+    /// live and then stop moving — and `latest` is not offered beside it, since it goes to the same place.
+    #[test]
+    fn a_step_that_reaches_now_lands_on_the_live_view() {
+        let mut p = live("24h");
+        p.to = Some(NOW - DAY + MINUTE);
+        let s = steps(&p, (NOW - 2 * DAY + MINUTE, NOW - DAY + MINUTE), NOW).unwrap();
+        assert_eq!(s.later.as_ref().unwrap().to, None);
+        assert!(s.latest.is_none());
+    }
+
+    /// A drill-down window has no preset length, so it steps by its own width, both ends moving together.
+    #[test]
+    fn a_custom_window_steps_by_its_own_width() {
+        let p = parse_explore(&pairs(&[("range", "custom"), ("from", "1000"), ("to", "1360")]));
+        let s = steps(&p, (1_000, 1_360), NOW).unwrap();
+        assert_eq!(s.length, None);
+        assert_eq!((s.earlier.from, s.earlier.to), (Some(640), Some(1_000)));
+        let later = s.later.unwrap();
+        assert_eq!((later.from, later.to), (Some(1_360), Some(1_720)));
+        assert!(s.latest.is_none(), "a custom window has no live edge; a preset is the way back");
+
+        // Once it reaches now there is nothing later.
+        assert!(steps(&p, (NOW - 360, NOW), NOW).unwrap().later.is_none());
+    }
+
+    #[test]
+    fn all_time_has_nowhere_to_step() {
+        assert!(steps(&live("all"), (0, NOW), NOW).is_none());
+    }
+
+    /// A step moves the window and nothing else: the type, its filters and the hidden series all come
+    /// along, while the pagination cursor — which belongs to the old window — does not.
+    #[test]
+    fn a_step_keeps_everything_but_the_window_and_the_cursor() {
+        let mut p = live("24h");
+        p.cursor = Some((NOW - HOUR, [7; 16]));
+        let earlier = steps(&p, (NOW - DAY, NOW), NOW).unwrap().earlier;
+        assert_eq!(earlier.kind.as_deref(), Some("t"));
+        assert_eq!(earlier.hidden, vec!["3".to_owned()]);
+        assert!(earlier.cursor.is_none());
     }
 
     /// Pagination has to carry the whole filter state forward, or page two is a different query from page

@@ -84,6 +84,9 @@ td.act{white-space:nowrap;width:1%}\
 .empty{opacity:.7;font-style:italic}\
 .error{color:var(--err);font-weight:600}\
 .note{font-size:.8rem;color:var(--text-2);margin:.25rem 0}\
+/* Padded so each step is a target a thumb can hit, not just the width of its words. */\
+.steps{font-size:.8rem;margin:.25rem 0}\
+.steps a{display:inline-block;padding:.35rem .25rem}\
 button{font:inherit;padding:.4rem .8rem;cursor:pointer}\
 button.link{background:none;border:none;padding:0;color:var(--err);text-decoration:underline;cursor:pointer;font:inherit}\
 select,input{font:inherit;padding:.3rem}\

@@ -1601,6 +1601,89 @@ async fn the_all_range_includes_the_newest_row() {
     assert!(rows.contains("last"), "the newest row must not be dropped: {rows}");
 }
 
+/// One measurement per day, told apart by its body, for the stepping tests.
+fn days(markers: &[(&str, i64)]) -> Vec<Measurement> {
+    markers
+        .iter()
+        .map(|(marker, event_time)| Measurement {
+            event_time: *event_time,
+            processed_time: *event_time,
+            kind: "t".to_owned(),
+            body: Some(json!({ "marker": marker })),
+            attributes: serde_json::Map::new(),
+        })
+        .collect()
+}
+
+/// The `href` of the step link whose text is `text`, unescaped and ready to request.
+fn step_link(body: &str, text: &str) -> Option<String> {
+    let row = body.split("<p class=\"steps\">").nth(1)?.split("</p>").next()?;
+    row.split("<a href=\"")
+        .skip(1)
+        .find(|link| link.contains(&format!(">{text}</a>")))
+        .and_then(|link| link.split('"').next())
+        .map(|href| href.replace("&amp;", "&"))
+}
+
+/// **Stepping back and forward through a 24-hour view**, end to end: the table under each step lists that
+/// day's rows and only those, and a step forward from the day before returns to where it started.
+#[tokio::test]
+async fn the_window_steps_back_and_forward_a_day_at_a_time() {
+    const DAY: i64 = 86_400_000_000_000;
+    const HOUR: i64 = 3_600_000_000_000;
+    let harness = harness();
+    harness.ingest(&days(&[("today-row", T - 2 * HOUR), ("yesterday-row", T - DAY - 2 * HOUR)]));
+    let cookie = harness.login().await;
+    let table = |body: &str| body.split("<tbody>").nth(1).unwrap_or_default().to_owned();
+
+    let today = explore(&harness, &cookie, &format!("range=24h&to={T}")).await;
+    assert!(table(&today.body).contains("today-row"), "{}", today.body);
+    assert!(!table(&today.body).contains("yesterday-row"), "{}", today.body);
+
+    let back = step_link(&today.body, "← 24 hours earlier").expect("a step back");
+    let yesterday = harness.get(&back, Some(&cookie)).await;
+    assert_eq!(yesterday.status, StatusCode::OK);
+    assert!(table(&yesterday.body).contains("yesterday-row"), "{}", yesterday.body);
+    assert!(!table(&yesterday.body).contains("today-row"), "{}", yesterday.body);
+
+    let forward = step_link(&yesterday.body, "24 hours later →").expect("a step forward");
+    assert!(forward.contains(&format!("to={T}")), "back to where it started: {forward}");
+    assert!(step_link(&yesterday.body, "latest").is_some(), "and a way back to now");
+}
+
+/// The live view has nothing later, so it offers only the step back.
+#[tokio::test]
+async fn the_live_view_offers_only_the_step_back() {
+    let harness = harness();
+    let cookie = harness.login().await;
+    let reply = explore(&harness, &cookie, "range=24h").await;
+    assert!(step_link(&reply.body, "← 24 hours earlier").is_some(), "{}", reply.body);
+    assert!(step_link(&reply.body, "24 hours later →").is_none(), "{}", reply.body);
+    assert!(step_link(&reply.body, "latest").is_none(), "{}", reply.body);
+}
+
+/// **Changing a filter keeps the window.** The filter row is a form, and before it carried the bounds,
+/// ticking a field after stepping back two days jumped the reader to now.
+#[tokio::test]
+async fn the_filter_form_carries_the_window() {
+    let harness = harness();
+    let cookie = harness.login().await;
+    let reply = explore(&harness, &cookie, &format!("range=24h&to={T}")).await;
+    let form = reply.body.split("<form method=\"get\" action=\"/\" class=\"filters\">").nth(1).unwrap();
+    let form = form.split("</form>").next().unwrap();
+    assert!(form.contains(&format!("<input type=\"hidden\" name=\"to\" value=\"{T}\">")), "{form}");
+}
+
+/// The full-size chart steps too, and its links stay on the chart page.
+#[tokio::test]
+async fn the_full_size_chart_steps_on_its_own_page() {
+    let harness = harness();
+    let cookie = harness.login().await;
+    let reply = harness.get(&format!("/chart?range=24h&to={T}"), Some(&cookie)).await;
+    let back = step_link(&reply.body, "← 24 hours earlier").expect("a step back");
+    assert!(back.starts_with("/chart?"), "{back}");
+}
+
 /// **Regression: the `all` window must not depend on the value filters.** If it did, filtering to one SSID
 /// would shrink the window to that SSID's rows — rescaling the axis on every filter change, and closing the
 /// one-way door again from behind, since a widened facet would have no other rows in range to offer.

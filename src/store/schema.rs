@@ -81,7 +81,7 @@ impl std::fmt::Display for Version {
 }
 
 /// Schema version this binary understands. Tracked in `PRAGMA user_version`.
-pub const SCHEMA_VERSION: Version = Version::new(4, 3);
+pub const SCHEMA_VERSION: Version = Version::new(5, 0);
 
 /// A compile-time guard, not a test, because it is an invariant about a constant and a build is the right
 /// place to lose an argument with one.
@@ -91,8 +91,8 @@ pub const SCHEMA_VERSION: Version = Version::new(4, 3);
 /// edit: get the new major deployed through the pipeline before anything writes a database at it. Changing
 /// this line is that decision, and this assertion is what makes it a visible one.
 ///
-/// **It has been changed once, from 3 to 4**, and the plan it required is worth recording because the next
-/// major will need the same one:
+/// **It has been changed twice.** First from 3 to 4, and the plan it required is worth recording because every
+/// major since has needed the same one:
 ///
 /// 1. 3.2 added `series` and dual-wrote it, so nothing read it yet.
 /// 2. 3.3 moved every *read* onto the join, leaving `measurement.type` and `measurement.attributes` written
@@ -104,10 +104,15 @@ pub const SCHEMA_VERSION: Version = Version::new(4, 3);
 /// The ordering was the whole point: it left 4.0 as a table rebuild with no read-path changes, which is the
 /// only shape worth having in a migration that cannot be rehearsed on the host or reverted once applied.
 ///
+/// Then from 4 to 5, the same way and smaller: 4.3 replaced passwords with sign-in tokens and stopped
+/// reading `web_user.password_hash`, as a minor, and was delivered through the pipeline before 5.0 was
+/// merged. So 5.0 drops a column no binary in circulation reads, and changes no code but the one `INSERT`
+/// that named it.
+///
 /// Only the major is pinned. A minor only adds (see [`MIGRATIONS`]), so it strands nothing and needs no
 /// such ceremony; pinning it too would only make every minor edit this line for no reason.
 const _: () = assert!(
-    SCHEMA_VERSION.major == 4,
+    SCHEMA_VERSION.major == 5,
     "a major bump strands every receiver still running the previous one; see SPEC.md §6.2"
 );
 
@@ -543,6 +548,31 @@ const MIGRATIONS: &[Migration] = &[
     ) STRICT;
 
     CREATE INDEX web_login_token_username_idx ON web_login_token (username);
+    "#,
+    },
+    // → version 5.0: `web_user.password_hash` dropped (SPEC §14.7). A major, and the third.
+    //
+    // **A major because a 4.x binary cannot survive it.** Its `create-user` names the column, and before 4.3
+    // its login reads it. A receiver reverted to any 4.x binary refuses to start against this database, by
+    // design (§6.2). That is why 5.0 only ships after 4.3 — which stopped reading the column and replaced
+    // passwords with sign-in tokens, revertibly — has been delivered through the pipeline: this migration
+    // carries no behaviour of its own that a revert might be needed to escape.
+    //
+    // **`DROP COLUMN`, not the rebuild 4.0 and 4.2 used, and the rebuild would be a disaster here.**
+    // `web_session`, `web_passkey` and `web_login_token` all reference `web_user` with `ON DELETE CASCADE`,
+    // and migrations run with foreign keys on — `migrate_with` enables them before `BEGIN`, and the pragma
+    // is a no-op inside a transaction, so it cannot be turned off for one migration. With them on, `DROP
+    // TABLE web_user` first deletes every row, and the cascade deletes every passkey, session and token with
+    // it. `ALTER TABLE … DROP COLUMN` rewrites the rows in place and deletes none. It needs SQLite 3.35; the
+    // bundled one is newer. It is allowed because nothing else names the column: no index, constraint,
+    // view or trigger.
+    //
+    // Whatever the column still held goes with it — an empty blob for every user since passwords were
+    // removed, and a hash only for one created by a reverted 4.2 binary, which no binary since 4.3 reads.
+    Migration {
+        version: Version::new(5, 0),
+        sql: r#"
+    ALTER TABLE web_user DROP COLUMN password_hash;
     "#,
     },
 ];
@@ -1061,8 +1091,7 @@ mod tests {
     /// keeps the boundary explicit rather than implied by a deleted test.
     #[test]
     fn an_older_binarys_writes_are_refused_by_the_4_0_schema() {
-        let conn = Connection::open_in_memory().unwrap();
-        migrate(&conn).unwrap();
+        let conn = database_at(Version::new(4, 0));
 
         let err = conn
             .execute(
@@ -1120,13 +1149,16 @@ mod tests {
                               (id, event_time, processed_time, body, series_id) \
                               VALUES (?1, ?2, ?3, ?4, ?5)";
 
-    /// A database as the 4.1 binary left it, so 4.2 is tested on the path a real upgrade takes.
-    fn database_at_4_1() -> Connection {
+    /// A database as the binary at `version` left it, so a migration is tested on the path a real upgrade
+    /// takes, and an older binary's writes against the schema it actually wrote to. Foreign keys on, as
+    /// [`migrate`] builds every database since 4.0.
+    fn database_at(version: Version) -> Connection {
         let conn = Connection::open_in_memory().unwrap();
-        for migration in MIGRATIONS.iter().filter(|m| m.version <= Version::new(4, 1)) {
+        conn.pragma_update(None, "foreign_keys", "ON").unwrap();
+        for migration in MIGRATIONS.iter().filter(|m| m.version <= version) {
             conn.execute_batch(migration.sql).unwrap();
         }
-        conn.pragma_update(None, "user_version", Version::new(4, 1).encode()).unwrap();
+        conn.pragma_update(None, "user_version", version.encode()).unwrap();
         conn
     }
 
@@ -1192,7 +1224,7 @@ mod tests {
     /// gets — the upgrade and the fresh install must not end up as two different schemas.
     #[test]
     fn migrating_from_4_1_keeps_every_row() {
-        let conn = database_at_4_1();
+        let conn = database_at(Version::new(4, 1));
         add_series(&conn, b"s1");
         add_series(&conn, b"s2");
         for (id, event_time, body, series) in [
@@ -1251,17 +1283,11 @@ mod tests {
     // ------------------------------------------------------------------------------- 4.3
 
     /// **A reverted 4.2 binary still works against 4.3**, which is what makes it a minor: everything it
-    /// writes about users and sessions it writes as before — a password included, which this binary then
-    /// ignores — and deleting a user still takes their token, through the cascade.
+    /// writes about users and sessions it writes as before — a password included, which 4.3 then ignores —
+    /// and deleting a user still takes their token, through the cascade.
     #[test]
     fn a_4_2_binarys_user_writes_still_work_against_4_3() {
-        let conn = Connection::open_in_memory().unwrap();
-        for migration in MIGRATIONS.iter().filter(|m| m.version <= Version::new(4, 2)) {
-            conn.execute_batch(migration.sql).unwrap();
-        }
-        conn.pragma_update(None, "user_version", Version::new(4, 2).encode()).unwrap();
-        migrate(&conn).unwrap();
-        assert_eq!(stored_version(&conn), Version::new(4, 3).encode());
+        let conn = database_at(Version::new(4, 3));
 
         conn.execute(
             "INSERT INTO web_user (username, password_hash, created_at) VALUES ('op', ?1, 1)",
@@ -1284,5 +1310,107 @@ mod tests {
         conn.execute("DELETE FROM web_user WHERE username = 'op'", []).expect("4.2's delete-user");
         let tokens: i64 = conn.query_row("SELECT count(*) FROM web_login_token", [], |r| r.get(0)).unwrap();
         assert_eq!(tokens, 0, "the cascade takes the token with its user");
+    }
+
+    // ------------------------------------------------------------------------------- 5.0
+
+    /// Every sign-in a 4.3 database holds — users, passkeys, sessions, a sign-in token — with a legacy
+    /// password hash on one user and the empty "no password" on the other.
+    fn database_at_4_3_with_sign_ins() -> Connection {
+        let conn = database_at(Version::new(4, 3));
+        conn.execute_batch(
+            "INSERT INTO web_user (username, password_hash, created_at) VALUES
+               ('sashee', x'', 10),
+               ('reverted', x'0707070707070707070707070707070707070707070707070707070707070707', 20);
+             INSERT INTO web_passkey
+               (credential_id, username, rp_id, static_state, dynamic_state, label, created_at, last_used_at)
+               VALUES (x'01', 'sashee', 'localhost', x'02', x'03', 'phone', 30, 40);
+             INSERT INTO web_session (id, secret_hash, username, created_at, expires_at)
+               VALUES ('0000000000000001', x'04', 'sashee', 50, 60);
+             INSERT INTO web_login_token (id, secret_hash, username, created_at, expires_at)
+               VALUES ('0000000000000002', x'05', 'reverted', 70, 80);",
+        )
+        .unwrap();
+        conn
+    }
+
+    /// Every row of every sign-in table, so a migration can be shown to have kept them all.
+    fn sign_ins(conn: &Connection) -> Vec<String> {
+        [
+            "SELECT username || ' ' || created_at FROM web_user",
+            "SELECT hex(credential_id) || ' ' || username || ' ' || rp_id || ' ' || label FROM web_passkey",
+            "SELECT id || ' ' || username || ' ' || expires_at FROM web_session",
+            "SELECT id || ' ' || username || ' ' || expires_at FROM web_login_token",
+        ]
+        .iter()
+        .flat_map(|query| {
+            conn.prepare(&format!("{query} ORDER BY 1"))
+                .unwrap()
+                .query_map([], |r| r.get::<_, String>(0))
+                .unwrap()
+                .map(Result::unwrap)
+                .collect::<Vec<_>>()
+        })
+        .collect()
+    }
+
+    /// **The column goes and every sign-in stays.** The second half is the one that matters: `web_user` is
+    /// referenced with `ON DELETE CASCADE` from three tables, so the drop-and-recreate rebuild 4.0 used would
+    /// have deleted every passkey, session and token with it. `DROP COLUMN` deletes no row.
+    #[test]
+    fn migrating_to_5_0_drops_the_password_and_keeps_every_sign_in() {
+        let conn = database_at_4_3_with_sign_ins();
+        let before = sign_ins(&conn);
+        assert_eq!(before.len(), 5, "precondition: two users, a passkey, a session and a token");
+
+        migrate(&conn).unwrap();
+
+        assert_eq!(stored_version(&conn), Version::new(5, 0).encode());
+        let columns: Vec<String> = conn
+            .prepare("SELECT name FROM pragma_table_info('web_user') ORDER BY cid")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        assert_eq!(columns, ["username", "created_at"]);
+        assert_eq!(sign_ins(&conn), before);
+
+        let fk_violations: i64 =
+            conn.query_row("SELECT count(*) FROM pragma_foreign_key_check", [], |r| r.get(0)).unwrap();
+        assert_eq!(fk_violations, 0);
+        let fresh = Connection::open_in_memory().unwrap();
+        migrate(&fresh).unwrap();
+        assert_eq!(schema_of(&conn, "web_user"), schema_of(&fresh, "web_user"));
+    }
+
+    /// The table's `CREATE` statement as SQLite now holds it.
+    fn schema_of(conn: &Connection, table: &str) -> String {
+        conn.query_row("SELECT sql FROM sqlite_master WHERE name = ?1", [table], |r| r.get(0)).unwrap()
+    }
+
+    /// **5.0 is where a 4.x binary's user writes stop working**, which is what makes it a major: its
+    /// `create-user` names the dropped column. The cascade from `web_user` still holds after the drop.
+    #[test]
+    fn a_4_x_binarys_user_insert_is_refused_by_5_0() {
+        let conn = Connection::open_in_memory().unwrap();
+        migrate(&conn).unwrap();
+
+        let err = conn
+            .execute("INSERT INTO web_user (username, password_hash, created_at) VALUES ('op', x'', 1)", [])
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("has no column named password_hash"), "{err}");
+
+        conn.execute("INSERT INTO web_user (username, created_at) VALUES ('op', 1)", []).expect("5.0's insert");
+        conn.execute(
+            "INSERT INTO web_login_token (id, secret_hash, username, created_at, expires_at) \
+             VALUES ('0000000000000002', x'00', 'op', 1, 2)",
+            [],
+        )
+        .unwrap();
+        conn.execute("DELETE FROM web_user WHERE username = 'op'", []).unwrap();
+        let tokens: i64 = conn.query_row("SELECT count(*) FROM web_login_token", [], |r| r.get(0)).unwrap();
+        assert_eq!(tokens, 0, "the cascade still takes a user's token");
     }
 }

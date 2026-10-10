@@ -568,7 +568,8 @@ The versions that exist:
 | 4.0 | `measurement` rebuilt without `type`/`attributes`, `series_id NOT NULL` + foreign key, `web_session.username` foreign key, foreign keys enabled (§6.7) | **major**, and the second in this project's life |
 | 4.1 | `web_passkey` (§14.10) | **minor** — a 4.0 binary ignores it, and its users' passwords still work |
 | 4.2 | `measurement` rebuilt: unique on `(event_time, id)` instead of `id`, both indexes ascending (§6.8) | **minor** — the first rebuild that is one: a 4.1 binary's insert is deduplicated the same way and its queries plan the same |
-| 4.3 | `web_login_token` (§14.7), replacing passwords | **minor** — a 4.2 binary ignores it; `web_user.password_hash` stays, unread, until a later major drops it |
+| 4.3 | `web_login_token` (§14.7), replacing passwords | **minor** — a 4.2 binary ignores it; `web_user.password_hash` stays, unread, until 5.0 drops it |
+| 5.0 | `web_user.password_hash` dropped (§14.7) | **major**, the third — a 4.x binary's `create-user` names the column; shipped only after 4.3 was delivered |
 
 ### 6.3 Write path
 
@@ -2519,12 +2520,18 @@ Tokens are issued in three places, and each shows the token exactly once:
 monitoring-platform create-login-token --db <path> --username sashee
 ```
 
-**`web_user.password_hash` stays.** Nothing reads it since 4.3. Every new user stores an empty blob there,
-because the column is `NOT NULL` with no default, and dropping it or giving it one is a rebuild and so a major
-(§6.2). An empty blob is also what every binary since 3.1 reads as "no password", so one the nightly upgrade
-reverts to refuses password logins for a user created after 4.3 rather than failing on them. A later major
-drops the column. That major ships only after 4.3 has been delivered through the pipeline, the order 3.3 → 4.0
-took.
+**`web_user.password_hash` is gone since 5.0, in two steps.** 4.3 stopped reading it. It kept writing an empty
+blob, because the column was `NOT NULL` with no default and changing that is a major (§6.2). An empty blob is
+what every binary since 3.1 reads as "no password", so a revert to 4.2 stayed survivable. 5.0 then drops the
+column, and ships only after 4.3 has been delivered through the pipeline, the order 3.3 → 4.0 took. 4.3 carries
+everything that changed how anyone signs in, revertibly. 5.0 carries nothing but the drop, which no 4.x binary
+survives: one the nightly upgrade puts back refuses to start against a 5.0 database. So 5.0 reaches the host
+only through the pipeline, never as a hand-switched generation.
+
+It is `ALTER TABLE … DROP COLUMN`, not the rebuild 4.0 and 4.2 used. Three tables reference `web_user` with
+`ON DELETE CASCADE`, and migrations run with foreign keys on (§6.7.1). With them on, dropping `web_user` to
+rebuild it deletes every row first, and every passkey, session and sign-in token with it. `DROP COLUMN`
+rewrites the rows in place and deletes none.
 
 ### 14.8 Schema
 
@@ -2558,6 +2565,9 @@ reserved there. No `revoked_at` on `web_session`: logging out deletes the row, e
 does (§13). No foreign key from `web_session.username`, because §6.1 sets no `foreign_keys` pragma — the
 constraint would be parsed and never enforced, which is worse than not declaring it, so `delete-user`
 does the cascade by hand and says so.
+
+Since **5.0**, `web_user` is `(username TEXT PRIMARY KEY, created_at INTEGER NOT NULL)`: `password_hash` is
+dropped (§14.7).
 
 **Version 4.3** adds the sign-in tokens (§14.7), a minor bump: one table, which a 4.2 binary neither reads
 nor writes. `web_session`'s shape, for `web_session`'s reasons; the key to `web_user` cascades, as every

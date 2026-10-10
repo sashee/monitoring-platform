@@ -5,8 +5,7 @@
 //!
 //! - **A page requires a session.** Not merely a redirect — the body must not contain the data the page
 //!   would have shown.
-//! - **A session is established only by a correct password**, and a wrong one is indistinguishable from an
-//!   unknown user.
+//! - **A session is established only by a sign-in token that is still good**, once, or by a passkey.
 //! - **The two credentials do not cross.** A session cookie must not authenticate `/v1/*`, and an API key
 //!   must not open a page. Both directions, because each is a separate mistake.
 //! - **Device-supplied text cannot become markup.** A measurement whose `type` is `<script>` is stored
@@ -22,7 +21,7 @@ use axum::body::Body;
 use axum::http::{Request, StatusCode, header};
 use http_body_util::BodyExt as _;
 use monitoring_platform::api::status::PROTOBUF;
-use monitoring_platform::auth::{SessionToken, TOKEN_BYTES, hash_password};
+use monitoring_platform::auth::{LoginToken, SessionToken, TOKEN_BYTES};
 use monitoring_platform::config::ServeArgs;
 use monitoring_platform::otlp::test_support::sample_request;
 use monitoring_platform::web::session::{COOKIE, TTL_NANOS};
@@ -32,7 +31,6 @@ use std::collections::HashMap;
 use tower::ServiceExt as _;
 
 const T: i64 = 1_785_489_242_123_456_789;
-const PASSWORD: &str = "a-high-entropy-password";
 const USER: &str = "sashee";
 
 struct Harness {
@@ -57,7 +55,7 @@ fn harness() -> Harness {
     // `issue_key` migrates the file, so this runs first and everything below sees the 3.1 tables.
     let authorization = common::issue_key(&db);
     let conn = store::open_write(&db).unwrap();
-    store::users::insert(&conn, USER, &hash_password(PASSWORD), T).unwrap();
+    store::users::insert(&conn, USER, T).unwrap();
 
     let (writer, done) = store::write::spawn(conn);
     std::mem::forget(done);
@@ -160,13 +158,29 @@ impl Harness {
         store::users::list(&self.read()).unwrap().into_iter().map(|u| u.username).collect()
     }
 
-    /// Logs in and returns the cookie value.
+    /// Logs in with a fresh sign-in token and returns the cookie value.
     async fn login(&self) -> String {
-        let reply = self
-            .post_form("/login", &format!("username={USER}&password={PASSWORD}"), None)
-            .await;
-        assert_eq!(reply.status, StatusCode::SEE_OTHER, "precondition: login must succeed");
+        self.login_as(USER).await
+    }
+
+    async fn login_as(&self, username: &str) -> String {
+        let token = self.issue_token(username);
+        let reply = self.post_form("/login", &token_field(&token), None).await;
+        assert_eq!(reply.status, StatusCode::SEE_OTHER, "precondition: login must succeed: {}", reply.body);
         reply.session().expect("login must set a session cookie")
+    }
+
+    /// A sign-in token for `username`, issued as `create-login-token` issues one.
+    fn issue_token(&self, username: &str) -> String {
+        let conn = store::open_write_existing(&self.db).unwrap();
+        let issued = monitoring_platform::web::login_token::issue(&conn, username, monitoring_platform::now_unix_nanos())
+            .unwrap()
+            .expect("the user exists");
+        issued.token.to_secret_string()
+    }
+
+    fn token_count(&self) -> usize {
+        store::login_tokens::list(&self.read()).unwrap().len()
     }
 
     fn read(&self) -> rusqlite::Connection {
@@ -176,6 +190,11 @@ impl Harness {
     fn session_count(&self) -> usize {
         store::sessions::list(&self.read()).unwrap().len()
     }
+}
+
+/// The login form's body for `token`, percent-encoded as a browser sends it.
+fn token_field(token: &str) -> String {
+    format!("token={}", monitoring_platform::web::html::percent_encode(token))
 }
 
 fn session_token(seed: u8) -> SessionToken {
@@ -193,7 +212,8 @@ async fn the_login_form_is_reachable_without_a_session() {
     let reply = harness.get("/login", None).await;
 
     assert_eq!(reply.status, StatusCode::OK);
-    assert!(reply.body.contains(r#"name="password""#), "{}", reply.body);
+    assert!(reply.body.contains(r#"name="token""#), "{}", reply.body);
+    assert!(!reply.body.contains("password"), "no password form any more: {}", reply.body);
 }
 
 /// `/healthz` is outside every layer, and must stay that way now that a second one exists.
@@ -206,17 +226,19 @@ async fn healthz_needs_neither_a_key_nor_a_session() {
 
 // ------------------------------------------------------------------------------------- logging in
 
+/// A sign-in token starts a session and sends the browser to the account page, where a passkey is added.
 #[tokio::test]
-async fn a_correct_password_establishes_a_session() {
+async fn a_sign_in_token_establishes_a_session() {
     let harness = harness();
-    let reply =
-        harness.post_form("/login", &format!("username={USER}&password={PASSWORD}"), None).await;
+    let token = harness.issue_token(USER);
+    let reply = harness.post_form("/login", &token_field(&token), None).await;
 
-    // 303, so a reload of the resulting page does not re-submit the password.
-    assert_eq!(reply.status, StatusCode::SEE_OTHER);
-    assert_eq!(reply.location.as_deref(), Some("/"));
+    // 303, so a reload of the resulting page does not re-submit the token.
+    assert_eq!(reply.status, StatusCode::SEE_OTHER, "{}", reply.body);
+    assert_eq!(reply.location.as_deref(), Some("/account"));
     assert!(reply.session().is_some(), "no session cookie in {:?}", reply.set_cookie);
     assert_eq!(harness.session_count(), 1, "and a row to go with it");
+    assert_eq!(harness.token_count(), 0, "the token is used up");
 }
 
 /// The attributes the browser actually depends on, asserted on the wire rather than on the builder that
@@ -224,8 +246,8 @@ async fn a_correct_password_establishes_a_session() {
 #[tokio::test]
 async fn the_session_cookie_is_httponly_samesite_and_not_secure() {
     let harness = harness();
-    let reply =
-        harness.post_form("/login", &format!("username={USER}&password={PASSWORD}"), None).await;
+    let token = harness.issue_token(USER);
+    let reply = harness.post_form("/login", &token_field(&token), None).await;
     let cookie = reply.set_cookie.first().expect("a Set-Cookie header");
 
     assert!(cookie.contains("HttpOnly"), "{cookie}");
@@ -247,71 +269,82 @@ async fn the_cookie_carries_a_session_token_not_an_api_key() {
     assert!(!cookie.starts_with("mpk_"), "{cookie}");
 }
 
+/// **Single use**, through the form: the second attempt establishes nothing and says why.
 #[tokio::test]
-async fn a_wrong_password_establishes_nothing() {
+async fn a_sign_in_token_works_once() {
     let harness = harness();
-    let reply = harness.post_form("/login", &format!("username={USER}&password=wrong"), None).await;
+    let token = harness.issue_token(USER);
+    harness.post_form("/login", &token_field(&token), None).await;
+
+    let again = harness.post_form("/login", &token_field(&token), None).await;
+    assert_eq!(again.status, StatusCode::UNAUTHORIZED);
+    assert!(again.session().is_none(), "no cookie: {:?}", again.set_cookie);
+    assert_eq!(harness.session_count(), 1, "only the first sign-in's");
+    assert!(again.body.contains("used already"), "{}", again.body);
+    assert!(again.body.contains(r#"name="token""#), "the form comes back: {}", again.body);
+}
+
+/// A token nobody issued, of the right shape: nothing, and the user is not told whose it might have been.
+#[tokio::test]
+async fn an_unissued_token_establishes_nothing() {
+    let harness = harness();
+    let forged = LoginToken::from_random(&[9; TOKEN_BYTES]).to_secret_string();
+    let reply = harness.post_form("/login", &token_field(&forged), None).await;
 
     assert_eq!(reply.status, StatusCode::UNAUTHORIZED);
-    assert!(reply.session().is_none(), "no cookie: {:?}", reply.set_cookie);
-    assert_eq!(harness.session_count(), 0, "and no row either");
-    assert!(reply.body.contains(r#"name="password""#), "the form comes back: {}", reply.body);
+    assert!(reply.session().is_none());
+    assert_eq!(harness.session_count(), 0);
 }
 
-/// One message for both, or the form becomes an oracle for which usernames exist.
+/// The right id with the wrong secret neither signs in nor voids the real token.
 #[tokio::test]
-async fn an_unknown_user_is_indistinguishable_from_a_wrong_password() {
+async fn the_wrong_secret_does_not_spend_the_token() {
     let harness = harness();
+    let token = harness.issue_token(USER);
+    let (id, _) = token.split_once('.').unwrap();
+    let wrong = format!("{id}.{}", "0".repeat(64));
 
-    let wrong_password =
-        harness.post_form("/login", &format!("username={USER}&password=wrong"), None).await;
-    let unknown_user =
-        harness.post_form("/login", "username=nobody&password=wrong", None).await;
-
-    assert_eq!(wrong_password.status, unknown_user.status);
-    // Identical but for the passkey challenge, which is fresh random bytes on every render of the page and
-    // so says nothing about which username was tried.
-    assert_eq!(without_challenge(&wrong_password.body), without_challenge(&unknown_user.body));
+    let reply = harness.post_form("/login", &token_field(&wrong), None).await;
+    assert_eq!(reply.status, StatusCode::UNAUTHORIZED);
+    assert_eq!(harness.token_count(), 1, "still usable");
+    assert_eq!(harness.post_form("/login", &token_field(&token), None).await.status, StatusCode::SEE_OTHER);
 }
 
-/// A page with the passkey challenge in its embedded options replaced, so two renders compare equal.
-fn without_challenge(body: &str) -> String {
-    match body.split_once("\"challenge\":\"") {
-        Some((before, after)) => {
-            let rest = after.split_once('"').map_or("", |(_, rest)| rest);
-            format!("{before}\"challenge\":\"…\"{rest}")
-        }
-        None => body.to_owned(),
-    }
-}
-
-/// The password arrives percent-encoded, and `Form` is what decodes it. A password containing `&`, `+` or
-/// `%` must survive the round trip — otherwise a login that works from `curl` fails from a browser.
+/// An expired token says so, which tells its owner to issue another rather than retype this one.
 #[tokio::test]
-async fn a_password_with_form_metacharacters_still_matches() {
-    let dir = tempfile::tempdir().unwrap();
-    let db = dir.path().join("measurements.db");
-    let args = ServeArgs {
-        database: Some(db.clone()),
-        socket: Some(dir.path().join("unused.sock")),
-        ..Default::default()
-    };
-    let config = Config::resolve(&args, &HashMap::new());
+async fn an_expired_token_says_so() {
+    let harness = harness();
+    let token = LoginToken::from_random(&[3; TOKEN_BYTES]);
+    // Issued and expired long before the clock this runs against.
+    let conn = store::open_write_existing(&harness.db).unwrap();
+    store::login_tokens::issue(&conn, token.id(), &token.secret_hash(), USER, T, T + 1).unwrap();
 
-    let awkward = "a&b+c%20d=e";
-    let conn = store::open_write(&db).unwrap();
-    store::users::insert(&conn, USER, &hash_password(awkward), T).unwrap();
-    let (writer, done) = store::write::spawn(conn);
-    std::mem::forget(done);
-    let harness =
-        Harness { app: api::app(AppState::new(config, writer)), db, authorization: String::new(), _dir: dir };
+    let reply = harness.post_form("/login", &token_field(&token.to_secret_string()), None).await;
+    assert_eq!(reply.status, StatusCode::UNAUTHORIZED);
+    assert!(reply.body.contains("expired"), "{}", reply.body);
+    assert_eq!(harness.session_count(), 0);
+}
 
-    // Percent-encoded exactly as a browser would send it.
-    let reply = harness
-        .post_form("/login", &format!("username={USER}&password=a%26b%2Bc%2520d%3De"), None)
-        .await;
+/// Something that is not a sign-in token at all — a session cookie pasted by mistake, say — is refused by its
+/// shape, before the database is asked.
+#[tokio::test]
+async fn something_other_than_a_token_is_refused_by_its_shape() {
+    let harness = harness();
+    for pasted in [session_token(1).to_secret_string(), "hunter2".to_owned(), String::new()] {
+        let reply = harness.post_form("/login", &token_field(&pasted), None).await;
+        assert_eq!(reply.status, StatusCode::UNAUTHORIZED, "on {pasted:?}");
+        assert!(reply.body.contains("not a sign-in token"), "on {pasted:?}: {}", reply.body);
+    }
+    assert_eq!(harness.session_count(), 0);
+}
 
-    assert_eq!(reply.status, StatusCode::SEE_OTHER, "body was {}", reply.body);
+/// A paste picks up whitespace — a trailing newline from a terminal, most often. It still signs in.
+#[tokio::test]
+async fn a_pasted_token_with_surrounding_whitespace_still_signs_in() {
+    let harness = harness();
+    let token = harness.issue_token(USER);
+    let reply = harness.post_form("/login", &token_field(&format!(" {token}\n")), None).await;
+    assert_eq!(reply.status, StatusCode::SEE_OTHER, "{}", reply.body);
 }
 
 // ------------------------------------------------------------------------------------- the guard
@@ -562,7 +595,7 @@ async fn a_post_from_another_port_on_the_same_host_is_refused() {
     let reply = harness
         .post_from(
             "/users/create",
-            "username=intruder&password=whatever",
+            "username=intruder",
             Some(&cookie),
             Some("http://localhost:3000"),
         )
@@ -578,7 +611,7 @@ async fn a_post_with_no_origin_is_refused() {
     let cookie = harness.login().await;
 
     let reply =
-        harness.post_from("/users/create", "username=x&password=y", Some(&cookie), None).await;
+        harness.post_from("/users/create", "username=x", Some(&cookie), None).await;
 
     assert_eq!(reply.status, StatusCode::FORBIDDEN);
     assert_eq!(harness.users(), vec![USER.to_owned()]);
@@ -590,18 +623,13 @@ async fn a_post_with_no_origin_is_refused() {
 async fn login_itself_is_origin_checked() {
     let harness = harness();
 
-    let reply = harness
-        .post_from(
-            "/login",
-            &format!("username={USER}&password={PASSWORD}"),
-            None,
-            Some("http://evil.example"),
-        )
-        .await;
+    let token = harness.issue_token(USER);
+    let reply = harness.post_from("/login", &token_field(&token), None, Some("http://evil.example")).await;
 
     assert_eq!(reply.status, StatusCode::FORBIDDEN, "not 303, and not 401");
     assert!(reply.session().is_none());
     assert_eq!(harness.session_count(), 0);
+    assert_eq!(harness.token_count(), 1, "and the token is not spent");
 }
 
 /// Logging out is state-changing too, so it is checked — otherwise any local page could log you out.
@@ -628,24 +656,36 @@ async fn reads_are_not_origin_checked() {
 
 // ------------------------------------------------------- managing users
 
+/// Creating a user shows their sign-in token once, and that token signs them in.
 #[tokio::test]
 async fn a_user_can_be_created_and_then_log_in() {
     let harness = harness();
     let cookie = harness.login().await;
 
-    let reply =
-        harness.post_form("/users/create", "username=second&password=another-long-one", Some(&cookie)).await;
+    let reply = harness.post_form("/users/create", "username=second", Some(&cookie)).await;
 
-    assert_eq!(reply.status, StatusCode::SEE_OTHER);
-    assert_eq!(reply.location.as_deref(), Some("/users"));
+    assert_eq!(reply.status, StatusCode::OK, "{}", reply.body);
     assert!(harness.users().contains(&"second".to_owned()));
+    let token = issued_secret(&reply.body).expect("the new user's token, shown once");
+    assert!(token.starts_with("mpl_"), "{token}");
+    assert!(reply.body.contains("a sign-in token until"), "the table says so: {}", reply.body);
 
-    // The real check: the stored hash is one the login path accepts.
-    let logged_in = harness
-        .post_form("/login", "username=second&password=another-long-one", None)
-        .await;
+    let logged_in = harness.post_form("/login", &token_field(&token), None).await;
     assert_eq!(logged_in.status, StatusCode::SEE_OTHER);
     assert!(logged_in.session().is_some());
+    let sessions = store::sessions::list(&harness.read()).unwrap();
+    assert!(sessions.iter().any(|s| s.username == "second"), "signed in as the new user");
+
+    // Not repeated on the next load: only its hash was stored.
+    let users = harness.get("/users", Some(&cookie)).await;
+    assert!(!users.body.contains(&token), "{}", users.body);
+}
+
+/// The secret in a page's shown-once block, if it has one.
+fn issued_secret(body: &str) -> Option<String> {
+    let (_, after) = body.split_once("class=\"issued\"")?;
+    let (_, code) = after.split_once("<code>")?;
+    Some(code.split_once("</code>")?.0.to_owned())
 }
 
 /// A duplicate is the operator's typo, so it is a message on the page rather than a 500.
@@ -654,21 +694,20 @@ async fn a_duplicate_username_is_reported_not_crashed() {
     let harness = harness();
     let cookie = harness.login().await;
 
-    let reply = harness
-        .post_form("/users/create", &format!("username={USER}&password=x"), Some(&cookie))
-        .await;
+    let reply = harness.post_form("/users/create", &format!("username={USER}"), Some(&cookie)).await;
 
     assert_eq!(reply.status, StatusCode::BAD_REQUEST);
     assert!(reply.body.contains("already exists"), "{}", reply.body);
+    assert!(issued_secret(&reply.body).is_none(), "no token for a user not created");
     assert_eq!(harness.users().len(), 1);
 }
 
 #[tokio::test]
-async fn a_user_needs_both_a_name_and_a_password() {
+async fn a_user_needs_a_name() {
     let harness = harness();
     let cookie = harness.login().await;
 
-    for body in ["username=&password=x", "username=x&password=", "username=%20%20&password=x"] {
+    for body in ["username=", "username=%20%20"] {
         let reply = harness.post_form("/users/create", body, Some(&cookie)).await;
         assert_eq!(reply.status, StatusCode::BAD_REQUEST, "on {body:?}");
         assert_eq!(harness.users().len(), 1, "on {body:?}");
@@ -679,7 +718,7 @@ async fn a_user_needs_both_a_name_and_a_password() {
 async fn a_user_can_be_deleted_once_another_exists() {
     let harness = harness();
     let cookie = harness.login().await;
-    harness.post_form("/users/create", "username=second&password=xxxxxxxxxxxx", Some(&cookie)).await;
+    harness.post_form("/users/create", "username=second", Some(&cookie)).await;
 
     let reply = harness.post_form("/users/delete", "username=second", Some(&cookie)).await;
 
@@ -707,7 +746,7 @@ async fn the_last_user_cannot_be_deleted() {
 async fn deleting_your_own_user_logs_you_out() {
     let harness = harness();
     let cookie = harness.login().await;
-    harness.post_form("/users/create", "username=second&password=xxxxxxxxxxxx", Some(&cookie)).await;
+    harness.post_form("/users/create", "username=second", Some(&cookie)).await;
 
     let reply = harness.post_form("/users/delete", &format!("username={USER}"), Some(&cookie)).await;
 
@@ -722,7 +761,7 @@ async fn deleting_your_own_user_logs_you_out() {
 async fn deleting_a_user_who_does_not_exist_is_reported() {
     let harness = harness();
     let cookie = harness.login().await;
-    harness.post_form("/users/create", "username=second&password=xxxxxxxxxxxx", Some(&cookie)).await;
+    harness.post_form("/users/create", "username=second", Some(&cookie)).await;
 
     let reply = harness.post_form("/users/delete", "username=ghost", Some(&cookie)).await;
     assert_eq!(reply.status, StatusCode::BAD_REQUEST);
@@ -1989,7 +2028,7 @@ async fn a_passkey_is_registered_from_the_account_page() {
     assert!(page.body.contains("data-label=\"name\">phone</td>"), "{}", page.body);
     assert!(page.body.contains("6c4b9e.localhost"), "{}", page.body);
     let users = harness.get_at(PHONE_HOST, "/users", &cookie).await;
-    assert!(users.body.contains("password, 1 passkey"), "{}", users.body);
+    assert!(users.body.contains("data-label=\"signs in with\">1 passkey</td>"), "{}", users.body);
 }
 
 /// A second registration from the same site sends the first passkey as `excludeCredentials`, so the
@@ -2058,10 +2097,9 @@ async fn a_ceremony_cannot_be_finished_by_another_user() {
     let mine = harness.login().await;
     {
         let conn = store::open_write_existing(&harness.db).unwrap();
-        store::users::insert(&conn, "other", &hash_password("another-password"), T).unwrap();
+        store::users::insert(&conn, "other", T).unwrap();
     }
-    let theirs = harness.post_form("/login", "username=other&password=another-password", None).await;
-    let theirs = theirs.session().expect("the second user can log in");
+    let theirs = harness.login_as("other").await;
 
     let options = harness.passkey_options(PHONE_HOST, &mine).await;
     let response = Authenticator::new(1).register(&options, PHONE_ORIGIN, "6c4b9e.localhost");
@@ -2084,24 +2122,22 @@ async fn on_an_ip_address_the_page_points_to_localhost() {
     assert!(page.body.contains("href=\"http://localhost:8080/account\""), "{}", page.body);
 }
 
+/// One of two passkeys can be removed. (The last one cannot: see `the_last_passkey_is_kept`.)
 #[tokio::test]
 async fn a_passkey_can_be_removed() {
     let harness = harness();
     let cookie = harness.login().await;
-    let options = harness.passkey_options(PHONE_HOST, &cookie).await;
     let authenticator = Authenticator::new(1);
-    let response = authenticator.register(&options, PHONE_ORIGIN, "6c4b9e.localhost");
-    harness
-        .post_at(PHONE_HOST, "/account/passkeys/create", &[("label", "phone"), ("response", &response)], &cookie)
-        .await;
-    assert_eq!(harness.passkey_count(), 1);
+    harness.register_passkey(PHONE_HOST, &cookie, &authenticator).await;
+    harness.register_passkey(PHONE_HOST, &cookie, &Authenticator::new(2)).await;
+    assert_eq!(harness.passkey_count(), 2);
 
     use base64::Engine as _;
     let id = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(authenticator.credential_id);
     let reply =
         harness.post_at(PHONE_HOST, "/account/passkeys/delete", &[("credential", &id)], &cookie).await;
     assert_eq!(reply.status, StatusCode::SEE_OTHER);
-    assert_eq!(harness.passkey_count(), 0);
+    assert_eq!(harness.passkey_count(), 1);
 }
 
 /// The username lands in the page's embedded JSON. A `</script>` in it must not end the element early.
@@ -2110,12 +2146,9 @@ async fn the_embedded_options_cannot_close_their_script_element() {
     let harness = harness();
     {
         let conn = store::open_write_existing(&harness.db).unwrap();
-        store::users::insert(&conn, "a</script><b>", &hash_password("pw-for-the-odd-one"), T).unwrap();
+        store::users::insert(&conn, "a</script><b>", T).unwrap();
     }
-    let reply = harness
-        .post_form("/login", "username=a%3C%2Fscript%3E%3Cb%3E&password=pw-for-the-odd-one", None)
-        .await;
-    let cookie = reply.session().expect("the odd user can log in");
+    let cookie = harness.login_as("a</script><b>").await;
     // Still parses: nothing ended the JSON early.
     let options = harness.passkey_options(PHONE_HOST, &cookie).await;
     assert_eq!(options["user"]["name"], "a</script><b>");
@@ -2274,9 +2307,11 @@ async fn a_removed_passkey_no_longer_signs_in() {
     let cookie = harness.login().await;
     let authenticator = Authenticator::new(1);
     let handle = harness.register_passkey(PHONE_HOST, &cookie, &authenticator).await;
+    harness.register_passkey(PHONE_HOST, &cookie, &Authenticator::new(2)).await;
     use base64::Engine as _;
     let id = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(authenticator.credential_id);
-    harness.post_at(PHONE_HOST, "/account/passkeys/delete", &[("credential", &id)], &cookie).await;
+    let removed = harness.post_at(PHONE_HOST, "/account/passkeys/delete", &[("credential", &id)], &cookie).await;
+    assert_eq!(removed.status, StatusCode::SEE_OTHER, "precondition: removed");
 
     let options = harness.sign_in_options(PHONE_HOST).await;
     let reply = harness
@@ -2287,18 +2322,18 @@ async fn a_removed_passkey_no_longer_signs_in() {
 }
 
 /// The login page offers the passkey button at a loopback name and, at `127.0.0.1`, a link to one instead —
-/// the password form being there either way.
+/// the sign-in token form being there either way.
 #[tokio::test]
 async fn the_login_page_offers_a_passkey_where_one_can_be_used() {
     let harness = harness();
     let here = harness.login_page_at(PHONE_HOST).await;
     assert!(here.body.contains("sign in with a passkey"), "{}", here.body);
-    assert!(here.body.contains("name=\"password\""));
+    assert!(here.body.contains("name=\"token\""));
 
     let ip = harness.login_page_at("127.0.0.1:8080").await;
     assert!(!ip.body.contains("passkey-options"), "{}", ip.body);
     assert!(ip.body.contains("href=\"http://localhost:8080/login\""), "{}", ip.body);
-    assert!(ip.body.contains("name=\"password\""));
+    assert!(ip.body.contains("name=\"token\""));
 }
 
 /// The sign-in route is behind the origin check like `/login` itself: a page on another port cannot sign
@@ -2310,66 +2345,97 @@ async fn the_passkey_sign_in_route_is_origin_checked() {
     assert_eq!(forged.status, StatusCode::FORBIDDEN);
 }
 
-// ------------------------------------------------------- removing the password (SPEC §14.10)
+// ------------------------------------------------------- the account's sign-in token (SPEC §14.7)
 
-/// **Passkeys only, end to end.** With a passkey registered, the password goes: the password form stops
-/// working, the passkey still signs in, and both pages say how this user signs in now.
+/// **A second device, end to end.** Signed in on one, the user issues a token, pastes it into the other, and
+/// adds a passkey there.
 #[tokio::test]
-async fn a_password_can_be_removed_once_a_passkey_exists() {
+async fn a_token_issued_on_the_account_page_signs_in_another_device() {
     let harness = harness();
     let cookie = harness.login().await;
-    let authenticator = Authenticator::new(1);
-    let handle = harness.register_passkey(PHONE_HOST, &cookie, &authenticator).await;
 
-    let reply = harness.post_at(PHONE_HOST, "/account/password/remove", &[], &cookie).await;
-    assert_eq!(reply.status, StatusCode::SEE_OTHER, "{}", reply.body);
+    let account = harness.post_at(PHONE_HOST, "/account/tokens/create", &[], &cookie).await;
+    assert_eq!(account.status, StatusCode::OK, "{}", account.body);
+    let token = issued_secret(&account.body).expect("the token, shown once");
 
-    let password = harness.post_form("/login", &format!("username={USER}&password={PASSWORD}"), None).await;
-    assert_eq!(password.status, StatusCode::UNAUTHORIZED, "the password no longer signs in");
-
-    let options = harness.sign_in_options(PHONE_HOST).await;
-    let signed_in = harness
-        .passkey_sign_in(PHONE_HOST, &authenticator.sign(&options, PHONE_ORIGIN, "6c4b9e.localhost", &handle))
-        .await;
-    assert_eq!(signed_in.status, StatusCode::SEE_OTHER, "the passkey still does");
-
-    let users = harness.get_at(PHONE_HOST, "/users", &cookie).await;
-    assert!(users.body.contains("data-label=\"signs in with\">1 passkey</td>"), "{}", users.body);
-    let account = harness.get_at(PHONE_HOST, "/account", &cookie).await;
-    assert!(account.body.contains("You have no password"), "{}", account.body);
-    assert!(!account.body.contains("/account/passkeys/delete"), "the only way in has no remove button");
+    let other_device = harness.post_form("/login", &token_field(&token), None).await;
+    assert_eq!(other_device.status, StatusCode::SEE_OTHER, "{}", other_device.body);
+    assert_eq!(other_device.location.as_deref(), Some("/account"));
+    let theirs = other_device.session().expect("a session for the new device");
+    harness.register_passkey(PHONE_HOST, &theirs, &Authenticator::new(1)).await;
+    assert_eq!(harness.passkey_count(), 1);
 }
 
-/// **The lockout guard, through the page.** Without a passkey, removing the password would leave nothing
-/// that signs in: refused, and the password still works.
+/// The page says a token is waiting, and until when, and offers to delete it; deleted, it signs nobody in.
 #[tokio::test]
-async fn a_password_cannot_be_removed_without_a_passkey() {
+async fn a_waiting_token_is_shown_and_can_be_deleted() {
     let harness = harness();
     let cookie = harness.login().await;
-    let account = harness.get_at(PHONE_HOST, "/account", &cookie).await;
-    assert!(!account.body.contains("/account/password/remove"), "no button to press: {}", account.body);
+    let none = harness.get_at(PHONE_HOST, "/account", &cookie).await;
+    assert!(!none.body.contains("/account/tokens/delete"), "nothing to delete yet: {}", none.body);
+    assert!(none.body.contains("issue a sign-in token"), "{}", none.body);
 
-    let reply = harness.post_at(PHONE_HOST, "/account/password/remove", &[], &cookie).await;
-    assert_eq!(reply.status, StatusCode::BAD_REQUEST, "{}", reply.body);
-    assert!(reply.body.contains("Add a passkey first"), "{}", reply.body);
-    harness.login().await;
+    let token = harness.issue_token(USER);
+    let waiting = harness.get_at(PHONE_HOST, "/account", &cookie).await;
+    assert!(waiting.body.contains("A sign-in token you issued works until"), "{}", waiting.body);
+    assert!(!waiting.body.contains(&token), "only shown when issued: {}", waiting.body);
+
+    let deleted = harness.post_at(PHONE_HOST, "/account/tokens/delete", &[], &cookie).await;
+    assert_eq!(deleted.status, StatusCode::SEE_OTHER);
+    assert_eq!(harness.token_count(), 0);
+    assert_eq!(harness.post_form("/login", &token_field(&token), None).await.status, StatusCode::UNAUTHORIZED);
 }
 
-/// The other guard: with no password, the last passkey is the only way in and stays — though one of two
-/// can go.
+/// Issuing again replaces the waiting token, so one that went astray is voided by issuing another.
 #[tokio::test]
-async fn the_last_passkey_of_a_user_without_a_password_is_kept() {
+async fn issuing_again_voids_the_earlier_token() {
+    let harness = harness();
+    let cookie = harness.login().await;
+    let first = issued_secret(&harness.post_at(PHONE_HOST, "/account/tokens/create", &[], &cookie).await.body).unwrap();
+    let second = issued_secret(&harness.post_at(PHONE_HOST, "/account/tokens/create", &[], &cookie).await.body).unwrap();
+
+    assert_eq!(harness.token_count(), 1);
+    assert_eq!(harness.post_form("/login", &token_field(&first), None).await.status, StatusCode::UNAUTHORIZED);
+    assert_eq!(harness.post_form("/login", &token_field(&second), None).await.status, StatusCode::SEE_OTHER);
+}
+
+/// The account page issues and deletes only its own user's token.
+#[tokio::test]
+async fn the_account_page_touches_only_your_own_token() {
+    let harness = harness();
+    {
+        let conn = store::open_write_existing(&harness.db).unwrap();
+        store::users::insert(&conn, "other", T).unwrap();
+    }
+    let theirs = harness.issue_token("other");
+    let cookie = harness.login().await;
+
+    harness.post_at(PHONE_HOST, "/account/tokens/create", &[], &cookie).await;
+    harness.post_at(PHONE_HOST, "/account/tokens/delete", &[], &cookie).await;
+
+    let left: Vec<String> =
+        store::login_tokens::list(&harness.read()).unwrap().into_iter().map(|t| t.username).collect();
+    assert_eq!(left, vec!["other".to_owned()]);
+    assert_eq!(harness.post_form("/login", &token_field(&theirs), None).await.status, StatusCode::SEE_OTHER);
+}
+
+/// **The lockout guard, through the page.** The last passkey is the only way in from the page, and stays —
+/// though one of two can go.
+#[tokio::test]
+async fn the_last_passkey_is_kept() {
     let harness = harness();
     let cookie = harness.login().await;
     let (first, second) = (Authenticator::new(1), Authenticator::new(2));
     harness.register_passkey(PHONE_HOST, &cookie, &first).await;
     harness.register_passkey(PHONE_HOST, &cookie, &second).await;
-    harness.post_at(PHONE_HOST, "/account/password/remove", &[], &cookie).await;
 
     use base64::Engine as _;
     let id = |a: &Authenticator| base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(a.credential_id);
     let one = harness.post_at(PHONE_HOST, "/account/passkeys/delete", &[("credential", &id(&first))], &cookie).await;
     assert_eq!(one.status, StatusCode::SEE_OTHER);
+    let account = harness.get_at(PHONE_HOST, "/account", &cookie).await;
+    assert!(!account.body.contains("/account/passkeys/delete"), "the only way in has no remove button");
+
     let last =
         harness.post_at(PHONE_HOST, "/account/passkeys/delete", &[("credential", &id(&second))], &cookie).await;
     assert_eq!(last.status, StatusCode::BAD_REQUEST, "{}", last.body);
@@ -2378,9 +2444,12 @@ async fn the_last_passkey_of_a_user_without_a_password_is_kept() {
 }
 
 #[tokio::test]
-async fn the_password_removal_route_is_origin_checked() {
+async fn the_token_routes_are_origin_checked() {
     let harness = harness();
     let cookie = harness.login().await;
-    let forged = harness.post_from("/account/password/remove", "", Some(&cookie), Some("http://localhost:3000")).await;
-    assert_eq!(forged.status, StatusCode::FORBIDDEN);
+    for path in ["/account/tokens/create", "/account/tokens/delete"] {
+        let forged = harness.post_from(path, "", Some(&cookie), Some("http://localhost:3000")).await;
+        assert_eq!(forged.status, StatusCode::FORBIDDEN, "{path}");
+    }
+    assert_eq!(harness.token_count(), 0, "nothing issued");
 }

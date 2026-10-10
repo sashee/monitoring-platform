@@ -18,6 +18,7 @@
 
 pub mod account;
 pub mod html;
+pub mod login_token;
 pub mod origin;
 pub mod passkey;
 pub mod passkey_page;
@@ -34,6 +35,7 @@ use serde::Deserialize;
 use crate::AppState;
 use crate::api::query::format_nanos;
 use crate::model::StoredMeasurement;
+use crate::store::login_tokens::{NewSession, Redemption};
 use crate::store::read::{
     Facets, FieldRef, MAX_SERIES, Point, QuerySpec, Series, SeriesSpec, bucket_nanos,
 };
@@ -91,7 +93,8 @@ pub fn routers(state: AppState) -> (Router<AppState>, Router<AppState>) {
         .route("/account", get(account::account))
         .route("/account/passkeys/create", post(account::add_passkey))
         .route("/account/passkeys/delete", post(account::remove_passkey))
-        .route("/account/password/remove", post(account::remove_password))
+        .route("/account/tokens/create", post(account::issue_token))
+        .route("/account/tokens/delete", post(account::delete_token))
         .route("/logout", post(logout))
         .layer(axum::middleware::from_fn_with_state(state, session::guard))
         // Outside the session layer, so a forged POST is refused before its cookie is even looked up.
@@ -1170,42 +1173,58 @@ fn short_key(key: &str) -> String {
 
 // ------------------------------------------------------------------------------------ users
 
-/// How a user can sign in, for the users page: `password`, `password, 2 passkeys`, `1 passkey`.
-fn sign_in_methods(has_password: bool, passkeys: Option<i64>) -> String {
+/// How a user can sign in, for the users page: `2 passkeys`, `1 passkey, a sign-in token until …`, or — for a
+/// user with neither — what gives them one.
+fn sign_in_methods(passkeys: Option<i64>, token_expires_at: Option<i64>) -> String {
     let passkeys = match passkeys.unwrap_or(0) {
         0 => None,
         1 => Some("1 passkey".to_owned()),
         n => Some(format!("{n} passkeys")),
     };
-    [has_password.then(|| "password".to_owned()), passkeys]
-        .into_iter()
-        .flatten()
-        .collect::<Vec<_>>()
-        .join(", ")
+    let token = token_expires_at.map(|at| format!("a sign-in token until {}", format_nanos(at)));
+    let methods = [passkeys, token].into_iter().flatten().collect::<Vec<_>>();
+    if methods.is_empty() {
+        "nothing yet — create-login-token on the host".to_owned()
+    } else {
+        methods.join(", ")
+    }
 }
 
 async fn users(State(state): State<AppState>) -> Response {
-    render_users(&state, None).await
+    render_users(&state, None, None).await
 }
 
-/// The users page, optionally with an error from a failed mutation.
+/// The users page, optionally with an error from a failed mutation, or with the sign-in token of a user just
+/// created — the one time it is shown.
 ///
 /// A rendered error rather than a redirect: a `303` cannot carry a message without a query parameter or
 /// server-side flash state, and `?error=…` is a reflected string in a URL that gets pasted around.
-async fn render_users(state: &AppState, error: Option<&str>) -> Response {
+async fn render_users(
+    state: &AppState,
+    error: Option<&str>,
+    created: Option<(&str, &login_token::Issued)>,
+) -> Response {
     let db_path = state.config.database_path.clone();
     let listed = tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
         let conn = crate::store::open_read(&db_path)?;
-        Ok((crate::store::users::list(&conn)?, crate::store::passkeys::counts(&conn)?))
+        Ok((
+            crate::store::users::list(&conn)?,
+            crate::store::passkeys::counts(&conn)?,
+            crate::store::login_tokens::list(&conn)?,
+        ))
     })
     .await;
 
-    let (listed, passkeys) = match listed {
+    let (listed, passkeys, tokens) = match listed {
         Ok(Ok(listed)) => listed,
         Ok(Err(e)) => return failed("reading the users", &e),
         Err(e) => return failed("the user query task", &e),
     };
 
+    let now = crate::now_unix_nanos();
+    let live_token = |username: &str| {
+        tokens.iter().find(|t| t.username == username && t.is_live(now)).map(|t| t.expires_at)
+    };
     let last = listed.len() <= 1;
     let table = html::table(
         &["username", "signs in with", "created", ""],
@@ -1214,7 +1233,7 @@ async fn render_users(state: &AppState, error: Option<&str>) -> Response {
             .map(|u| {
                 vec![
                     html::escape(&u.username),
-                    html::escape(&sign_in_methods(u.has_password, passkeys.get(&u.username).copied())),
+                    html::escape(&sign_in_methods(passkeys.get(&u.username).copied(), live_token(&u.username))),
                     html::escape(&format_nanos(u.created_at)),
                     if last {
                         // Not rendered rather than rendered disabled: the handler refuses it anyway, and a
@@ -1233,6 +1252,16 @@ async fn render_users(state: &AppState, error: Option<&str>) -> Response {
     if let Some(message) = error {
         body.push_str(&format!("<p class=\"error\">{}</p>\n", html::escape(message)));
     }
+    if let Some((username, issued)) = created {
+        body.push_str(&html::issued(
+            &issued.token.to_secret_string(),
+            &format!(
+                "Created {username}. Give them this sign-in token — it is not stored and cannot be shown \
+                 again. It signs them in once, until {}, to add a passkey:",
+                format_nanos(issued.expires_at)
+            ),
+        ));
+    }
     body.push_str(&table);
     if last {
         body.push_str(&html::note(
@@ -1249,38 +1278,43 @@ async fn render_users(state: &AppState, error: Option<&str>) -> Response {
 #[derive(Deserialize)]
 pub struct NewUser {
     username: String,
-    password: String,
 }
 
+/// Creates a user, and a sign-in token for them to add their first passkey with.
+///
+/// Two statements rather than one transaction: issuing takes its own (`store::login_tokens::issue`). If the
+/// second fails the user exists without a token, which the users page shows and `create-login-token` mends.
 async fn create_user(State(state): State<AppState>, Form(form): Form<NewUser>) -> Response {
-    // The username is trimmed, because one with a trailing space is indistinguishable on screen from one
-    // without and would silently never match at login. The password is **not** — §14.7 hashes exactly what
-    // was supplied, and trimming would store something other than what was typed.
+    // Trimmed, because a username with a trailing space is indistinguishable on screen from one without.
     let username = form.username.trim().to_owned();
-    if username.is_empty() || form.password.is_empty() {
-        return render_users(&state, Some("a username and a password are both required.")).await;
+    if username.is_empty() {
+        return render_users(&state, Some("a username is required."), None).await;
     }
 
-    let hash = crate::auth::hash_password(&form.password);
     let db_path = state.config.database_path.clone();
     let name = username.clone();
-    let created = tokio::task::spawn_blocking(move || {
+    let created = tokio::task::spawn_blocking(move || -> anyhow::Result<Option<login_token::Issued>> {
         let conn = crate::store::open_write_existing(&db_path)?;
-        crate::store::users::insert(&conn, &name, &hash, crate::now_unix_nanos())
+        let now = crate::now_unix_nanos();
+        // The realistic failure is the primary key: a duplicate username. Reported as a page rather than a
+        // 500, since it is the operator's typo and not a fault.
+        if let Err(e) = crate::store::users::insert(&conn, &name, now) {
+            tracing::warn!(error = %e, user = %name, "could not create the user");
+            return Ok(None);
+        }
+        login_token::issue(&conn, &name, now)?
+            .map(Some)
+            .ok_or_else(|| anyhow::anyhow!("the user just created is gone"))
     })
     .await;
 
     match created {
-        Ok(Ok(())) => {
-            tracing::info!(user = %username, "user created from the web interface");
-            see_other("/users")
+        Ok(Ok(Some(issued))) => {
+            tracing::info!(user = %username, token = %issued.token.id(), "user created from the web interface");
+            render_users(&state, None, Some((&username, &issued))).await
         }
-        // The realistic failure is the primary key: a duplicate username. Reported as a page rather than a
-        // 500, since it is the operator's typo and not a fault.
-        Ok(Err(e)) => {
-            tracing::warn!(error = %e, user = %username, "could not create the user");
-            render_users(&state, Some("that username already exists.")).await
-        }
+        Ok(Ok(None)) => render_users(&state, Some("that username already exists."), None).await,
+        Ok(Err(e)) => failed("creating the user or issuing their sign-in token", &e),
         Err(e) => failed("the user creation task", &e),
     }
 }
@@ -1314,10 +1348,11 @@ async fn delete_user(
             render_users(
                 &state,
                 Some("that is the only user, and deleting it would lock you out of this interface."),
+                None,
             )
             .await
         }
-        Ok(Ok(Some(false))) => render_users(&state, Some("there is no such user.")).await,
+        Ok(Ok(Some(false))) => render_users(&state, Some("there is no such user."), None).await,
         Ok(Ok(Some(true))) => {
             tracing::info!(user = %form.username, by = %identity.username, "user deleted");
             // `users::delete` takes that user's sessions with it, so deleting yourself has just ended this
@@ -1379,12 +1414,7 @@ async fn render_keys(state: &AppState, error: Option<&str>, issued: Option<&str>
         body.push_str(&format!("<p class=\"error\">{}</p>\n", html::escape(message)));
     }
     if let Some(token) = issued {
-        // The one place a secret is ever rendered. Marked as such, because the reader has one chance.
-        body.push_str(&format!(
-            "<p class=\"issued\"><strong>Copy this now — it is not stored and cannot be shown \
-             again:</strong><br><code>{}</code></p>\n",
-            html::escape(token)
-        ));
+        body.push_str(&html::issued(token, "Copy this now — it is not stored and cannot be shown again:"));
     }
     body.push_str(&table);
     if listed.is_empty() {
@@ -1600,10 +1630,9 @@ pub struct PasskeySignIn {
     response: String,
 }
 
-/// Signs in with a passkey (SPEC §14.10): verifies the browser's answer, then establishes a session exactly as
-/// a password login does.
+/// Signs in with a passkey (SPEC §14.10): verifies the browser's answer, then establishes a session.
 ///
-/// The failure messages are specific, unlike the password form's single one: a passkey cannot be guessed, so
+/// The failure messages are specific: a passkey cannot be guessed, so
 /// saying that this one was removed, or belongs to another address, tells an attacker nothing and tells the
 /// owner what to do.
 async fn passkey_login(
@@ -1675,69 +1704,88 @@ async fn passkey_login(
     }
 }
 
-/// The login form's fields.
+/// The login form's one field.
 ///
-/// `Form` comes from axum's default `form` feature, so this needs no new dependency. It percent-decodes and
-/// handles `+`-as-space, which hand-rolled parsing of a password field would have to get right.
+/// `Form` comes from axum's default `form` feature, so this needs no new dependency. It percent-decodes, which
+/// a hand-rolled parse of a pasted field would have to get right.
 #[derive(Deserialize)]
-pub struct Credentials {
-    username: String,
-    password: String,
+pub struct SignInToken {
+    token: String,
 }
 
-/// One message for every way a login can fail.
+/// Signs in with a one-time token (SPEC §14.7): uses it up and starts a session in one transaction, then sends
+/// the browser to the account page — a token is for getting in to add a passkey, and that is where it is
+/// added.
 ///
-/// The same reasoning as [`crate::api::auth::refuse`]: distinguishing "no such user" from "wrong password"
-/// turns the form into an oracle for which usernames exist. What is *not* defended is timing — an unknown
-/// username returns before any hashing happens, so it is measurably faster. With one operator and a
-/// username that is not secret, closing that would be machinery guarding nothing, and stating it is better
-/// than implying it was handled.
-const REFUSED: &str = "that username and password did not match.";
+/// The failure messages are specific, as the passkey form's are and for the same reason: a token cannot be
+/// guessed, so saying that this one expired tells an attacker nothing and tells its owner what to do.
+async fn login(State(state): State<AppState>, headers: HeaderMap, Form(form): Form<SignInToken>) -> Response {
+    let refuse = |message: &str| {
+        html(StatusCode::UNAUTHORIZED, html::login(Some(message), &passkey_sign_in(&state, &headers)))
+    };
+    let token = match crate::auth::parse_login_token(&form.token) {
+        Ok(token) => token,
+        Err(e) => {
+            tracing::warn!(reason = e.reason(), "rejected: not a sign-in token");
+            return refuse("That is not a sign-in token. One starts with mpl_, and has to be pasted whole.");
+        }
+    };
+    let session = match crate::random_bytes() {
+        Ok(bytes) => crate::auth::SessionToken::from_random(&bytes),
+        Err(e) => return login_unavailable(&e),
+    };
 
-async fn login(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    Form(credentials): Form<Credentials>,
-) -> Response {
     let db_path = state.config.database_path.clone();
-    let username = credentials.username.clone();
-    let presented = crate::auth::hash_password(&credentials.password);
-
-    let verified = tokio::task::spawn_blocking(move || -> anyhow::Result<bool> {
-        let conn = crate::store::open_read(&db_path)?;
-        // `blake3::Hash`'s constant-time `PartialEq`, as everywhere else a secret is compared here.
-        Ok(crate::store::users::password_hash(&conn, &username)?
-            .is_some_and(|stored| stored == presented))
+    let token_id = token.id().to_owned();
+    let (id, session_id) = (token_id.clone(), session.id().to_owned());
+    let session_hash = session.secret_hash();
+    let redeemed = tokio::task::spawn_blocking(move || {
+        let now = crate::now_unix_nanos();
+        // `open_write_existing`, not `open_write`: a login must never be the thing that discovers the schema
+        // needs migrating (SPEC §6.2).
+        let conn = crate::store::open_write_existing(&db_path)?;
+        sweep_expired_sessions(&conn, now);
+        let new = NewSession {
+            id: &session_id,
+            secret_hash: session_hash,
+            expires_at: now.saturating_add(session::TTL_NANOS),
+        };
+        crate::store::login_tokens::redeem(&conn, &id, &token.secret_hash(), now, new)
     })
     .await;
 
-    match verified {
-        Ok(Ok(true)) => {}
-        Ok(Ok(false)) => {
-            tracing::warn!(user = %credentials.username, "rejected: login did not match");
-            return html(
-                StatusCode::UNAUTHORIZED,
-                html::login(Some(REFUSED), &passkey_sign_in(&state, &headers)),
+    match redeemed {
+        Ok(Ok(Redemption::SignedIn { username })) => {
+            // The token's id is public and worth logging; its secret never is.
+            tracing::info!(user = %username, token = %token_id, "logged in with a sign-in token");
+            let mut response = see_other("/account");
+            session::set_cookie(
+                &mut response,
+                &session::session_cookie(&session.to_secret_string(), session::TTL_NANOS),
             );
-        }
-        Ok(Err(e)) => return login_unavailable(&e),
-        Err(e) => return login_unavailable(&e),
-    }
-
-    match establish(&state, &credentials.username) {
-        Ok(cookie) => {
-            tracing::info!(user = %credentials.username, "logged in");
-            let mut response = see_other("/");
-            session::set_cookie(&mut response, &cookie);
             response
         }
+        Ok(Ok(Redemption::Expired)) => {
+            tracing::warn!(token = %token_id, "rejected: an expired sign-in token");
+            refuse(
+                "That sign-in token has expired. Issue another: create-login-token on the host, or from the \
+                 account page on a device that is signed in.",
+            )
+        }
+        Ok(Ok(Redemption::Unknown)) => {
+            tracing::warn!(token = %token_id, "rejected: an unknown sign-in token");
+            refuse(
+                "That sign-in token does not work: it was used already, replaced by a newer one, or deleted.",
+            )
+        }
+        Ok(Err(e)) => login_unavailable(&e),
         Err(e) => login_unavailable(&e),
     }
 }
 
 /// A login that could not be *checked* is not a login that was wrong — the same distinction the API-key
 /// layer draws to answer 503 rather than 401. Here it matters less (a browser will simply retry) but
-/// reporting a database failure as a bad password would send the operator hunting for the wrong thing.
+/// reporting a database failure as a bad token would send the operator hunting for the wrong thing.
 fn login_unavailable(error: &dyn std::fmt::Display) -> Response {
     tracing::error!(%error, "could not verify a login");
     html(
@@ -1760,18 +1808,23 @@ fn establish(state: &AppState, username: &str) -> anyhow::Result<String> {
     // `open_write_existing`, not `open_write`: a login must never be the thing that discovers the schema
     // needs migrating (SPEC §6.2).
     let conn = crate::store::open_write_existing(&state.config.database_path)?;
-
-    // Opportunistic, and here rather than on a timer because a login is the only moment this table grows.
-    // A failure to sweep must not fail the login — the rows it would have removed are inert.
-    match crate::store::sessions::delete_expired(&conn, now) {
-        Ok(0) => {}
-        Ok(swept) => tracing::debug!(swept, "removed expired sessions"),
-        Err(e) => tracing::warn!(error = %e, "could not sweep expired sessions"),
-    }
+    sweep_expired_sessions(&conn, now);
 
     crate::store::sessions::insert(&conn, token.id(), &token.secret_hash(), username, now, expires_at)?;
 
     Ok(session::session_cookie(&token.to_secret_string(), session::TTL_NANOS))
+}
+
+/// Removes expired sessions, at a login.
+///
+/// Opportunistic, and at a login rather than on a timer because a login is the only moment the table grows.
+/// A failure to sweep must not fail the login — the rows it would have removed are inert.
+fn sweep_expired_sessions(conn: &rusqlite::Connection, now: i64) {
+    match crate::store::sessions::delete_expired(conn, now) {
+        Ok(0) => {}
+        Ok(swept) => tracing::debug!(swept, "removed expired sessions"),
+        Err(e) => tracing::warn!(error = %e, "could not sweep expired sessions"),
+    }
 }
 
 /// Logging out: delete the row, clear the cookie.

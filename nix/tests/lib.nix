@@ -527,12 +527,13 @@ let
 
       # ------------------------------------------------------------------ the web interface (SPEC.md §14)
 
-      # The credentials the web cases use. The password is fixed rather than generated: nothing here is
-      # protecting anything, and a literal makes a failing assertion reproducible.
+      # The user the web cases sign in as. Signing in takes a sign-in token from the host (SPEC.md §14.7),
+      # so each login issues one: they work once.
       WEB_USER = "operator"
-      WEB_PASSWORD = "a-high-entropy-test-password"
 
-      def create_web_user(username=WEB_USER, password=WEB_PASSWORD):
+      def create_web_user(username=WEB_USER):
+          # Returns the sign-in token create-user prints, which is the whole of its stdout.
+          #
           # As the service user, for the same reason authenticate() does it: SQLite writes -wal and -shm
           # beside the database, and root-owned ones would be files the service itself could no longer
           # write. The state directory is created the way systemd's StateDirectory= would, since
@@ -541,13 +542,18 @@ let
           machine.succeed(
               f"install -d -m 0700 -o {SERVICE_USER} -g {SERVICE_USER} $(dirname {DB})"
           )
-          # The password reaches the command on stdin, never in argv: /proc/<pid>/cmdline is
-          # world-readable, so a password as a flag would be visible to every process on the machine --
-          # including this test's own shell. Piping it is what the command documents.
-          machine.succeed(
-              f"printf %s {shlex.quote(password)} | runuser -u {SERVICE_USER} -- "
+          return machine.succeed(
+              f"runuser -u {SERVICE_USER} -- "
               f"monitoring-platform create-user --db {DB} --username {shlex.quote(username)}"
-          )
+          ).strip()
+
+      def create_login_token(username=WEB_USER):
+          # A fresh sign-in token for an existing user, as the operator would issue one over ssh. As the
+          # service user, for create_web_user's reason.
+          return machine.succeed(
+              f"runuser -u {SERVICE_USER} -- "
+              f"monitoring-platform create-login-token --db {DB} --username {shlex.quote(username)}"
+          ).strip()
 
       # What a browser would send, and what the §14.3 origin check compares against the Host header. curl
       # derives `Host: localhost` from the URL, so this pairs with it.
@@ -569,17 +575,15 @@ let
           cmd = _as_user(user, f"curl -sS -i {header}--unix-socket {SOCKET} {args}")
           return (machine.succeed if succeed else machine.fail)(cmd)
 
-      def web_login(username=WEB_USER, password=WEB_PASSWORD):
-          # Returns the session cookie's value, so a case can then use it like a browser would.
+      def web_login(username=WEB_USER, token=None):
+          # Returns the session cookie's value, so a case can then use it like a browser would. Issues a
+          # token for `username` unless one is given.
           #
-          # --data-urlencode rather than --data, so a password containing & or = is sent the way a browser
-          # would send it instead of being silently split into extra fields.
+          # --data-urlencode rather than --data, which is how a browser sends the field.
+          if token is None:
+              token = create_login_token(username)
           out = web_curl(
-              "-X POST --data-urlencode "
-              + shlex.quote(f"username={username}")
-              + " --data-urlencode "
-              + shlex.quote(f"password={password}")
-              + " http://localhost/login"
+              "-X POST --data-urlencode " + shlex.quote(f"token={token}") + " http://localhost/login"
           )
           for line in out.splitlines():
               if line.lower().startswith("set-cookie:") and "mp_session=" in line:

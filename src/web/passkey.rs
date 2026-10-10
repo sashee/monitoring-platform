@@ -44,7 +44,7 @@ const CEREMONY_CAPACITY: usize = 32;
 /// The same for sign-ins, with more room: every visit to the login page starts one, including every
 /// redirect there from an expired session. Reaching the page at all takes the tunnel's own authentication
 /// (SPEC §14.5), so this bounds memory rather than defending against strangers — and a full set refuses only
-/// the passkey button; the password form does not use it.
+/// the passkey button; the sign-in token form does not use it.
 const SIGN_IN_CAPACITY: usize = 64;
 
 /// Domain for deriving a user handle. Frozen: changing it changes every user's handle, after which no

@@ -26,7 +26,7 @@ from playwright.sync_api import TimeoutError as PlaywrightTimeout
 from playwright.sync_api import sync_playwright
 
 BINARY = os.environ.get("MP_BIN", "monitoring-platform")
-USER, PASSWORD = "sashee", "a-password-for-the-browser-check"
+USER = "sashee"
 
 failures: list[str] = []
 
@@ -63,9 +63,8 @@ def healthy(port: int) -> bool:
 def main() -> int:
     work = tempfile.mkdtemp()
     db, sock, log = (os.path.join(work, name) for name in ("m.db", "m.sock", "server.log"))
-    subprocess.run(
-        [BINARY, "create-user", "--db", db, "--username", USER], input=PASSWORD.encode(), check=True
-    )
+    # The token it prints goes unused: each browser profile signs in with one of its own (`signed_in`).
+    subprocess.run([BINARY, "create-user", "--db", db, "--username", USER], check=True, stdout=subprocess.DEVNULL)
     port = free_port()
     with open(log, "w") as server_log:
         server = subprocess.Popen([BINARY, "serve", "--socket", sock, "--db", db], stdout=server_log, stderr=server_log)
@@ -75,7 +74,7 @@ def main() -> int:
         )
     try:
         wait_for(lambda: healthy(port), "the receiver answering through the shim")
-        run_checks(port)
+        run_checks(port, db)
     finally:
         shim.terminate()
         server.terminate()
@@ -86,7 +85,16 @@ def main() -> int:
     return 1 if failures else 0
 
 
-def run_checks(port: int) -> None:
+def sign_in_token(db: str) -> str:
+    """A fresh sign-in token, as the operator issues one on the host. The receiver is running: a second
+    writer, as it is on the Pi."""
+    issued = subprocess.run(
+        [BINARY, "create-login-token", "--db", db, "--username", USER], check=True, capture_output=True, text=True
+    )
+    return issued.stdout.strip()
+
+
+def run_checks(port: int, db: str) -> None:
     with sync_playwright() as playwright:
         # No sandbox: Chromium's needs user namespaces, which the Nix build sandbox does not offer, and this
         # browser only ever loads the page under test.
@@ -95,7 +103,7 @@ def run_checks(port: int) -> None:
         )
 
         def signed_in(host: str, without_tojson: bool = False):
-            """A fresh browser profile with its own virtual authenticator, signed in with the password."""
+            """A fresh browser profile with its own virtual authenticator, signed in with a sign-in token."""
             context = browser.new_context()
             page = context.new_page()
             if without_tojson:
@@ -117,10 +125,10 @@ def run_checks(port: int) -> None:
             )
             base = f"http://{host}:{port}"
             page.goto(f"{base}/login")
-            page.fill("input[name=username]", USER)
-            page.fill("input[name=password]", PASSWORD)
+            page.fill("input[name=token]", sign_in_token(db))
             with page.expect_navigation():
                 page.click("form[action='/login'] button")
+            check(f"a sign-in token lands on the account page at {host}", page.url == f"{base}/account", page.url)
             return page, base
 
         def submit(page, button: str) -> str | None:

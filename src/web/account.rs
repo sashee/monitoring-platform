@@ -1,4 +1,5 @@
-//! The account page (SPEC §14.10): the signed-in user's own passkeys — listing, adding and removing them.
+//! The account page (SPEC §14.10): the signed-in user's own passkeys — listing, adding and removing them — and
+//! their sign-in token (§14.7), which gets them in once on a device that has no passkey yet.
 //!
 //! **One of the two pages with a script on it** (the other is the login page; both scripts are in
 //! `web::passkey_page`). WebAuthn has no HTML-form API, so adding a passkey takes a script — and only that
@@ -14,12 +15,13 @@ use serde::Deserialize;
 
 use super::passkey::{self, PasskeyError, Site};
 use super::passkey_page;
+use super::login_token::{self, Issued};
 use super::session::Identity;
 use super::{failed, html, see_other};
 use crate::AppState;
 use crate::api::query::format_nanos;
+use crate::store::login_tokens::StoredLoginToken;
 use crate::store::passkeys::{ListedPasskey, PasskeyRemoval};
-use crate::store::users::PasswordRemoval;
 
 /// The longest name a passkey may be given. A label in a table, not a description.
 const MAX_LABEL_CHARS: usize = 64;
@@ -29,7 +31,7 @@ pub async fn account(
     Extension(identity): Extension<Identity>,
     headers: HeaderMap,
 ) -> Response {
-    render(&state, &identity, &headers, None).await
+    render(&state, &identity, &headers, None, None).await
 }
 
 #[derive(Deserialize)]
@@ -50,12 +52,13 @@ pub async fn add_passkey(
     // this only refuses a request that did not come from the form. By then the authenticator has made the
     // passkey, which is why the browser's check, not this one, is the one a person meets.
     if label.is_empty() || label.chars().count() > MAX_LABEL_CHARS {
-        return render(&state, &identity, &headers, Some("A passkey needs a name, up to 64 characters.")).await;
+        return render(&state, &identity, &headers, Some("A passkey needs a name, up to 64 characters."), None)
+            .await;
     }
     // A `POST` reaches here only if the origin guard matched `Origin` to `Host`, so this is the request's
     // own origin — the one the browser signed into the client data.
     let Some(site) = header_value(&headers, header::ORIGIN).and_then(Site::from_origin) else {
-        return render(&state, &identity, &headers, Some(PasskeyError::NotLocalhost.message())).await;
+        return render(&state, &identity, &headers, Some(PasskeyError::NotLocalhost.message()), None).await;
     };
 
     let db_path = state.config.database_path.clone();
@@ -82,7 +85,7 @@ pub async fn add_passkey(
             // `warn` with the library's reason: the realistic causes are an expired prompt or a browser
             // sending something unexpected, and the journal is where that can be told apart.
             tracing::warn!(user = %identity.username, error = %e, "passkey not added");
-            render(&state, &identity, &headers, Some(e.message())).await
+            render(&state, &identity, &headers, Some(e.message()), None).await
         }
         Ok(Err(e)) => failed("storing the new passkey", &e),
         Err(e) => failed("the passkey task", &e),
@@ -119,45 +122,69 @@ pub async fn remove_passkey(
             see_other("/account")
         }
         Ok(Ok(PasskeyRemoval::NotFound)) => see_other("/account"),
-        // The page hides this passkey's button, so this is a page older than the password's removal, or a
+        // The page hides this passkey's button, so this is a page older than another passkey's removal, or a
         // request that did not come from it — checked here regardless, where the delete happens.
         Ok(Ok(PasskeyRemoval::LastWayIn)) => {
-            render(&state, &identity, &headers, Some(LAST_WAY_IN)).await
+            render(&state, &identity, &headers, Some(LAST_WAY_IN), None).await
         }
         Ok(Err(e)) => failed("removing the passkey", &e),
         Err(e) => failed("the passkey task", &e),
     }
 }
 
-/// Why the last passkey of a user without a password stays.
-const LAST_WAY_IN: &str = "That is your only passkey and you have no password, so it is your only way to \
-                           sign in. Add another passkey first, or set a password with set-password.";
+/// Why the last passkey stays.
+const LAST_WAY_IN: &str = "That is your only passkey, so it is your only way to sign in. Add another passkey \
+                           first. (Lost them all? create-login-token on the host gets you back in.)";
 
-/// Removes the signed-in user's password (SPEC §14.10) — only while they have a passkey to sign in with.
-pub async fn remove_password(
+/// Issues a sign-in token for the signed-in user, replacing any they had, and shows it the one time it exists.
+///
+/// For a device with no passkey yet: the token gets it in once, and the passkey is added there. Only for
+/// yourself — a token for someone else is `create-login-token` on the host, or the one shown on creating them.
+pub async fn issue_token(
     State(state): State<AppState>,
     Extension(identity): Extension<Identity>,
     headers: HeaderMap,
 ) -> Response {
     let db_path = state.config.database_path.clone();
     let username = identity.username.clone();
-    let removed = tokio::task::spawn_blocking(move || {
+    let issued = tokio::task::spawn_blocking(move || {
         let conn = crate::store::open_write_existing(&db_path)?;
-        crate::store::users::remove_password(&conn, &username)
+        login_token::issue(&conn, &username, crate::now_unix_nanos())
     })
     .await;
 
-    match removed {
-        Ok(Ok(PasswordRemoval::Removed)) => {
-            tracing::info!(user = %identity.username, "password removed; passkeys only from now on");
+    match issued {
+        Ok(Ok(Some(issued))) => {
+            // The id is public and worth logging; the token is not.
+            tracing::info!(user = %identity.username, token = %issued.token.id(), "sign-in token issued");
+            render(&state, &identity, &headers, None, Some(&issued)).await
+        }
+        // The session guard found this user a moment ago, and deleting a user deletes their sessions.
+        Ok(Ok(None)) => failed("issuing a sign-in token", &"the signed-in user no longer exists"),
+        Ok(Err(e)) => failed("issuing a sign-in token", &e),
+        Err(e) => failed("the sign-in token task", &e),
+    }
+}
+
+/// Deletes the signed-in user's sign-in token, if they have one.
+pub async fn delete_token(State(state): State<AppState>, Extension(identity): Extension<Identity>) -> Response {
+    let db_path = state.config.database_path.clone();
+    let username = identity.username.clone();
+    let deleted = tokio::task::spawn_blocking(move || {
+        let conn = crate::store::open_write_existing(&db_path)?;
+        crate::store::login_tokens::delete(&conn, &username)
+    })
+    .await;
+
+    match deleted {
+        Ok(Ok(existed)) => {
+            if existed {
+                tracing::info!(user = %identity.username, "sign-in token deleted");
+            }
             see_other("/account")
         }
-        Ok(Ok(PasswordRemoval::NoPasskey)) => {
-            let message = "Add a passkey first: without a password or a passkey, nothing would sign you in.";
-            render(&state, &identity, &headers, Some(message)).await
-        }
-        Ok(Err(e)) => failed("removing the password", &e),
-        Err(e) => failed("the password task", &e),
+        Ok(Err(e)) => failed("deleting the sign-in token", &e),
+        Err(e) => failed("the sign-in token task", &e),
     }
 }
 
@@ -172,30 +199,43 @@ enum Adding {
     Refused(PasskeyError),
 }
 
-async fn render(state: &AppState, identity: &Identity, headers: &HeaderMap, error: Option<&str>) -> Response {
+/// The account page, optionally with an error from a failed action, or with a sign-in token just issued — the
+/// one time it is shown.
+async fn render(
+    state: &AppState,
+    identity: &Identity,
+    headers: &HeaderMap,
+    error: Option<&str>,
+    issued: Option<&Issued>,
+) -> Response {
     let db_path = state.config.database_path.clone();
     let ceremonies = state.ceremonies.clone();
     let username = identity.username.clone();
     let host = header_value(headers, header::HOST).map(str::to_owned);
-    let gathered = tokio::task::spawn_blocking(move || -> anyhow::Result<(Vec<ListedPasskey>, bool, Adding)> {
-        let conn = crate::store::open_read(&db_path)?;
-        let listed = crate::store::passkeys::list(&conn, &username)?;
-        let has_password = crate::store::users::has_password(&conn, &username)?;
-        let adding = match host.as_deref().and_then(passkey::rp_id_for) {
-            Some(rp_id) => {
-                let existing = crate::store::passkeys::ids_on(&conn, &username, &rp_id)?;
-                match passkey::start_registration(&ceremonies, &rp_id, &username, existing) {
-                    Ok(options) => Adding::Ready(options),
-                    Err(e) => Adding::Refused(e),
+    let gathered = tokio::task::spawn_blocking(
+        move || -> anyhow::Result<(Vec<ListedPasskey>, Option<StoredLoginToken>, Adding)> {
+            let conn = crate::store::open_read(&db_path)?;
+            let listed = crate::store::passkeys::list(&conn, &username)?;
+            let now = crate::now_unix_nanos();
+            let token = crate::store::login_tokens::list(&conn)?
+                .into_iter()
+                .find(|t| t.username == username && t.is_live(now));
+            let adding = match host.as_deref().and_then(passkey::rp_id_for) {
+                Some(rp_id) => {
+                    let existing = crate::store::passkeys::ids_on(&conn, &username, &rp_id)?;
+                    match passkey::start_registration(&ceremonies, &rp_id, &username, existing) {
+                        Ok(options) => Adding::Ready(options),
+                        Err(e) => Adding::Refused(e),
+                    }
                 }
-            }
-            None => Adding::NotLocalhost(host),
-        };
-        Ok((listed, has_password, adding))
-    })
+                None => Adding::NotLocalhost(host),
+            };
+            Ok((listed, token, adding))
+        },
+    )
     .await;
 
-    let (listed, has_password, adding) = match gathered {
+    let (listed, token, adding) = match gathered {
         Ok(Ok(gathered)) => gathered,
         Ok(Err(e)) => return failed("reading your passkeys", &e),
         Err(e) => return failed("the passkey query task", &e),
@@ -206,7 +246,7 @@ async fn render(state: &AppState, identity: &Identity, headers: &HeaderMap, erro
         body.push_str(&format!("<p class=\"error\">{}</p>\n", html::escape(message)));
     }
     body.push_str("<h2>passkeys</h2>\n");
-    body.push_str(&passkey_table(&listed, has_password));
+    body.push_str(&passkey_table(&listed));
     body.push_str("<h2>add a passkey</h2>\n");
     body.push_str(&match adding {
         Adding::Ready(options) => passkey_page::add_form(&options, MAX_LABEL_CHARS),
@@ -217,39 +257,47 @@ async fn render(state: &AppState, identity: &Identity, headers: &HeaderMap, erro
         }
     });
 
-    body.push_str("<h2>password</h2>\n");
-    body.push_str(&password_section(has_password, listed.len()));
+    body.push_str("<h2>sign-in token</h2>\n");
+    body.push_str(&token_section(issued, token.as_ref()));
 
     let status = if error.is_some() { StatusCode::BAD_REQUEST } else { StatusCode::OK };
     super::html(status, html::page("account", "/account", &body))
 }
 
-/// Whether there is a password, and the button that removes it once a passkey can take its place.
-///
-/// There is no form to set one. The SPEC has never had a password change page (§14.3), and the way back to a
-/// password is the same as the way to a first one: on the host, `set-password` from stdin.
-fn password_section(has_password: bool, passkeys: usize) -> String {
-    match (has_password, passkeys) {
-        (false, _) => html::note(
-            "You have no password: only your passkeys sign you in. To set one again, run \
-             `monitoring-platform set-password --username <you>` on the host.",
+/// The sign-in token: the one just issued, shown once; or the one waiting, with a button to delete it; and the
+/// button that issues one — a new one replaces the old.
+fn token_section(issued: Option<&Issued>, waiting: Option<&StoredLoginToken>) -> String {
+    let state = match (issued, waiting) {
+        (Some(issued), _) => html::issued(
+            &issued.token.to_secret_string(),
+            &format!(
+                "Copy this now — it is not stored and cannot be shown again. Paste it into the sign-in form \
+                 on the device to add a passkey on. It works once, until {}:",
+                format_nanos(issued.expires_at)
+            ),
         ),
-        (true, 0) => html::note(
-            "You sign in with a password. Add a passkey above to be able to remove it — without one, nothing \
-             would sign you in.",
+        // Separate elements: a `<form>` inside a `<p>` closes the paragraph where it starts.
+        (None, Some(waiting)) => format!(
+            "{}<form method=\"post\" action=\"/account/tokens/delete\" class=\"inline\">\
+             <button type=\"submit\">delete it</button></form>\n",
+            html::note(&format!("A sign-in token you issued works until {}.", format_nanos(waiting.expires_at)))
         ),
-        (true, _) => "<p class=\"note\">You can sign in with your password or a passkey. Once the password is \
-             removed, only your passkeys sign you in; set-password on the host gives it back.</p>\n\
-             <form method=\"post\" action=\"/account/password/remove\" class=\"inline\">\
-             <button type=\"submit\">remove password</button></form>\n"
-            .to_owned(),
-    }
+        (None, None) => html::note(
+            "A sign-in token lets you in once, within 15 minutes, on a device with no passkey yet — so that \
+             you can add one there.",
+        ),
+    };
+    let label = if issued.is_some() || waiting.is_some() { "issue a new one" } else { "issue a sign-in token" };
+    format!(
+        "{state}<form method=\"post\" action=\"/account/tokens/create\" class=\"inline\">\
+         <button type=\"submit\">{label}</button></form>\n"
+    )
 }
 
-fn passkey_table(listed: &[ListedPasskey], has_password: bool) -> String {
-    // The last passkey of a user without a password is their only way in: its button is not rendered, as the
-    // last user's delete button is not on the users page. The handler refuses it regardless.
-    let last_way_in = !has_password && listed.len() == 1;
+fn passkey_table(listed: &[ListedPasskey]) -> String {
+    // The last passkey is the only way in from this page: its button is not rendered, as the last user's
+    // delete button is not on the users page. The handler refuses it regardless.
+    let last_way_in = listed.len() == 1;
     let rows: Vec<Vec<String>> = listed
         .iter()
         .map(|p| {

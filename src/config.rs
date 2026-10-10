@@ -48,24 +48,21 @@ pub enum Command {
     /// to log in with. Listing and revoking moved to the page; issuing is the bootstrap.
     CreateApiKey(CreateApiKeyArgs),
 
-    /// Create a web interface user, reading the password from stdin (SPEC §14).
+    /// Create a web interface user, and print a sign-in token for them (SPEC §14.7).
     ///
-    /// The password is never a flag and never an argument. `/proc/<pid>/cmdline` is world-readable, so a
-    /// password on the command line is visible to every process on the host for as long as this one runs —
-    /// and lands in the shell history besides. This is the same reason the collector takes an
-    /// `apiKeyFile` rather than a key.
+    /// The token signs the user in once, within 15 minutes, so that they can add a passkey. It goes to stdout
+    /// alone, like a new API key, and cannot be recovered afterwards; `create-login-token` issues another.
     CreateUser(CreateUserArgs),
 
-    /// Give an existing web interface user a password, reading it from stdin (SPEC §14.10).
+    /// Print a sign-in token for an existing web interface user (SPEC §14.7).
     ///
-    /// The way back in for a user whose passkeys are lost, or who removed their password and wants it back —
-    /// the web interface has no form for setting one. Replaces any password the user had. From stdin, never a
-    /// flag, for the reason on `create-user`.
-    SetPassword(CreateUserArgs),
+    /// The way in for a user with no passkey on the device at hand — a new one, or every passkey lost. It
+    /// replaces any token the user had, and works once, within 15 minutes.
+    CreateLoginToken(CreateUserArgs),
 
     /// List the web interface users, by name, creation time and how they sign in.
     ///
-    /// Never prints a password, because none is stored.
+    /// Never prints a sign-in token, because none is stored.
     ListUsers(ApiKeyArgs),
 
     /// List the browser sessions that exist, by public id, user and expiry.

@@ -14,7 +14,6 @@ mod common;
 use axum::body::Body;
 use axum::http::{Request, StatusCode, header};
 use http_body_util::BodyExt as _;
-use monitoring_platform::auth::hash_password;
 use monitoring_platform::config::ServeArgs;
 use monitoring_platform::model::Measurement;
 use monitoring_platform::web::session::COOKIE;
@@ -24,11 +23,11 @@ use std::collections::HashMap;
 use std::io::Read as _;
 use tower::ServiceExt as _;
 
-const PASSWORD: &str = "a-high-entropy-password";
 const USER: &str = "sashee";
 
 struct Harness {
     app: axum::Router,
+    db: std::path::PathBuf,
     authorization: String,
     _dir: tempfile::TempDir,
 }
@@ -87,13 +86,14 @@ fn harness() -> Harness {
     // `issue_key` migrates the file, so it runs before anything else touches the tables.
     let authorization = common::issue_key(&config.database_path);
     let mut conn = store::open_write(&config.database_path).unwrap();
-    store::users::insert(&conn, USER, &hash_password(PASSWORD), 0).unwrap();
+    store::users::insert(&conn, USER, 0).unwrap();
     store::write::insert_batch(&mut conn, &fixtures()).unwrap();
 
     let (writer, done) = store::write::spawn(conn);
     std::mem::forget(done);
 
-    Harness { app: api::app(AppState::new(config, writer)), authorization, _dir: dir }
+    let db = config.database_path.clone();
+    Harness { app: api::app(AppState::new(config, writer)), db, authorization, _dir: dir }
 }
 
 impl Harness {
@@ -158,15 +158,20 @@ impl Harness {
         self.send(request.body(Body::empty()).unwrap()).await
     }
 
-    /// Logs in and returns the session cookie's value.
+    /// Logs in with a fresh sign-in token and returns the session cookie's value.
     async fn session(&self) -> String {
+        let conn = store::open_write_existing(&self.db).unwrap();
+        let issued = monitoring_platform::web::login_token::issue(&conn, USER, monitoring_platform::now_unix_nanos())
+            .unwrap()
+            .expect("the user exists");
+        let token = monitoring_platform::web::html::percent_encode(&issued.token.to_secret_string());
         let request = Request::builder()
             .method("POST")
             .uri("/login")
             .header(header::HOST, "localhost")
             .header(header::ORIGIN, "http://localhost")
             .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
-            .body(Body::from(format!("username={USER}&password={PASSWORD}")))
+            .body(Body::from(format!("token={token}")))
             .unwrap();
         let response = self.app.clone().oneshot(request).await.unwrap();
         assert_eq!(response.status(), StatusCode::SEE_OTHER, "the test login did not succeed");

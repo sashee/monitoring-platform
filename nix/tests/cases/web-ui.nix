@@ -2,8 +2,8 @@
 #
 # The router-level Rust tests in tests/web.rs cover the login, guard and rendering rules exhaustively.
 # What is only reachable here is that they still work through systemd's sandbox, as the service user,
-# against the provisioned StateDirectory — and, specifically, that `create-user` can write to a database
-# the running service holds open. That is a second writer against a live receiver, which is safe because
+# against the provisioned StateDirectory — and, specifically, that `create-user` and `create-login-token`
+# can write to a database the running service holds open. That is a second writer against a live receiver, which is safe because
 # of WAL and `busy_timeout` (SPEC.md §6.1) and is the kind of claim a unit test cannot make.
 #
 # A lightweight case sharing one VM, so the database is not empty when it starts and the machine may be
@@ -13,13 +13,16 @@
 {
   testScript = ''
     # A second writer against the running service. This is the assertion that cannot be made off-VM.
-    create_web_user()
+    # create-user prints the new user's sign-in token, and nothing else on stdout.
+    first_token = create_web_user()
+    assert first_token.startswith("mpl_") and "\n" not in first_token, first_token
 
     # Present, and reachable without a credential of any kind — a login form behind a login would be a
     # locked door with the key inside.
     form = web_curl("http://localhost/login")
     assert http_status(form) == 200, form
-    assert 'name="password"' in form, form
+    assert 'name="token"' in form, form
+    assert 'name="password"' not in form, form
 
     # Every page must refuse a request with no cookie, and must not leak what it would have shown.
     for path in ["/", "/users", "/sessions"]:
@@ -28,28 +31,30 @@
         assert "location: /login" in anonymous.lower(), f"{path}: {anonymous}"
         assert WEB_USER not in anonymous, f"{path} leaked the user list: {anonymous}"
 
-    # A wrong password establishes nothing. Checked before the successful login, so a cookie left over
+    # A token nobody issued establishes nothing. Checked before the successful login, so a cookie left over
     # from an earlier step cannot make this pass.
     refused = web_curl(
-        "-X POST --data-urlencode " + shlex.quote(f"username={WEB_USER}")
-        + " --data-urlencode password=wrong http://localhost/login"
+        "-X POST --data-urlencode token=mpl_0000000000000000." + "0" * 64 + " http://localhost/login"
     )
     assert http_status(refused) == 401, refused
     assert "mp_session=" not in refused, f"a failed login set a cookie: {refused}"
 
-    # The real thing.
-    cookie = web_login()
+    # The real thing, with the token create-user printed. It works once.
+    cookie = web_login(token=first_token)
+    replayed = web_curl("-X POST --data-urlencode " + shlex.quote(f"token={first_token}") + " http://localhost/login")
+    assert http_status(replayed) == 401, f"a sign-in token worked twice: {replayed}"
 
     # The cookie is a session token, not something that could be mistaken for an API key — the prefixes
     # are what keep the two credentials apart.
     assert cookie.startswith("mps_"), cookie
 
     # The attributes the browser depends on, read off the wire rather than off the builder that made them.
+    # With a token from create-login-token, the way back in for a user with no passkey at hand.
     established = web_curl(
-        "-X POST --data-urlencode " + shlex.quote(f"username={WEB_USER}")
-        + " --data-urlencode " + shlex.quote(f"password={WEB_PASSWORD}")
-        + " http://localhost/login"
+        "-X POST --data-urlencode " + shlex.quote(f"token={create_login_token()}") + " http://localhost/login"
     )
+    assert http_status(established) == 303, established
+    assert "location: /account" in established.lower(), established
     set_cookie = [l for l in established.splitlines() if l.lower().startswith("set-cookie:")][0]
     assert "HttpOnly" in set_cookie, set_cookie
     assert "SameSite=Strict" in set_cookie, set_cookie
@@ -74,7 +79,7 @@
         f"runuser -u {SERVICE_USER} -- monitoring-platform list-users --db {DB} 2>/dev/null"
     )
     assert WEB_USER in listed, listed
-    assert WEB_PASSWORD not in listed, "the password must not be printable"
+    assert "mpl_" not in listed, "a sign-in token must not be printable"
 
     sessions = machine.succeed(
         f"runuser -u {SERVICE_USER} -- monitoring-platform list-sessions --db {DB} 2>/dev/null"
@@ -102,16 +107,14 @@
     # check can fail, and each must leave the database untouched — a 403 that still wrote would be worse
     # than no check at all.
     forged = web_curl(
-        "-X POST --data-urlencode username=intruder --data-urlencode password=whatever "
-        "http://localhost/users/create",
+        "-X POST --data-urlencode username=intruder http://localhost/users/create",
         cookie=cookie,
         origin="http://localhost:3000",
     )
     assert http_status(forged) == 403, f"a cross-port POST was not refused: {forged}"
 
     headerless = web_curl(
-        "-X POST --data-urlencode username=intruder2 --data-urlencode password=whatever "
-        "http://localhost/users/create",
+        "-X POST --data-urlencode username=intruder2 http://localhost/users/create",
         cookie=cookie,
         origin=None,
     )
@@ -126,19 +129,20 @@
     # the handler writes to a database the running service holds open, as the service user, through
     # systemd's sandbox.
     created = web_curl(
-        "-X POST --data-urlencode username=second --data-urlencode "
-        + shlex.quote(f"password={WEB_PASSWORD}-2")
-        + " http://localhost/users/create",
-        cookie=cookie,
+        "-X POST --data-urlencode username=second http://localhost/users/create", cookie=cookie
     )
-    assert http_status(created) == 303, created
+    assert http_status(created) == 200, created
+    second_token = created.split('class="issued"', 1)[1].split("<code>", 1)[1].split("</code>", 1)[0]
+    assert second_token.startswith("mpl_"), second_token
 
     users_page = web_curl("http://localhost/users", cookie=cookie)
     assert "second" in users_page, users_page
+    assert second_token not in users_page, "a sign-in token must not reappear on a later load"
 
-    # And the new user can actually log in, which is what proves the hash the form stored is one the login
-    # path accepts — a create that wrote an unusable hash would look identical up to here.
-    second_cookie = web_login(username="second", password=f"{WEB_PASSWORD}-2")
+    # And the new user can actually log in with the token the page showed, which is what proves the hash it
+    # stored is one the login path accepts — a create that wrote an unusable hash would look identical up to
+    # here.
+    second_cookie = web_login(token=second_token)
     assert http_status(web_curl("http://localhost/", cookie=second_cookie)) == 200
 
     # Ending someone else's session must not touch your own.

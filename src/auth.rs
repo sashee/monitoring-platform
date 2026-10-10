@@ -1,9 +1,8 @@
-//! Credential identity: the tokens handed out, the passwords accepted, and the hashes the database
-//! keeps (SPEC §13, §14).
+//! Credential identity: the tokens handed out and the hashes the database keeps (SPEC §13, §14).
 //!
-//! Pure — no I/O, and no randomness either: [`Token::from_random`] and [`SessionToken::from_random`]
-//! take the bytes rather than sourcing them, so every property here is testable against a fixed value.
-//! The randomness itself is [`crate::random_bytes`].
+//! Pure — no I/O, and no randomness either: [`Token::from_random`], [`SessionToken::from_random`] and
+//! [`LoginToken::from_random`] take the bytes rather than sourcing them, so every property here is testable
+//! against a fixed value. The randomness itself is [`crate::random_bytes`].
 //!
 //! Three credentials live here, because they are three answers to one question — *what proves who you
 //! are* — and keeping them together is what keeps their domains provably distinct:
@@ -12,7 +11,10 @@
 //! |---|---|---|---|
 //! | API key (§13) | `Authorization: Bearer mpk_…` | its public id | `blake3(api-key domain ‖ secret)` |
 //! | session (§14) | the `mp_session` cookie | its public id | `blake3(session domain ‖ secret)` |
-//! | password (§14) | a login form field | the username | `blake3(password domain ‖ password)` |
+//! | sign-in token (§14.7) | the login form | its public id | `blake3(login-token domain ‖ secret)` |
+//!
+//! There is no password among them. Passkeys (§14.10) are the fourth way in, and their verification is
+//! `web::passkey`'s, since what proves them is a signature rather than a secret.
 //!
 //! A token has two halves with different jobs:
 //!
@@ -28,11 +30,9 @@
 //! class of hardware as the devices it collects from. What a fast hash does still need is domain
 //! separation, and that is here.
 //!
-//! **That argument covers the password too, but only because of how the password is chosen.** It is
-//! one operator's own high-entropy secret, not a human-memorable string, so there is no small space to
-//! search and nothing for a slow KDF to buy (SPEC §14). The moment a second user picks a password they
-//! can remember, that stops being true and [`hash_password`] is where argon2 belongs — which is why
-//! this is written down rather than left as an inherited assumption.
+//! The argument holds for every credential here because none of them is chosen by a person. It held for the
+//! password that used to be the fourth only by convention — one operator's own high-entropy secret — and
+//! replacing it with [`LoginToken`] is what made it hold by construction.
 
 use blake3::Hash;
 
@@ -46,6 +46,9 @@ pub const PREFIX: &str = "mpk_";
 /// should be able to tell which kind of credential leaked, and a session value that looked like an API
 /// key would invite exactly the confusion §14's separate auth layers exist to prevent.
 pub const SESSION_PREFIX: &str = "mps_";
+
+/// The sign-in token's counterpart to [`PREFIX`], distinct for the same two reasons as [`SESSION_PREFIX`].
+pub const LOGIN_PREFIX: &str = "mpl_";
 
 pub const ID_BYTES: usize = 8;
 /// 256 bits, which is what makes hashing it with a fast hash sound (see the module docs).
@@ -69,9 +72,12 @@ const DOMAIN_API_KEY: &[u8] = b"monitoring-platform/api-key/v1";
 /// §14's separation of the two auth layers would hold in the router while leaking through the database.
 const DOMAIN_SESSION: &[u8] = b"monitoring-platform/session/v1";
 
-/// The password domain (SPEC §14). Changing it invalidates every stored password, which then have to
-/// be re-set with `create-user`.
-const DOMAIN_PASSWORD: &[u8] = b"monitoring-platform/password/v1";
+/// The sign-in token domain (SPEC §14.7), distinct from the other two for the reason [`DOMAIN_SESSION`]
+/// gives. Changing it only voids tokens not yet used, which last minutes anyway.
+///
+/// `monitoring-platform/password/v1` was the password's, and is not reused: a value that once meant one
+/// credential should not start meaning another.
+const DOMAIN_LOGIN_TOKEN: &[u8] = b"monitoring-platform/login-token/v1";
 
 /// A token as a client presents it.
 #[derive(Clone)]
@@ -167,19 +173,80 @@ impl SessionToken {
     }
 }
 
+/// A one-time sign-in token (SPEC §14.7): it lets its user in once, shortly after it was issued, so that they
+/// can add a passkey.
+///
+/// The same two halves as [`Token`] and [`SessionToken`], and a third type for the reason `SessionToken` gives
+/// for being a second: a sign-in token presented as a cookie, or a cookie pasted into the sign-in form, must
+/// not be a compile-time possibility.
+#[derive(Clone)]
+pub struct LoginToken {
+    id: String,
+    secret: [u8; SECRET_BYTES],
+}
+
+impl std::fmt::Debug for LoginToken {
+    /// Redacted, for the reason spelled out on [`Token`]'s impl.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "LoginToken {{ id: {:?}, secret: <redacted> }}", self.id)
+    }
+}
+
+impl LoginToken {
+    pub fn from_random(bytes: &[u8; TOKEN_BYTES]) -> Self {
+        let (id, secret) = bytes.split_at(ID_BYTES);
+        Self {
+            id: hex(id),
+            secret: secret.try_into().expect("TOKEN_BYTES - ID_BYTES == SECRET_BYTES"),
+        }
+    }
+
+    pub fn id(&self) -> &str {
+        &self.id
+    }
+
+    /// What `web_login_token.secret_hash` stores.
+    pub fn secret_hash(&self) -> Hash {
+        hash_in_domain(DOMAIN_LOGIN_TOKEN, &self.secret)
+    }
+
+    /// What the user is given to paste. Shown once, like [`Token::to_secret_string`].
+    pub fn to_secret_string(&self) -> String {
+        format!("{LOGIN_PREFIX}{}.{}", self.id, hex(&self.secret))
+    }
+}
+
 /// A session token out of a cookie value.
 ///
 /// Rejects an API key outright, rather than parsing it and failing to find the id in `web_session`: the
 /// prefixes are what distinguish the two credentials, so a mismatch is a malformed session and should
 /// say so.
 pub fn parse_session(raw: &str) -> Result<SessionToken, Malformed> {
-    let body = raw.strip_prefix(SESSION_PREFIX).ok_or(Malformed::MissingPrefix)?;
+    let (id, secret) = parse_halves(raw, SESSION_PREFIX)?;
+    Ok(SessionToken { id, secret })
+}
+
+/// A sign-in token as pasted into the login form.
+///
+/// Surrounding whitespace is trimmed, unlike everywhere else a token is read: this one arrives by copy and
+/// paste, which picks up a trailing newline or space often enough to matter, and whitespace is never part of
+/// a token, so trimming it cannot turn one token into another.
+pub fn parse_login_token(raw: &str) -> Result<LoginToken, Malformed> {
+    let (id, secret) = parse_halves(raw.trim(), LOGIN_PREFIX)?;
+    Ok(LoginToken { id, secret })
+}
+
+/// The two halves of `<prefix><id>.<secret>`, validated. One parser for every kind, so they cannot drift.
+///
+/// The id is validated as hex but kept as the string, since that is what each table is keyed by.
+fn parse_halves(raw: &str, prefix: &str) -> Result<(String, [u8; SECRET_BYTES]), Malformed> {
+    let body = raw.strip_prefix(prefix).ok_or(Malformed::MissingPrefix)?;
     let (id, secret) = body.split_once('.').ok_or(Malformed::NotTwoParts)?;
 
     unhex::<ID_BYTES>(id).ok_or(Malformed::BadId)?;
     let secret = unhex::<SECRET_BYTES>(secret).ok_or(Malformed::BadSecret)?;
 
-    Ok(SessionToken { id: id.to_owned(), secret })
+    Ok((id.to_owned(), secret))
 }
 
 /// Why a token string was not usable.
@@ -232,14 +299,8 @@ pub fn from_authorization(value: &str) -> Result<Token, Malformed> {
 
 /// A bare token, without the header scheme.
 pub fn parse(raw: &str) -> Result<Token, Malformed> {
-    let body = raw.strip_prefix(PREFIX).ok_or(Malformed::MissingPrefix)?;
-    let (id, secret) = body.split_once('.').ok_or(Malformed::NotTwoParts)?;
-
-    // The id is validated as hex but kept as the string, since that is what the table is keyed by.
-    unhex::<ID_BYTES>(id).ok_or(Malformed::BadId)?;
-    let secret = unhex::<SECRET_BYTES>(secret).ok_or(Malformed::BadSecret)?;
-
-    Ok(Token { id: id.to_owned(), secret })
+    let (id, secret) = parse_halves(raw, PREFIX)?;
+    Ok(Token { id, secret })
 }
 
 pub fn hash_secret(secret: &[u8]) -> Hash {
@@ -249,16 +310,6 @@ pub fn hash_secret(secret: &[u8]) -> Hash {
 /// What `web_session.secret_hash` stores (SPEC §14).
 pub fn hash_session_secret(secret: &[u8]) -> Hash {
     hash_in_domain(DOMAIN_SESSION, secret)
-}
-
-/// What `web_user.password_hash` stores (SPEC §14).
-///
-/// Takes the password as `&str` rather than `&[u8]`: it arrives as text from a form field or a
-/// terminal, and hashing the UTF-8 bytes of exactly what was typed is the only rule that makes a
-/// password reproducible. No normalization, no trimming — a trailing space is part of the secret, and a
-/// hash that silently disagreed with what the operator entered would be unrecoverable.
-pub fn hash_password(password: &str) -> Hash {
-    hash_in_domain(DOMAIN_PASSWORD, password.as_bytes())
 }
 
 /// The one place a domain is prefixed, so no caller can hash into the wrong one by writing the
@@ -430,24 +481,14 @@ mod tests {
 
         let api_key = hash_secret(secret);
         let session = hash_session_secret(secret);
-        let password = hash_password(std::str::from_utf8(secret).unwrap());
+        let login = hash_in_domain(DOMAIN_LOGIN_TOKEN, secret);
 
         assert_ne!(api_key, session, "an api key hash must not match a session hash");
-        assert_ne!(api_key, password);
-        assert_ne!(session, password);
-        for hash in [api_key, session, password] {
+        assert_ne!(api_key, login);
+        assert_ne!(session, login);
+        for hash in [api_key, session, login] {
             assert_ne!(hash, blake3::hash(secret), "none may be a bare blake3");
         }
-    }
-
-    /// A password is hashed as exactly the bytes typed. No trimming, no normalization — a hash that
-    /// disagreed with what the operator entered would be unrecoverable, since only the hash is stored.
-    #[test]
-    fn a_password_is_hashed_verbatim() {
-        assert_eq!(hash_password("hunter2"), hash_password("hunter2"), "deterministic");
-        assert_ne!(hash_password("hunter2"), hash_password("hunter2 "), "a trailing space counts");
-        assert_ne!(hash_password("hunter2"), hash_password(" hunter2"));
-        assert_ne!(hash_password("hunter2"), hash_password("Hunter2"), "and case counts");
     }
 
     // ------------------------------------------------------------------------------- session tokens
@@ -510,6 +551,55 @@ mod tests {
         for (raw, expected) in cases {
             assert_eq!(parse_session(raw).unwrap_err(), expected, "on {raw:?}");
         }
+    }
+
+    // ------------------------------------------------------------------------------- sign-in tokens
+
+    fn login_token() -> LoginToken {
+        LoginToken::from_random(&bytes())
+    }
+
+    #[test]
+    fn a_login_token_round_trips_through_its_printed_form() {
+        let printed = login_token().to_secret_string();
+        assert!(printed.starts_with("mpl_0001020304050607."), "{printed}");
+
+        let parsed = parse_login_token(&printed).expect("the printed form must parse");
+        assert_eq!(parsed.id(), login_token().id());
+        assert_eq!(parsed.secret_hash(), login_token().secret_hash());
+    }
+
+    /// Pasting picks up whitespace at either end; inside the token it is still refused.
+    #[test]
+    fn a_pasted_login_token_may_carry_surrounding_whitespace() {
+        let printed = login_token().to_secret_string();
+        let parsed = parse_login_token(&format!("  {printed}\r\n")).expect("trimmed");
+        assert_eq!(parsed.secret_hash(), login_token().secret_hash());
+
+        assert!(parse_login_token(&printed.replacen('.', ". ", 1)).is_err());
+    }
+
+    /// Each parser refuses the other two kinds outright, by prefix.
+    #[test]
+    fn a_login_token_is_neither_a_session_nor_an_api_key() {
+        let login = login_token().to_secret_string();
+        assert_eq!(parse_session(&login).unwrap_err(), Malformed::MissingPrefix);
+        assert_eq!(parse(&login).unwrap_err(), Malformed::MissingPrefix);
+        assert_eq!(
+            parse_login_token(&session().to_secret_string()).unwrap_err(),
+            Malformed::MissingPrefix
+        );
+        assert_eq!(parse_login_token(&token().to_secret_string()).unwrap_err(), Malformed::MissingPrefix);
+
+        assert_ne!(login_token().secret_hash(), session().secret_hash(), "the same bytes, another domain");
+        assert_ne!(login_token().secret_hash(), token().secret_hash());
+    }
+
+    #[test]
+    fn login_token_debug_redacts_the_secret() {
+        let rendered = format!("{:?}", login_token());
+        assert!(rendered.contains("0001020304050607"), "the id is not secret: {rendered}");
+        assert!(!rendered.contains("808182"), "{rendered}");
     }
 
     /// The two halves come from disjoint randomness, which is worth pinning in both directions: a

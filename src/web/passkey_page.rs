@@ -155,7 +155,7 @@ pub fn sign_in_form(options: &str) -> String {
                 <input type=\"hidden\" name=\"response\">\
                 <button type=\"submit\">sign in with a passkey</button>\
                 </form>\n";
-    with_script(form, options, SIGN_IN, "Signing in with a passkey needs JavaScript. The password form works without it.")
+    with_script(form, options, SIGN_IN, "Signing in with a passkey needs JavaScript. The sign-in token form works without it.")
 }
 
 fn with_script(form: &str, options: &str, script: &str, without_script: &str) -> String {

@@ -162,7 +162,7 @@ mod tests {
         let conn = Connection::open_in_memory().unwrap();
         crate::store::schema::migrate(&conn).unwrap();
         for username in ["sashee", "irrelevant"] {
-            crate::store::users::insert(&conn, username, &crate::auth::hash_password("pw"), 1)
+            crate::store::users::insert(&conn, username, 1)
                 .expect("seeding the owner of the test sessions");
         }
         conn
@@ -225,7 +225,7 @@ mod tests {
     #[test]
     fn a_session_is_live_strictly_before_its_expiry() {
         let record = SessionRecord {
-            secret_hash: crate::auth::hash_password("irrelevant"),
+            secret_hash: blake3::hash(b"irrelevant"),
             username: "sashee".into(),
             expires_at: 100,
         };

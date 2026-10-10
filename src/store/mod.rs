@@ -1,4 +1,5 @@
 pub mod keys;
+pub mod login_tokens;
 pub mod passkeys;
 pub mod read;
 pub mod schema;

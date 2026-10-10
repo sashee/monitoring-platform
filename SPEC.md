@@ -568,6 +568,7 @@ The versions that exist:
 | 4.0 | `measurement` rebuilt without `type`/`attributes`, `series_id NOT NULL` + foreign key, `web_session.username` foreign key, foreign keys enabled (§6.7) | **major**, and the second in this project's life |
 | 4.1 | `web_passkey` (§14.10) | **minor** — a 4.0 binary ignores it, and its users' passwords still work |
 | 4.2 | `measurement` rebuilt: unique on `(event_time, id)` instead of `id`, both indexes ascending (§6.8) | **minor** — the first rebuild that is one: a 4.1 binary's insert is deduplicated the same way and its queries plan the same |
+| 4.3 | `web_login_token` (§14.7), replacing passwords | **minor** — a 4.2 binary ignores it; `web_user.password_hash` stays, unread, until a later major drops it |
 
 ### 6.3 Write path
 
@@ -1056,8 +1057,8 @@ monitoring-platform wait-for-clock       # the §9.4 boot gate; exit 1 if the cl
 
 ```
 monitoring-platform create-api-key --label <name>   # §13.3; prints the token to stdout once
-monitoring-platform create-user --username <name>   # §14.7; password on stdin, never in argv
-monitoring-platform set-password --username <name> # §14.10; a user's password back, on stdin
+monitoring-platform create-user --username <name>   # §14.7; prints their sign-in token to stdout once
+monitoring-platform create-login-token --username <name>  # §14.7; another sign-in token, replacing theirs
 monitoring-platform list-users                      # §14
 monitoring-platform list-sessions                   # §14
 monitoring-platform delete-user --username <name>   # §14; removes their sessions too
@@ -1362,7 +1363,7 @@ Approaches considered and rejected, recorded so they are not reinvented:
 src/
   main.rs              CLI, wiring, signal handling, shutdown ordering
   lib.rs               AppState, random_bytes
-  auth.rs              pure: API key, session token and password identity (§13, §14)
+  auth.rs              pure: API key, session token and sign-in token identity (§13, §14)
   bin/
     mp-make-sample.rs  writes a sample OTLP batch, posts one with --post, or stamps a
                        different --device-id; a shipped bin, not an example, so the VM
@@ -1664,9 +1665,9 @@ Web interface (§14), at the router level over a temp-file database:
 
 - The login form and `/healthz` answer with no credential at all; every other page redirects to
   `/login` and its body does **not** contain what it would have shown.
-- A correct password answers `303` with a cookie and a row; a wrong one answers `401` with neither.
-  An unknown username and a wrong password produce byte-identical responses, so the form is not an
-  oracle for which usernames exist.
+- A sign-in token answers `303` to the account page with a cookie and a row, and is used up; presented again,
+  or never issued, or expired, or not a sign-in token at all, it answers `401` with neither and says which. The
+  right id with the wrong secret leaves the token usable, and surrounding whitespace from a paste is forgiven.
 - The cookie carries `HttpOnly`, `SameSite=Strict`, `Path=/` and a `Max-Age` matching the row — and
   **not** `Secure`, which is pinned in both the unit and the integration tests because adding it would
   silently make every request after login anonymous (§14.2).
@@ -1674,8 +1675,6 @@ Web interface (§14), at the router level over a temp-file database:
   (so the public id on the sessions page is not itself a credential), when it is malformed, and when
   the session has expired. Logging in sweeps what expired; logging out deletes the row and the same
   cookie stops working. `GET /logout` is `405` and leaves the session intact.
-- A password containing `&`, `+` and `%` survives form encoding, so a login that works from `curl`
-  also works from a browser.
 - **The credentials do not cross, in both directions** (§14.4): a session cookie gets `401` on
   `/v1/measurements` *and* on `/v1/logs` with nothing written, and a valid API key gets `303` on every
   page with no user data in the body. Plus the control — that the same key still works on `/v1` — so
@@ -1770,7 +1769,7 @@ The explorer (§14.9):
   RP ID, another key under a stored credential id, another user's handle, and a credential never registered. A
   passkey is refused at another of the site's addresses; a signed response cannot be replayed; a removed passkey
   no longer signs in and says so; the login page offers the button on a loopback name and a `localhost` link on
-  `127.0.0.1`, the password form being there either way; the route is origin-checked.
+  `127.0.0.1`, the sign-in token form being there either way; the route is origin-checked.
 - **Passkeys in a real browser** (§14.10; `nix-build nix -A tests.browser-passkeys`, built by `make run-tests`
   with the VM tests on both architectures, and not part of the package's checkPhase, which the host runs).
   The pages' scripts in headless Chromium, with Chromium's own WebAuthn behind a virtual authenticator, against
@@ -1784,13 +1783,14 @@ The explorer (§14.9):
   lifetime are cut to it from their own creation, sooner ones keep their expiry, and a second pass changes
   nothing; through the real binary, a session stored with thirty days left is cut to four hours from its
   creation by the time the receiver answers its first request.
-- **Passkeys only** (§14.10). With a passkey, removing the password stops the password form signing that user
-  in while the passkey still does, and both pages say so; without one, removing it is refused and the password
-  still works. With no password, one of two passkeys can go but the last cannot, and its button is not
-  rendered. In unit tests the same guards hold at the store, inside their transactions, and a password set again
-  re-enables the last passkey's removal. Through the real binary: `create-user`, then the account page's
-  removal, `list-users` reporting `no password, 1 passkey`, and `set-password` from stdin storing the new
-  password without its line ending — and failing for a user that does not exist.
+- **Sign-in tokens** (§14.7). A token issued on the account page signs a second browser in, which then adds a
+  passkey; the page says when a token is waiting and deletes it; issuing again voids the earlier one; and the
+  account page touches only its own user's token. Creating a user on the users page shows their token once,
+  and it signs them in. One of two passkeys can go but the last cannot, and its button is not rendered. In unit
+  tests the store redeems a token once and with its session in one transaction, sweeps expired ones on issue,
+  and loses a user's token with the user. Through the real binary: `create-user` and `create-login-token` print
+  one token each to stdout alone, the second replacing the first; `list-users` reports the waiting one; an
+  unknown user is an error, and a mistyped `--db` creates nothing.
 - The geometry presets differ where it counts — asserted at **compile time**, since they are constants and
   the media-query swap is decoration if they ever converge.
 - **A dense chart is still clickable although it has no markers** — the regression test for linking marks
@@ -2252,24 +2252,25 @@ operator's own view, not a product surface: no dashboards, no charts, no JavaScr
 
 | Route | Method | Auth | |
 |---|---|---|---|
-| `/login` | `GET` | none | the form |
-| `/login` | `POST` | none | success → `303` to `/` with a session cookie; failure → the form again, `401` |
-| `/login/passkey` | `POST` | none | the browser's WebAuthn answer → the same session as a password login (§14.10) |
+| `/login` | `GET` | none | the passkey button and the sign-in token form |
+| `/login` | `POST` | none | `token` → used up, `303` to `/account` with a session cookie; failure → the page again, `401` (§14.7) |
+| `/login/passkey` | `POST` | none | the browser's WebAuthn answer → `303` to `/` with a session cookie (§14.10) |
 | `/logout` | `POST` | session | delete the row, clear the cookie, `303` to `/login` |
 | `/` | `GET` | session | the measurement explorer (§14.9) |
 | `/chart` | `GET` | session | one chart, full page, with clickable points (§14.9) |
 | `/users` | `GET` | session | the `web_user` table, with a create form |
-| `/users/create` | `POST` | session | `username` + `password` → a new user |
+| `/users/create` | `POST` | session | `username` → a new user, and their sign-in token **shown once** |
 | `/users/delete` | `POST` | session | `username` → that user and their sessions |
 | `/keys` | `GET` | session | the `api_key` table, with an issue form (§13) |
 | `/keys/create` | `POST` | session | `label` → a new key, **shown once** |
 | `/keys/delete` | `POST` | session | `id` → revoke, i.e. delete the row |
 | `/sessions` | `GET` | session | the `web_session` table |
 | `/sessions/end` | `POST` | session | `id` → delete that session |
-| `/account` | `GET` | session | your own passkeys, with an add form (§14.10) |
+| `/account` | `GET` | session | your own passkeys, with an add form (§14.10), and your sign-in token (§14.7) |
 | `/account/passkeys/create` | `POST` | session | `label` + the browser's WebAuthn response → a new passkey |
 | `/account/passkeys/delete` | `POST` | session | `credential` → remove one of your own passkeys, unless it is your last way in |
-| `/account/password/remove` | `POST` | session | remove your own password, while a passkey remains |
+| `/account/tokens/create` | `POST` | session | a sign-in token for yourself, replacing any you had, **shown once** |
+| `/account/tokens/delete` | `POST` | session | delete your own sign-in token |
 
 Every mutation is a `POST` and answers `303` back to the page it came from, so a reload does not
 resubmit. None is a link: a `GET` that changes something is a URL a prefetcher or an `<img src>` can
@@ -2290,8 +2291,8 @@ not locking yourself out:
 **An issued API key is rendered on the response to the `POST`, not after a redirect.** Only its hash is
 stored, so the token exists exactly once and a redirect would lose it — and a token carried in a URL would
 land in browser history and in any log that records paths. That is the same one-shot contract
-`create-api-key` has on the command line (§13.3), and this is the only place in §14 where a secret is ever
-rendered.
+`create-api-key` has on the command line (§13.3). A sign-in token is rendered the same way, for the same
+reasons (§14.7); these are the only places in §14 where a secret is ever rendered.
 
 **There is no last-key guard**, unlike the last-user one. Revoking every key stops devices delivering and
 is recoverable from this very page; deleting the last *user* locks the operator out of the page itself.
@@ -2357,19 +2358,12 @@ goes if a host ever needs to differ.
 Stated rather than left implicit, because each of these is a deliberate stop and would otherwise read as
 an oversight:
 
-- **No login rate limiting, and no lockout.** The password is 2^n of the operator's own choosing, not a
-  human-memorable string, so online guessing is not the threat model (§14.7). A lockout would also be a
-  denial-of-service on the only account.
-- **Username existence is observable by timing.** An unknown username returns before any hashing
-  happens, so it is measurably faster than a wrong password. The *response* is identical either way —
-  one message for every failure, so the form is not an oracle — but the timing is not equalised. With
-  one operator whose username is not secret, closing that would be machinery guarding nothing.
-- **No password change page.** `create-user`, `set-password` and `delete-user` are the interface — the account
-  page can *remove* a password once a passkey exists (§14.10), but not set one; a form would need the
-  old password, a confirmation field and a re-login path, for something done about once.
-- **A session is full authority.** Creating and deleting users needs nothing beyond being logged in — no
-  re-entered password. So a stolen cookie can mint a second login and make its access outlive the
-  session. Accepted deliberately for a single operator: that cookie already reads every measurement and
+- **No login rate limiting, and no lockout.** Nothing a person chose is ever checked: a sign-in token's secret
+  is 256 bits from the CSPRNG (§14.7) and a passkey is a signature (§14.10), so online guessing is not the
+  threat model. A lockout would also be a denial-of-service on the only account.
+- **A session is full authority.** Creating and deleting users, and issuing yourself a sign-in token, need
+  nothing beyond being logged in — no fresh passkey prompt. So a stolen cookie can mint a second login and
+  make its access outlive the session. Accepted deliberately for a single operator: that cookie already reads every measurement and
   every credential id, and the realistic ways it leaks (a shared laptop, a local process) are ones a
   re-auth prompt on one form does not close. Re-authentication is the thing to add first if this ever
   serves more than one person.
@@ -2476,38 +2470,61 @@ and §5.2 stores both verbatim by design — nothing upstream of the rendering r
 **Two pages carry a script: `/account` and `/login`** (§14.10). WebAuthn has no HTML-form API, so adding a
 passkey or signing in with one is impossible without one. Each is inline, only bridges
 `navigator.credentials` to an ordinary form `POST`, and both live in `web::passkey_page`. Without them the
-account page still lists and removes passkeys and the login page's password form still works. Every other page
-is still script-free.
+account page still lists and removes passkeys and the login page's sign-in token form still works. Every other
+page is still script-free.
 
-### 14.7 Passwords
+### 14.7 Sign-in tokens
 
-Stored as `blake3(password domain ‖ password)`. §13.2's argument for a fast hash carries over, **but
-only because of how the password is chosen**: it is one operator's own high-entropy secret, not a
-human-memorable string, so there is no small space to search and nothing a slow KDF would buy. The
-moment a second user picks a password they can remember that stops being true, and `auth::hash_password`
-is where argon2 belongs. Written down rather than left as an inherited assumption.
+There are no passwords. A user signs in with a passkey (§14.10); a **sign-in token** is how they get in
+*once*, on a device that has no passkey yet, so that they can add one there. Version 4.3 replaced passwords
+with these. By then no user had a password left.
 
-Hashed as exactly the bytes supplied — no trimming, no Unicode normalization. A trailing space is part
-of the secret. A hash that silently disagreed with what was typed would be unrecoverable, since only
-the hash is kept.
+A token is `mpl_<id>.<secret>`: the two halves of an API key (§13.1), with its own prefix and its own hash
+domain, so it can be mistaken for neither a key nor a session cookie and hashes differently from both.
+Only `blake3(login-token domain ‖ secret)` is stored, in `web_login_token` (§14.8). §13.2's argument for a
+fast hash holds by construction now: nothing a person chose is hashed anywhere.
 
-`create-user` reads the password from **stdin, never from a flag or an environment variable**:
-`/proc/<pid>/cmdline` and `/proc/<pid>/environ` are world-readable, so either would publish it to every
-process on the host for as long as the command runs, and land it in shell history besides. The same
-reasoning as the collector's `apiKeyFile` (§13.4).
+- **Once.** Signing in deletes the token and stores the session in one `IMMEDIATE` transaction, so two
+  requests presenting it at once cannot both succeed. Spending the token without storing the session is not
+  possible either. The right id with the wrong secret leaves the token alone, so knowing an id is not enough
+  to void the token behind it.
+- **Fifteen minutes.** Long enough to carry it from a terminal or another device, short enough that one left in
+  a scrollback or a clipboard is dead by the time anyone finds it. An expired token is deleted when presented,
+  and expired ones are swept whenever a token is issued, which is the only time the table grows.
+- **One per user.** Issuing replaces the user's earlier token. Issuing another is how a token that went astray
+  is voided, and the table never holds more rows than there are users. This is the store's rule, not a
+  constraint, since a `UNIQUE` could only be taken back by a major.
+- **Pasted, not typed.** The form's field is plain text with autocomplete off, and whitespace around the token
+  is trimmed: a paste from a terminal brings a newline often enough to matter, and whitespace is never part of
+  a token. Its 85 characters are the full 256-bit secret. A code short enough to type would need the guess
+  limit §14.3 does without.
+- **Specific refusals.** The form says whether a token was not one at all, expired, or not valid (used,
+  replaced or deleted). As with passkeys, a token cannot be guessed, so the distinction helps its owner and
+  tells an attacker nothing.
+
+A sign-in lands on the account page, where the passkey is added. The session is the same four hours as a
+passkey's (§14.2), with the same full authority (§14.3).
+
+Tokens are issued in three places, and each shows the token exactly once:
+
+- `create-user` prints the new user's token to stdout, with nothing else there, like `create-api-key`.
+  `create-login-token` prints another for an existing user. It is the way back in for a user whose passkeys
+  are all lost. It refuses a `--db` that does not exist rather than create an empty database.
+- **The account page** issues one for the signed-in user, for a second device. It also says when a token is
+  waiting and deletes it. Only the user's own token: a token for someone else comes from the host, or from
+  creating them.
+- **The users page** shows a new user's token on creating them.
 
 ```sh
-printf %s "$PASSWORD" | monitoring-platform create-user --db <path> --username sashee
+monitoring-platform create-login-token --db <path> --username sashee
 ```
 
-**No password is an empty `password_hash`** (§14.10), not `NULL`: the column is `NOT NULL`, and relaxing that is a
-rebuild and so a major. Every binary since 3.1 reads a stored hash that is not 32 bytes as no password, so one
-the nightly upgrade reverts to refuses that user's password logins rather than failing on them. `set-password`
-gives one back, from stdin like `create-user`.
-
-There is no terminal echo suppression: that needs `termios` raw-mode handling with a restore-on-signal
-path, or a Ctrl-C leaves the operator's shell echo-less, and piping is the documented usage precisely so
-the password need not be typed where it can be seen.
+**`web_user.password_hash` stays.** Nothing reads it since 4.3. Every new user stores an empty blob there,
+because the column is `NOT NULL` with no default, and dropping it or giving it one is a rebuild and so a major
+(§6.2). An empty blob is also what every binary since 3.1 reads as "no password", so one the nightly upgrade
+reverts to refuses password logins for a user created after 4.3 rather than failing on them. A later major
+drops the column. That major ships only after 4.3 has been delivered through the pipeline, the order 3.3 → 4.0
+took.
 
 ### 14.8 Schema
 
@@ -2541,6 +2558,23 @@ reserved there. No `revoked_at` on `web_session`: logging out deletes the row, e
 does (§13). No foreign key from `web_session.username`, because §6.1 sets no `foreign_keys` pragma — the
 constraint would be parsed and never enforced, which is worse than not declaring it, so `delete-user`
 does the cascade by hand and says so.
+
+**Version 4.3** adds the sign-in tokens (§14.7), a minor bump: one table, which a 4.2 binary neither reads
+nor writes. `web_session`'s shape, for `web_session`'s reasons; the key to `web_user` cascades, as every
+binary since 4.0 enforces foreign keys, so deleting a user deletes their token. The index on `username` is what
+issuing (which replaces the user's token) and the cascade look rows up by.
+
+```sql
+CREATE TABLE web_login_token (
+  id          TEXT    PRIMARY KEY,
+  secret_hash BLOB    NOT NULL,
+  username    TEXT    NOT NULL REFERENCES web_user(username) ON DELETE CASCADE,
+  created_at  INTEGER NOT NULL,
+  expires_at  INTEGER NOT NULL
+) STRICT;
+
+CREATE INDEX web_login_token_username_idx ON web_login_token (username);
+```
 
 Sessions are created and deleted on the request path, not through the storage writer: they are single
 statements on their own tables rather than measurement batches, so teaching the writer a second kind of
@@ -2858,10 +2892,10 @@ labels are device-supplied — is as dangerous in a `<title>` as in an element b
 
 ### 14.10 Passkeys
 
-A user can sign in with a password, with passkeys, or with both, and can remove the password once a passkey
-exists. Built in four phases, each deployed and checked on the host before the next: registering passkeys,
-signing in with them, removing the password, and shortening sessions to four hours (§14.2) now that signing in
-is one tap.
+A user signs in with a passkey. Built in four phases, each deployed and checked on the host before the next:
+registering passkeys, signing in with them, removing the password, and shortening sessions to four hours
+(§14.2) now that signing in is one tap. Passwords themselves went in 4.3. A sign-in token (§14.7) now gets a
+user in once on a device with no passkey, to add one.
 
 **A passkey is bound to the host it was registered from.** Each device reaches the UI at its own loopback
 name: a laptop at `localhost:PORT`, the Android app (sashee/iroh-webview-app) at `<label>.localhost:<port>`,
@@ -2916,15 +2950,16 @@ CREATE TABLE web_passkey (
 ```
 
 A passkey is removed only by its owner — the owner is part of the `DELETE`, not a check before it — and with
-its user, by the foreign key. The users page lists how each user signs in (`password, 2 passkeys`).
+its user, by the foreign key. The users page lists how each user signs in (`2 passkeys`, and a waiting sign-in
+token if there is one).
 
 #### Signing in with a passkey
 
-The login page offers **sign in with a passkey** above the password form: one tap, where the password is two
-fields. It is a **discoverable** ceremony — no `allowCredentials`, no username typed — so the authenticator
+The login page offers **sign in with a passkey** above the sign-in token form. It is a **discoverable**
+ceremony — no `allowCredentials`, no username typed — so the authenticator
 offers whichever passkey it holds for the page's host, and the chosen one names its user by its handle. On an
 address passkeys cannot be bound to, the page links to the same login under `localhost` instead, and the
-password form is there either way.
+sign-in token form is there either way.
 
 Finishing it, in order:
 
@@ -2940,12 +2975,10 @@ Finishing it, in order:
    against the one derived for the passkey's owner — so a passkey cannot be presented under someone else's.
 5. `last_used_at` is recorded, with the new dynamic state when verification changed it (the phone app's counter
    stays at zero, so for it this is only ever the timestamp), and a session is established exactly as for a
-   password.
+   sign-in token.
 
-The refusals say what went wrong — removed, another address, expired, not verified — unlike the password form's
-single message. A passkey cannot be guessed, so naming the reason tells an attacker nothing and tells the owner
-what to do. The password form's indistinguishability (§14.3) is unaffected: a refused password re-renders the
-page with a fresh challenge in it, and the two refusals are compared with that masked.
+The refusals say what went wrong — removed, another address, expired, not verified. A passkey cannot be guessed,
+so naming the reason tells an attacker nothing and tells the owner what to do.
 
 Sign-in ceremonies get their own set of 64 slots, twice the registrations', because every visit to the login
 page starts one, including each redirect there from an expired session. Reaching the page at all takes the
@@ -2954,26 +2987,13 @@ only the passkey button.
 
 #### Passkeys only
 
-Once a user has a passkey, the account page can remove their password. From then on the password form refuses
-them like any wrong password, their passkeys sign them in, and the users page and `list-users` say so
-(`1 passkey`; `no password, 1 passkey`).
+The account page could remove a user's password once they had a passkey. That was phase three, and 4.3 then
+removed passwords altogether (§14.7). Removing a password never touched existing sessions: a session does not
+record how it was created.
 
-**Two guards keep a user from locking themselves out**, each checked in the same `BEGIN IMMEDIATE` transaction
-as the change it guards:
-
-- **No password is removed without a passkey.** Nothing would sign the user in afterwards.
-- **No passkey is removed when it is the last one and there is no password**, for the same reason. The page
-  does not render its button, as the users page does not render the last user's delete — and the handler
-  refuses it regardless, since the page may be older than the password's removal.
-
-`IMMEDIATE` because the two are the same hazard from opposite ends. Checked in deferred transactions, removing
-the password and removing the last passkey could each see the other still there, both pass, and together leave
-nothing — so each takes the write lock before it counts.
-
-**The way back is on the host.** There is no form to set a password, as there has never been one to change it
-(§14.3). `set-password` reads one from stdin and replaces whatever the user had, which covers both a lost phone
-and a change of mind. It opens the database without creating it, so a mistyped `--db` fails instead of
-reporting that the user does not exist in a new empty file.
-
-Existing sessions are untouched by either change. A session does not record how it was created, and one made
-with a password is no less the user's than one made with a passkey; ending sessions is the sessions page's job.
+**The last passkey stays.** It is a user's only way in from the page, so its button is not rendered, as the
+users page does not render the last user's delete. The handler refuses it regardless, in a `BEGIN IMMEDIATE`
+transaction with the delete: checked in deferred ones, two requests removing a user's last two passkeys could
+each see the other remaining, and together leave none. With sign-in tokens it is a convenience rather than the
+only thing between a user and a lockout. `create-login-token` on the host is always a way back. It is kept
+because needing a shell to undo one click is a poor trade.

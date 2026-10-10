@@ -6,7 +6,7 @@ use monitoring_platform::config::{
     ApiKeyArgs, Cli, Command, CreateApiKeyArgs, CreateUserArgs, DeleteUserArgs, ServeArgs,
 };
 use monitoring_platform::{
-    AppState, Config, api, auth, clock, now_unix_nanos, store, transport,
+    AppState, Config, api, auth, clock, now_unix_nanos, store, transport, web,
 };
 use tracing_subscriber::EnvFilter;
 
@@ -37,9 +37,9 @@ fn main() -> Result<()> {
             init_tracing_on_stderr(&args.common.log_level);
             create_user(&args)
         }
-        Command::SetPassword(args) => {
+        Command::CreateLoginToken(args) => {
             init_tracing_on_stderr(&args.common.log_level);
-            set_password(&args)
+            create_login_token(&args)
         }
         Command::ListUsers(args) => {
             init_tracing_on_stderr(&args.log_level);
@@ -102,10 +102,10 @@ fn create_api_key(args: &CreateApiKeyArgs) -> Result<()> {
 }
 
 
-/// Creates a web interface user (SPEC §14).
+/// Creates a web interface user (SPEC §14), and prints a sign-in token for them.
 ///
 /// `open_write` rather than `open_read` for the same reason `create_api_key` uses it: on a receiver upgraded
-/// but not yet restarted, this is what applies the 3.1 migration that creates the table.
+/// but not yet restarted, this is what applies the migrations that create the tables.
 fn create_user(args: &CreateUserArgs) -> Result<()> {
     let path = args.common.database_path();
 
@@ -120,85 +120,64 @@ fn create_user(args: &CreateUserArgs) -> Result<()> {
         );
     }
 
-    let password = read_password()?;
-
     let conn = store::open_write(&path)?;
-    store::users::insert(&conn, &args.username, &auth::hash_password(&password), now_unix_nanos())?;
-
-    // stderr, not stdout: unlike a token, there is nothing here worth capturing into a variable, and the
-    // command's whole output being diagnostic keeps it consistent with the key commands' split.
+    let now = now_unix_nanos();
+    store::users::insert(&conn, &args.username, now)?;
     eprintln!("stored user {:?} in {}", args.username, path.display());
-    Ok(())
+
+    print_login_token(&conn, &args.username, now, &path)
 }
 
-/// Sets an existing user's password, from stdin: the way back in when passkeys are lost (SPEC §14.10).
+/// Issues a sign-in token for an existing user (SPEC §14.7): the way in on a device with no passkey.
 ///
-/// `open_write_existing`, not `open_write`: there is a user to change, so there is a database, and a mistyped
-/// `--db` should fail here rather than create an empty one and report that the user does not exist in it.
-fn set_password(args: &CreateUserArgs) -> Result<()> {
+/// Refuses a `--db` with no file behind it rather than create an empty database and report that the user is
+/// not in it. `open_write` once it exists, not `open_write_existing`: on a receiver upgraded but not yet
+/// restarted, the table the token goes in is created by the migration this applies.
+fn create_login_token(args: &CreateUserArgs) -> Result<()> {
     let path = args.common.database_path();
-    let password = read_password()?;
-    let conn = store::open_write_existing(&path)?;
-    if !store::users::set_password(&conn, &args.username, &auth::hash_password(&password))? {
-        anyhow::bail!("no user {:?} in {}", args.username, path.display());
+    if !path.exists() {
+        anyhow::bail!("no database at {}; check --db or STATE_DIRECTORY", path.display());
     }
-    eprintln!("set the password of user {:?} in {}", args.username, path.display());
-    Ok(())
+    let conn = store::open_write(&path)?;
+    print_login_token(&conn, &args.username, now_unix_nanos(), &path)
 }
 
-/// The password, from stdin.
-///
-/// **Never from argv**, for the reason on `Command::CreateUser`. Not from an environment variable either:
-/// `/proc/<pid>/environ` is readable by the same processes, and an exported variable outlives the command.
-///
-/// No terminal echo suppression, deliberately: that needs `termios` handling — a raw-mode dance with a
-/// restore-on-signal path to avoid leaving the operator's shell echo-less after a Ctrl-C — for a command run
-/// once per host. Piping is the documented usage precisely so the password need not be typed where it can be
-/// seen:
-///
-/// ```sh
-/// printf %s "$PASSWORD" | monitoring-platform create-user --username sashee
-/// ```
-///
-/// The prompt goes to stderr so it is visible even when stdout is redirected.
-fn read_password() -> Result<String> {
-    use std::io::{BufRead, IsTerminal};
-
-    let stdin = std::io::stdin();
-    if stdin.is_terminal() {
-        eprint!("password (will be visible as you type): ");
-    }
-
-    let mut password = String::new();
-    stdin.lock().read_line(&mut password).context("reading the password from stdin")?;
-    if stdin.is_terminal() {
-        eprintln!();
-    }
-
-    // Only the line ending is stripped, and only from the end. A password may legitimately begin or end with
-    // a space, and `trim()` would quietly store something other than what was supplied — unrecoverably, since
-    // only the hash is kept.
-    let password = password.strip_suffix('\n').unwrap_or(&password);
-    let password = password.strip_suffix('\r').unwrap_or(password);
-
-    if password.is_empty() {
-        anyhow::bail!(
-            "the password was empty. Pipe one in, e.g. \
-             `printf %s \"$PASSWORD\" | monitoring-platform create-user --username <name>`"
-        );
-    }
-    Ok(password.to_owned())
+/// Issues a token for `username` and prints it — to stdout, and nothing else there, as `create-api-key`
+/// prints a key: this is the only time it exists anywhere, and a `tracing` line would put it wherever the
+/// journal goes.
+fn print_login_token(
+    conn: &rusqlite::Connection,
+    username: &str,
+    now: i64,
+    path: &std::path::Path,
+) -> Result<()> {
+    let Some(issued) = web::login_token::issue(conn, username, now)? else {
+        anyhow::bail!("no user {username:?} in {}", path.display());
+    };
+    println!("{}", issued.token.to_secret_string());
+    // stderr, so redirecting stdout to a file captures the token alone.
+    eprintln!(
+        "the sign-in token above signs {username:?} in once, until {}; paste it into the login page",
+        api::query::format_nanos(issued.expires_at)
+    );
+    Ok(())
 }
 
 fn list_users(args: &ApiKeyArgs) -> Result<()> {
     let conn = store::open_read(&args.database_path())?;
     let passkeys = store::passkeys::counts(&conn)?;
+    let tokens = store::login_tokens::list(&conn)?;
+    let now = now_unix_nanos();
     for user in store::users::list(&conn)? {
-        // How each user signs in, so a recovery starts by seeing who has no password.
+        // How each user signs in, so a recovery starts by seeing who has no passkey.
         let passkeys = passkeys.get(&user.username).copied().unwrap_or(0);
-        let password = if user.has_password { "password" } else { "no password" };
+        let token = tokens
+            .iter()
+            .find(|t| t.username == user.username && t.is_live(now))
+            .map(|t| format!(", a sign-in token until {}", api::query::format_nanos(t.expires_at)))
+            .unwrap_or_default();
         println!(
-            "{}  {}  {password}, {passkeys} passkey{}",
+            "{}  {}  {passkeys} passkey{}{token}",
             api::query::format_nanos(user.created_at),
             user.username,
             if passkeys == 1 { "" } else { "s" }

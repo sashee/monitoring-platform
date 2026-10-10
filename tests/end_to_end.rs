@@ -474,65 +474,59 @@ fn starts_against_a_newer_minor_schema() {
     assert_eq!(stored, future.encode());
 }
 
-/// Runs the CLI with `stdin` piped in, as its documentation tells an operator to.
-fn cli_with_stdin(args: &[&str], db: &Path, stdin: &str) -> std::process::Output {
-    let mut child = Command::new(env!("CARGO_BIN_EXE_monitoring-platform"))
-        .args(args)
-        .arg("--db")
-        .arg(db)
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-        .unwrap();
-    child.stdin.take().unwrap().write_all(stdin.as_bytes()).unwrap();
-    child.wait_with_output().unwrap()
+/// Runs the CLI against `db`.
+fn cli(args: &[&str], db: &Path) -> std::process::Output {
+    Command::new(env!("CARGO_BIN_EXE_monitoring-platform")).args(args).arg("--db").arg(db).output().unwrap()
 }
 
-/// SPEC §14.10: **`set-password` is the way back in.** A user who removed their password — and then lost
-/// their passkeys — gets one again from the host, read from stdin like `create-user`'s; `list-users` shows
-/// who has none; and a user that does not exist is an error rather than a quiet success.
+/// SPEC §14.7: **the host is the way in.** `create-user` prints a sign-in token, `create-login-token` prints
+/// another — to stdout alone, so it can be captured — that replaces the first; both are tokens the store
+/// redeems; `list-users` shows the one waiting; and a user or database that does not exist is an error
+/// rather than a quiet success.
 #[test]
-fn set_password_gives_a_user_a_password_back() {
+fn the_cli_issues_sign_in_tokens() {
     use monitoring_platform::{auth, store};
 
     let dir = tempfile::tempdir().unwrap();
     let db = dir.path().join("mp.db");
-    let created = cli_with_stdin(&["create-user", "--username", "sashee"], &db, "first-password");
+    let created = cli(&["create-user", "--username", "sashee"], &db);
     assert!(created.status.success(), "{}", String::from_utf8_lossy(&created.stderr));
+    let first = String::from_utf8(created.stdout).unwrap();
+    assert!(first.starts_with("mpl_") && first.ends_with('\n') && first.lines().count() == 1, "{first:?}");
 
-    // As the account page leaves it: a passkey, and no password.
-    {
-        let conn = store::open_write(&db).unwrap();
-        let passkey = store::passkeys::NewPasskey {
-            credential_id: vec![1; 16],
-            rp_id: "localhost".into(),
-            static_state: vec![1],
-            dynamic_state: vec![2],
-        };
-        store::passkeys::insert(&conn, "sashee", &passkey, "phone", 1).unwrap();
-        store::users::remove_password(&conn, "sashee").unwrap();
-    }
-    let listed = Command::new(env!("CARGO_BIN_EXE_monitoring-platform"))
-        .args(["list-users", "--db"])
-        .arg(&db)
-        .output()
-        .unwrap();
+    let issued = cli(&["create-login-token", "--username", "sashee"], &db);
+    assert!(issued.status.success(), "{}", String::from_utf8_lossy(&issued.stderr));
+    let second = String::from_utf8(issued.stdout).unwrap();
+    assert!(String::from_utf8_lossy(&issued.stderr).contains("signs \"sashee\" in once"));
+
+    let listed = cli(&["list-users"], &db);
     let listed = String::from_utf8_lossy(&listed.stdout);
-    assert!(listed.contains("sashee  no password, 1 passkey"), "{listed}");
+    assert!(listed.contains("sashee  0 passkeys, a sign-in token until "), "{listed}");
 
-    let set = cli_with_stdin(&["set-password", "--username", "sashee"], &db, "second-password\n");
-    assert!(set.status.success(), "{}", String::from_utf8_lossy(&set.stderr));
-    let conn = store::open_read(&db).unwrap();
-    assert_eq!(
-        store::users::password_hash(&conn, "sashee").unwrap(),
-        Some(auth::hash_password("second-password")),
-        "the new password, without its line ending"
-    );
+    let conn = store::open_write_existing(&db).unwrap();
+    let redeem = |printed: &str, seed: u8| {
+        let token = auth::parse_login_token(printed).unwrap();
+        let session = auth::SessionToken::from_random(&[seed; auth::TOKEN_BYTES]);
+        let new = store::login_tokens::NewSession {
+            id: session.id(),
+            secret_hash: session.secret_hash(),
+            expires_at: i64::MAX,
+        };
+        store::login_tokens::redeem(&conn, token.id(), &token.secret_hash(), monitoring_platform::now_unix_nanos(), new)
+            .unwrap()
+    };
+    assert_eq!(redeem(&first, 1), store::login_tokens::Redemption::Unknown, "replaced by the second");
+    assert_eq!(redeem(&second, 2), store::login_tokens::Redemption::SignedIn { username: "sashee".into() });
 
-    let unknown = cli_with_stdin(&["set-password", "--username", "nobody"], &db, "x");
+    let unknown = cli(&["create-login-token", "--username", "nobody"], &db);
     assert!(!unknown.status.success());
     assert!(String::from_utf8_lossy(&unknown.stderr).contains("no user \"nobody\""));
+    assert!(unknown.stdout.is_empty(), "no token for nobody");
+
+    let missing = dir.path().join("typo.db");
+    let typo = cli(&["create-login-token", "--username", "sashee"], &missing);
+    assert!(!typo.status.success());
+    assert!(!missing.exists(), "a mistyped --db must not create a database");
 }
 
 /// SPEC §14.2: **a shorter session lifetime holds from the first start**, not weeks later. A session issued
@@ -550,7 +544,7 @@ fn sessions_from_a_longer_lifetime_are_cut_at_startup() {
     let created = T;
     {
         let conn = store::open_write(&db).unwrap();
-        store::users::insert(&conn, "sashee", &auth::hash_password("pw"), T).unwrap();
+        store::users::insert(&conn, "sashee", T).unwrap();
         let thirty_days = 30 * 24 * 60 * 60 * 1_000_000_000;
         store::sessions::insert(&conn, token.id(), &token.secret_hash(), "sashee", created, created + thirty_days)
             .unwrap();

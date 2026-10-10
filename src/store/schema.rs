@@ -81,7 +81,7 @@ impl std::fmt::Display for Version {
 }
 
 /// Schema version this binary understands. Tracked in `PRAGMA user_version`.
-pub const SCHEMA_VERSION: Version = Version::new(4, 2);
+pub const SCHEMA_VERSION: Version = Version::new(4, 3);
 
 /// A compile-time guard, not a test, because it is an invariant about a constant and a build is the right
 /// place to lose an argument with one.
@@ -514,6 +514,35 @@ const MIGRATIONS: &[Migration] = &[
 
     CREATE UNIQUE INDEX measurement_event_time_idx        ON measurement (event_time, id);
     CREATE INDEX        measurement_series_event_time_idx ON measurement (series_id, event_time, id);
+    "#,
+    },
+    // → version 4.3: one-time sign-in tokens replace passwords (SPEC §14.7).
+    //
+    // **A minor bump.** One new table, which a 4.2 binary neither reads nor writes: reverted to it, an unused
+    // token simply never works, and passkeys sign in exactly as before. Nothing else changes, and in
+    // particular `web_user.password_hash` stays: this binary no longer reads it and writes it only as the
+    // empty "no password" value its `NOT NULL` demands. Dropping it is a rebuild and so a major, left for
+    // after this version has been delivered — the same order 3.3 → 4.0 took.
+    //
+    // `web_session`'s shape, for `web_session`'s reasons: `id` is the public half verbatim, `secret_hash` the
+    // only record of the secret. The key to `web_user` cascades, so deleting a user takes their token with it
+    // in every binary, since all of them run with foreign keys on (4.0).
+    //
+    // One token per user is the store's rule (`store::login_tokens::issue`), not a constraint: issuing
+    // replaces, but a `UNIQUE (username)` here would be a decision only a major could take back. The index on
+    // `username` is what that replacement and the cascade look rows up by.
+    Migration {
+        version: Version::new(4, 3),
+        sql: r#"
+    CREATE TABLE web_login_token (
+      id          TEXT    PRIMARY KEY,
+      secret_hash BLOB    NOT NULL,
+      username    TEXT    NOT NULL REFERENCES web_user(username) ON DELETE CASCADE,
+      created_at  INTEGER NOT NULL,
+      expires_at  INTEGER NOT NULL
+    ) STRICT;
+
+    CREATE INDEX web_login_token_username_idx ON web_login_token (username);
     "#,
     },
 ];
@@ -1189,7 +1218,7 @@ mod tests {
 
         migrate(&conn).unwrap();
 
-        assert_eq!(stored_version(&conn), Version::new(4, 2).encode());
+        assert_eq!(stored_version(&conn), SCHEMA_VERSION.encode());
         assert_eq!(rows(&conn), before);
         let fresh = Connection::open_in_memory().unwrap();
         migrate(&fresh).unwrap();
@@ -1217,5 +1246,43 @@ mod tests {
             .query_row("SELECT processed_time FROM measurement WHERE id = x'6d31'", [], |r| r.get(0))
             .unwrap();
         assert_eq!(pt, 100, "first arrival wins");
+    }
+
+    // ------------------------------------------------------------------------------- 4.3
+
+    /// **A reverted 4.2 binary still works against 4.3**, which is what makes it a minor: everything it
+    /// writes about users and sessions it writes as before — a password included, which this binary then
+    /// ignores — and deleting a user still takes their token, through the cascade.
+    #[test]
+    fn a_4_2_binarys_user_writes_still_work_against_4_3() {
+        let conn = Connection::open_in_memory().unwrap();
+        for migration in MIGRATIONS.iter().filter(|m| m.version <= Version::new(4, 2)) {
+            conn.execute_batch(migration.sql).unwrap();
+        }
+        conn.pragma_update(None, "user_version", Version::new(4, 2).encode()).unwrap();
+        migrate(&conn).unwrap();
+        assert_eq!(stored_version(&conn), Version::new(4, 3).encode());
+
+        conn.execute(
+            "INSERT INTO web_user (username, password_hash, created_at) VALUES ('op', ?1, 1)",
+            [&[7u8; 32][..]],
+        )
+        .expect("4.2's create-user");
+        conn.execute(
+            "INSERT INTO web_session (id, secret_hash, username, created_at, expires_at) \
+             VALUES ('0000000000000001', x'00', 'op', 1, 2)",
+            [],
+        )
+        .expect("4.2's login");
+        conn.execute(
+            "INSERT INTO web_login_token (id, secret_hash, username, created_at, expires_at) \
+             VALUES ('0000000000000002', x'00', 'op', 1, 2)",
+            [],
+        )
+        .unwrap();
+
+        conn.execute("DELETE FROM web_user WHERE username = 'op'", []).expect("4.2's delete-user");
+        let tokens: i64 = conn.query_row("SELECT count(*) FROM web_login_token", [], |r| r.get(0)).unwrap();
+        assert_eq!(tokens, 0, "the cascade takes the token with its user");
     }
 }

@@ -211,14 +211,19 @@ pub fn page(title: &str, current_path: &str, content: &str) -> String {
 const DOCTYPE: &str = "<!doctype html>\n<html lang=\"en\">\n<meta charset=\"utf-8\">\n\
 <meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">\n";
 
-/// The login form. Deliberately shares nothing with [`page`]: it has no nav, because every link in it
-/// leads somewhere that would bounce straight back here, and no logout button for the same reason.
+/// The login page. Deliberately shares nothing with [`page`]: it has no nav, because every link in it leads
+/// somewhere that would bounce straight back here, and no logout button for the same reason.
+///
+/// `passkey` is the passkey section, already rendered (`web::passkey_page`), or empty when there is none to
+/// offer. It goes first: it is how a user signs in, where the token form below it is how they get in once to
+/// add a passkey (SPEC §14.7).
 ///
 /// `error` is rendered when a previous attempt failed. It is a fixed string chosen by the caller, never
-/// anything the request supplied — see [`super::login`] for why the message is identical for every way a
-/// login can fail.
-/// The login page. `passkey` is the passkey section, already rendered (`web::passkey_page`), or empty when
-/// there is none to offer — it goes first, since it is one tap where the password is two fields.
+/// anything the request supplied.
+///
+/// The token field is plain text, not `type="password"`: it is pasted, not typed, and a field that hid it
+/// would only hide a paste that went wrong. `autocomplete="off"`, so no browser offers to remember a
+/// credential that will not work twice.
 pub fn login(error: Option<&str>, passkey: &str) -> String {
     let message = match error {
         Some(text) => format!("<p class=\"error\">{}</p>\n", escape(text)),
@@ -229,11 +234,25 @@ pub fn login(error: Option<&str>, passkey: &str) -> String {
         "{}<title>log in — monitoring platform</title>\n<style>{}</style>\n\
          <h1>monitoring platform</h1>\n{}{}\
          <form class=\"login\" method=\"post\" action=\"/login\">\n\
-         <label>username<input name=\"username\" autocomplete=\"username\" autofocus required></label>\n\
-         <label>password<input name=\"password\" type=\"password\" autocomplete=\"current-password\" required></label>\n\
-         <button type=\"submit\">log in</button>\n\
-         </form>\n",
+         <label>sign-in token<input name=\"token\" autocomplete=\"off\" autocapitalize=\"off\" \
+         spellcheck=\"false\" placeholder=\"mpl_…\" required></label>\n\
+         <button type=\"submit\">sign in once</button>\n\
+         </form>\n\
+         <p class=\"note\">No passkey on this device yet? A sign-in token lets you in once, to add one. \
+         Issue it from the account page on a device that is signed in, or with create-login-token on the \
+         host.</p>\n",
         DOCTYPE, STYLE, message, passkey
+    )
+}
+
+/// A secret shown the one time it exists — a new API key or sign-in token — with `lead` saying what it is.
+///
+/// Marked as such, because the reader has one chance: only its hash is stored.
+pub fn issued(secret: &str, lead: &str) -> String {
+    format!(
+        "<p class=\"issued\"><strong>{}</strong><br><code>{}</code></p>\n",
+        escape(lead),
+        escape(secret)
     )
 }
 
@@ -535,16 +554,12 @@ pub fn post_button(action: &str, field: &str, value: &str, label: &str, class: &
     )
 }
 
-/// The create-user form.
-///
-/// `autocomplete="new-password"` so a browser offers to generate one rather than filling in the
-/// operator's own — the premise of the fast hash (SPEC §14.7) is that these are high-entropy, and a
-/// password manager is the realistic way that happens.
+/// The create-user form. A username and nothing else: the new user's way in is the sign-in token shown once
+/// the user exists (SPEC §14.7).
 pub fn create_user_form() -> String {
     "<h2>add a user</h2>\n\
      <form method=\"post\" action=\"/users/create\" class=\"filters\">\
      <label>username<input name=\"username\" autocomplete=\"off\" required></label>\
-     <label>password<input name=\"password\" type=\"password\" autocomplete=\"new-password\" required></label>\
      <button type=\"submit\" class=\"go\">create</button>\
      </form>\n"
         .to_owned()

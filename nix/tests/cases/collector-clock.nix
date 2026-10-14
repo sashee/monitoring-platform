@@ -200,24 +200,40 @@
             ).strip()
             return json.loads(out) if out else None
 
+        accepted = {}
+
         def post_recovery_health(_last_try):
             # Both halves, or this waits for the wrong thing. Polling for *a* health row is not
-            # enough — several are emitted before the step above, and the first to land naturally
-            # reports zero steps. Neither is polling for a step: emission is gated on
-            # ever_synchronized rather than on the clock being good right now, so the reading
-            # taken inside the 2019 window is a legitimate row that already carries the step
-            # count, and stopping there leaves the assertions below reading a snapshot from a
-            # moment when the clock was known-bad.
+            # enough — several are emitted before the step above. Neither is polling for a step:
+            # emission is gated on ever_synchronized rather than on the clock being good right
+            # now, so the reading taken inside the 2019 window is a legitimate row that already
+            # carries the step count, and stopping there leaves the assertions below reading a
+            # snapshot from a moment when the clock was known-bad.
+            #
+            # Relative to `before`, not a fixed 1: "NTP arrives" may already have stepped the
+            # clock, so a row from before the 2019 step can carry steps >= 1 and disciplined —
+            # which is how this once passed on its first poll without waiting for anything. +2 is
+            # the 2019 step plus at least one step back to real time by the time daemon.
+            #
+            # And `disciplined` is the collector's last clock poll, not a live read: a step sets
+            # the kernel unsynchronized, and once settled the collector polls only on a step or
+            # once a minute, so it reports False for up to a minute after the daemon has already
+            # disciplined the clock again. Hence waited for rather than assumed.
             reported = latest_health()
-            return (
+            ok = (
                 reported is not None
-                and reported["clock.steps"] >= 1
+                and reported["clock.steps"] >= before + 2
                 and reported["clock.disciplined"] is True
             )
+            if ok:
+                accepted["row"] = reported
+            return ok
 
-        retry(post_recovery_health, timeout_seconds=120)
+        retry(post_recovery_health, timeout_seconds=180)
 
-        reported = latest_health()
+        # The row the predicate accepted, not a fresh read: a later emission can land before the
+        # collector's next clock poll and still report the step's unsynchronized state.
+        reported = accepted["row"]
         assert reported["clock.disciplined"] is True, f"NTP is up by now: {reported}"
         assert reported["clock.seconds_since_last_step"] != [None], (
             f"a step has happened, so this is no longer null: {reported}"

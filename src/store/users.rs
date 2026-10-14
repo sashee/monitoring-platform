@@ -13,18 +13,10 @@ pub struct StoredUser {
     pub created_at: i64,
 }
 
-/// What every user stores in `password_hash` (SPEC §14.7): nothing.
-///
-/// The column is a leftover of passwords, which 4.3 replaced with sign-in tokens. Nothing reads it any more,
-/// but it is `NOT NULL` with no default, and dropping it or giving it one is a rebuild and so a major (§6.2).
-/// An empty blob is what every binary since 3.1 reads as "no password", so one the nightly upgrade reverts to
-/// refuses password logins for a user created here rather than failing on them.
-const NO_PASSWORD: &[u8] = &[];
-
 pub fn insert(conn: &Connection, username: &str, created_at: i64) -> Result<()> {
     conn.execute(
-        "INSERT INTO web_user (username, password_hash, created_at) VALUES (?1, ?2, ?3)",
-        rusqlite::params![username, NO_PASSWORD, created_at],
+        "INSERT INTO web_user (username, created_at) VALUES (?1, ?2)",
+        rusqlite::params![username, created_at],
     )
     .with_context(|| format!("storing web user {username:?}"))?;
     Ok(())
@@ -88,16 +80,10 @@ mod tests {
         conn
     }
 
-    /// A user is stored with no password: the column holds the empty value every binary reads as none.
     #[test]
-    fn a_user_is_stored_without_a_password() {
+    fn a_stored_user_is_listed() {
         let conn = db();
         insert(&conn, "sashee", 1_000).unwrap();
-
-        let stored: Vec<u8> = conn
-            .query_row("SELECT password_hash FROM web_user WHERE username = 'sashee'", [], |r| r.get(0))
-            .unwrap();
-        assert!(stored.is_empty());
         assert_eq!(list(&conn).unwrap(), vec![StoredUser { username: "sashee".into(), created_at: 1_000 }]);
     }
 

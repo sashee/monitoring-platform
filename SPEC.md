@@ -182,7 +182,7 @@ over data that will never be accepted.
 
 ### 4.4 Record rejection
 
-A `LogRecord` is rejected — skipped, counted in `partial_success`, and logged at `warn` — when:
+A `LogRecord` is rejected — skipped, counted in `partial_success`, and logged — when:
 
 - `event_name` is empty. `type` has no other source; a measurement without a type is not storable.
 - `time_unix_nano` **and** `observed_time_unix_nano` are both zero. OTLP requires
@@ -192,6 +192,10 @@ A `LogRecord` is rejected — skipped, counted in `partial_success`, and logged 
 Both rejections have the same shape: a required value is absent and the platform will not fabricate
 one. Everything else is accepted — unknown attribute value shapes and absent bodies are handled by
 the mapping rules in §5 rather than rejected.
+
+The `warn` is one line per batch, carrying the count for each reason; each record's reason is at
+`debug`. A producer that gets one field wrong gets it wrong on every record, so a line per record
+would scale the journal with its traffic. A batch with no rejections is logged at `debug`.
 
 **`event_name` is `[Optional]` in OTLP, not required.** The proto documents it as "a unique
 identifier of event category/type… presence of `event_name` on the log record identifies this

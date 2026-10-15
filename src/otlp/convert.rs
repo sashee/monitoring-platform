@@ -49,7 +49,7 @@ pub fn to_measurements(
                 match convert_record(record, &base_attrs, processed_time) {
                     Ok(m) => out.push(m),
                     Err(reason) => {
-                        tracing::warn!(reason = reason.as_str(), "rejecting log record");
+                        tracing::debug!(reason = reason.as_str(), "rejecting log record");
                         match reason {
                             Reason::MissingEventName => rejections.missing_event_name += 1,
                             Reason::MissingTimestamp => rejections.missing_timestamp += 1,

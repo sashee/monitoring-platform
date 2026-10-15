@@ -63,10 +63,17 @@ pub async fn handler(
             .map_err(|e| IngestError::unavailable(format!("storage write failed: {e}")))?;
     }
 
+    // A clean batch is `debug`: one line per request would drown the journal on a busy host. A batch
+    // with rejections is the `warn` of SPEC §4.4, once per batch rather than once per record.
     if rejections.is_empty() {
-        tracing::info!(accepted, "ingested batch");
+        tracing::debug!(accepted, "ingested batch");
     } else {
-        tracing::info!(accepted, rejected = rejections.total(), "ingested batch with rejections");
+        tracing::warn!(
+            accepted,
+            missing_event_name = rejections.missing_event_name,
+            missing_timestamp = rejections.missing_timestamp,
+            "ingested batch with rejections"
+        );
     }
 
     // Partial success is reported on a 200 even when every record was rejected: that is what OTLP

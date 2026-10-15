@@ -615,14 +615,16 @@ impl FlushTask {
         // until something is spilled again.
         state.spool_dirty = false;
 
-        // The bound. Shedding is counted and logged, never silent.
-        while state.outbox.len() > self.config.buffer_max_records {
-            state.outbox.pop_front();
-            state.totals.shed_batches += 1;
-        }
-        if state.totals.shed_batches > 0 {
+        // The bound. Shedding is counted and logged, never silent. Logged only for the cycles that
+        // actually shed: the running total never goes down, so testing it would repeat the error on
+        // every cycle for the rest of the process's life.
+        let excess = state.outbox.len().saturating_sub(self.config.buffer_max_records);
+        state.outbox.drain(..excess);
+        state.totals.shed_batches += excess as u64;
+        if excess > 0 {
             tracing::error!(
-                shed = state.totals.shed_batches,
+                shed = excess,
+                total_shed = state.totals.shed_batches,
                 "the outbox is full and the receiver is not accepting; batches are being dropped"
             );
         }

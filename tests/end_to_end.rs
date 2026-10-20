@@ -10,6 +10,7 @@ use opentelemetry_proto::tonic::collector::logs::v1::{
     ExportLogsPartialSuccess, ExportLogsServiceResponse,
 };
 use prost::Message;
+use rustix::process::{Pid, Signal, kill_process};
 use std::io::{Read, Write};
 use std::os::unix::net::UnixStream;
 use std::path::Path;
@@ -138,7 +139,7 @@ impl Server {
 
     /// Sends SIGTERM and waits for exit, returning whether it exited successfully.
     fn terminate(&mut self) -> bool {
-        unsafe { libc::kill(self.child.id() as i32, libc::SIGTERM) };
+        kill_process(Pid::from_child(&self.child), Signal::TERM).expect("sending SIGTERM");
         // Same budget as readiness, and for the same reason: the graceful path drains the storage
         // writer and checkpoints the WAL, so it ends in an fsync too.
         let deadline = Instant::now() + budget();

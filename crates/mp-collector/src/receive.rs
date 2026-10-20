@@ -123,9 +123,7 @@ async fn ingest(
 
     // Sampled here, as late as possible before resolution and as close as possible to the moment
     // the bytes arrived. This is the upper bound of the `[sender_started, received]` window.
-    let received = mp_host::clock::now_boottime().map_err(|e| {
-        Error::new(StatusCode::INTERNAL_SERVER_ERROR, format!("cannot read CLOCK_BOOTTIME: {e}"))
-    })?;
+    let received = mp_host::clock::now_boottime();
 
     let table = state.handle.table();
     let tally = resolve_request(&mut request, &table, Receipt {

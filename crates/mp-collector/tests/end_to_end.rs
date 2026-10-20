@@ -222,7 +222,7 @@ impl Collector {
                 .expect("seeding the epoch table");
         }
 
-        let before_spawn = mp_host::clock::now_boottime().unwrap();
+        let before_spawn = mp_host::clock::now_boottime();
         let child = Command::new(env!("CARGO_BIN_EXE_mp-collector"))
             .arg("--socket")
             .arg(&socket)
@@ -315,7 +315,7 @@ fn now_realtime() -> i64 {
 
 /// The offset this host is actually running with.
 fn true_offset() -> i64 {
-    mp_host::clock::sample().unwrap().offset()
+    mp_host::clock::sample().offset()
 }
 
 fn batch(event_name: &str, time: i64, attributes: Vec<KeyValue>) -> ExportLogsServiceRequest {

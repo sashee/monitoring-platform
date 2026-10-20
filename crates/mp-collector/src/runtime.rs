@@ -204,7 +204,7 @@ pub fn choose_initial_table(
 
 /// Gathers the three inputs and hands them to [`choose_initial_table`].
 fn initial_table(config: &Config, boot_id: &str) -> Result<EpochTable> {
-    let now = mp_host::clock::sample().context("sampling the clocks at startup")?;
+    let now = mp_host::clock::sample();
     let persisted = state::load(&config.epochs_path(), boot_id);
 
     let backfilled = match (persisted.is_some(), config.journal_backfill) {
@@ -235,7 +235,7 @@ fn initial_table(config: &Config, boot_id: &str) -> Result<EpochTable> {
 /// is being served yet.
 fn backfill(config: &Config, boot_id: &str) -> Result<Vec<Epoch>> {
     let entries = crate::journal::read_this_boot()?;
-    let suspended = mp_host::clock::suspended_nanos().context("reading the suspend offset")?;
+    let suspended = mp_host::clock::suspended_nanos();
     Ok(crate::journal::epochs(
         &entries,
         boot_id,
@@ -304,7 +304,7 @@ impl ClockTask {
             tokio::select! {
                 stepped = watch_fd.stepped() => {
                     stepped?;
-                    self.on_step()?;
+                    self.on_step();
                     // The first correction on a clockless Pi usually exceeds chrony's `makestep`
                     // threshold and arrives as a step, so checking here is what resolves the
                     // common case without waiting for the next poll.
@@ -323,8 +323,8 @@ impl ClockTask {
         }
     }
 
-    fn on_step(&self) -> Result<()> {
-        let now = mp_host::clock::sample().context("sampling the clocks after a step")?;
+    fn on_step(&self) {
+        let now = mp_host::clock::sample();
         self.tx.send_modify(|state| {
             state.steps += 1;
             state.last_step = Some(now.boottime);
@@ -342,7 +342,6 @@ impl ClockTask {
             "clock stepped"
         );
         self.persist(&table);
-        Ok(())
     }
 
     fn on_poll(&self, streak: u32) -> Result<u32> {
@@ -357,7 +356,7 @@ impl ClockTask {
         // A boundary the step watch did not report — a step during the collector's own downtime,
         // or a timerfd that failed to re-arm. Slewing cannot move this quantity, so any
         // disagreement at all is a genuine discontinuity.
-        let now = mp_host::clock::sample().context("sampling the clocks")?;
+        let now = mp_host::clock::sample();
         let missed = self
             .tx
             .borrow()
@@ -503,7 +502,7 @@ impl FlushTask {
         if !clock.ever_synchronized {
             return;
         }
-        let Ok(now) = mp_host::clock::sample() else { return };
+        let now = mp_host::clock::sample();
 
         state.outbox.push_back(metrics::to_request(
             Health {
@@ -529,7 +528,7 @@ impl FlushTask {
     }
 
     async fn cycle(&self, state: &mut InFlight, forwarder: &mut Forwarder) {
-        let now = mp_host::clock::now_boottime().unwrap_or(0);
+        let now = mp_host::clock::now_boottime();
         let clock = self.clock.borrow().clone();
         let waited = state
             .holding_since

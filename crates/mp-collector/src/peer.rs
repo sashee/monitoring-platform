@@ -28,18 +28,19 @@ pub fn starttime_ticks(stat: &str) -> Option<u64> {
 /// `u128` intermediate on purpose: at the usual 100 Hz, `ticks * 1_000_000_000` overflows `u64`
 /// after about five and a half years of uptime, and a Raspberry Pi left running is exactly the
 /// host this code exists for.
-pub fn ticks_to_nanos(ticks: u64, ticks_per_second: i64) -> Option<i64> {
-    let per_second = u128::try_from(ticks_per_second).ok().filter(|n| *n > 0)?;
-    i64::try_from(u128::from(ticks) * 1_000_000_000 / per_second).ok()
+pub fn ticks_to_nanos(ticks: u64, ticks_per_second: u64) -> Option<i64> {
+    let nanos = (u128::from(ticks) * 1_000_000_000).checked_div(u128::from(ticks_per_second))?;
+    i64::try_from(nanos).ok()
 }
 
 /// `sysconf(_SC_CLK_TCK)`: the unit `/proc/PID/stat` counts in. Practically always 100.
-pub fn ticks_per_second() -> Result<i64> {
-    // SAFETY: `sysconf` reads a compile-time constant out of the C library and touches no memory
-    // this side owns.
-    let n = unsafe { libc::sysconf(libc::_SC_CLK_TCK) };
-    if n <= 0 {
-        return Err(anyhow!("sysconf(_SC_CLK_TCK) returned {n}; cannot convert process start times"));
+///
+/// rustix reads it from the `AT_CLKTCK` auxiliary-vector entry, the same source glibc's `sysconf`
+/// uses; a kernel that omitted the entry would leave it 0 here.
+pub fn ticks_per_second() -> Result<u64> {
+    let n = rustix::param::clock_ticks_per_second();
+    if n == 0 {
+        return Err(anyhow!("AT_CLKTCK is 0; cannot convert process start times"));
     }
     Ok(n)
 }
@@ -56,7 +57,7 @@ pub fn ticks_per_second() -> Result<i64> {
 /// *later*, so the bound comes out too tight and the record resolves to `Passthrough` — untouched
 /// and counted. The failure mode is already fail-safe, so a `uid` cross-check would buy nothing
 /// but a second syscall.
-pub fn started_at(pid: u32, ticks_per_second: i64) -> Result<i64> {
+pub fn started_at(pid: u32, ticks_per_second: u64) -> Result<i64> {
     let path = format!("/proc/{pid}/stat");
     let stat = fs::read_to_string(&path).with_context(|| format!("reading {path}"))?;
     let ticks = starttime_ticks(&stat)
@@ -120,17 +121,16 @@ mod tests {
     #[test]
     fn a_nonsense_tick_rate_is_refused_rather_than_dividing_by_zero() {
         assert_eq!(ticks_to_nanos(100, 0), None);
-        assert_eq!(ticks_to_nanos(100, -1), None);
     }
 
     /// The real thing, on this process. Its start time must be positive and no later than now.
     #[test]
     fn reads_this_processs_own_start_time() {
-        let hz = ticks_per_second().expect("sysconf(_SC_CLK_TCK)");
+        let hz = ticks_per_second().expect("AT_CLKTCK");
         assert_eq!(hz, 100, "unexpected tick rate on this host; not fatal, but worth knowing");
 
         let started = started_at(std::process::id(), hz).expect("own /proc/self/stat");
-        let now = mp_host::clock::now_boottime().unwrap();
+        let now = mp_host::clock::now_boottime();
         assert!(started > 0, "start time should be positive: {started}");
         assert!(started <= now, "a process cannot start after now: {started} > {now}");
     }

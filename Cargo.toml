@@ -15,6 +15,8 @@ clap = { version = "4.6.7", features = ["derive", "env"] }
 libc = "0.2.191"
 opentelemetry-proto = { version = "0.33.1", default-features = false, features = ["gen-tonic-messages", "logs"] }
 prost = "0.14.4"
+# Safe syscall wrappers. No features here: each crate enables only the modules it calls.
+rustix = "1.1.5"
 sd-notify = "0.5.0"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
@@ -60,9 +62,8 @@ webauthn_rp = { version = "0.3.0", features = ["serde_relaxed"] }
 
 [dev-dependencies]
 http-body-util = "0.1.5"
-# Only the end-to-end test signals the spawned child directly; the adjtimex(2) read that used
-# to need this at build time now lives in mp-host.
-libc = { workspace = true }
+# Only the end-to-end test signals the spawned child directly.
+rustix = { workspace = true, features = ["process"] }
 tempfile = { workspace = true }
 # A software authenticator for the passkey tests, shaped like the phone app's: ES256 over P-256, signed
 # with SHA-256. The same versions webauthn_rp already pulls in, so nothing new is built.

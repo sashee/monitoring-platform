@@ -1448,7 +1448,7 @@ The conversion and query-building layers are pure functions over owned data; all
 | dev: `tower`         | 0.5     | `ServiceExt::oneshot` for router-level tests                |
 | dev: `http-body-util`| 0.1     | collecting response bodies in tests                        |
 | dev: `tempfile`      | 3       | throwaway databases and sockets                            |
-| dev: `libc`          | 0.2     | sending `SIGTERM` in the end-to-end test                    |
+| dev: `rustix`        | 1.1     | sending `SIGTERM` in the end-to-end test, without `unsafe` |
 
 Deliberately *not* used: `tower-http` (see §4.2 — the limits are enforced in the handler — and §8.3,
 where the compression policy is three predicates over `flate2`) and `tonic-types` (see §4.1.1 — the one

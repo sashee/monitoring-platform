@@ -25,9 +25,8 @@ libc = { workspace = true }
 mp-host = { path = "../mp-host" }
 opentelemetry-proto = { workspace = true }
 prost = { workspace = true }
-# Safe wrappers for the timerfd syscalls behind step detection, so the only `unsafe` left in
-# `stepwatch.rs` is handing the descriptor to tokio's reactor.
-rustix = { version = "1.1.5", features = ["time"] }
+# `time` for the timerfd behind step detection, `param` for the `/proc/PID/stat` tick rate.
+rustix = { workspace = true, features = ["time", "param"] }
 sd-notify = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

@@ -14,17 +14,20 @@ anyhow = { workspace = true }
 axum = { workspace = true }
 clap = { workspace = true }
 # Same gzip support the receiver offers, so an SDK configured for it works against either.
-flate2 = "1.1.9"
+flate2 = "1.1.10"
 # The forwarder speaks HTTP/1.1 directly over an already-connected stream (unix or tcp) rather
 # than through a connector stack: one connection per flush, no pool, no connector Service to
 # write. `TokioIo` from hyper-util is the only glue that needs.
-http-body-util = "0.1.4"
-hyper = { version = "1.8.1", features = ["client", "http1"] }
-hyper-util = { version = "0.1.19", features = ["tokio"] }
+http-body-util = "0.1.5"
+hyper = { version = "1.12.0", features = ["client", "http1"] }
+hyper-util = { version = "0.1.21", features = ["tokio"] }
 libc = { workspace = true }
 mp-host = { path = "../mp-host" }
 opentelemetry-proto = { workspace = true }
 prost = { workspace = true }
+# Safe wrappers for the timerfd syscalls behind step detection, so the only `unsafe` left in
+# `stepwatch.rs` is handing the descriptor to tokio's reactor.
+rustix = { version = "1.1.5", features = ["time"] }
 sd-notify = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

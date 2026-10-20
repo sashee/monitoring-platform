@@ -1432,9 +1432,9 @@ The conversion and query-building layers are pure functions over owned data; all
 
 | Crate                | Version | Notes                                                      |
 |----------------------|---------|------------------------------------------------------------|
-| `tokio`              | 1.53    | `rt-multi-thread`, `net`, `signal`, `sync`, `macros`, `time` |
+| `tokio`              | 1.54    | `rt-multi-thread`, `net`, `signal`, `sync`, `macros`, `time` |
 | `axum`               | 0.8     | implements `Listener` for `tokio::net::UnixListener`       |
-| `opentelemetry-proto`| 0.32    | `default-features = false`, features `gen-tonic-messages,logs` — pre-generated prost types, **no `protoc` at build time** |
+| `opentelemetry-proto`| 0.33    | `default-features = false`, features `gen-tonic-messages,logs` — pre-generated prost types, **no `protoc` at build time** |
 | `prost`              | 0.14    | decode/encode of the OTLP messages, and the local `Status` |
 | `rusqlite`           | 0.40    | feature `bundled` — vendored SQLite, no system lib         |
 | `serde` / `serde_json`| 1      | JSON mapping and read-API responses                       |

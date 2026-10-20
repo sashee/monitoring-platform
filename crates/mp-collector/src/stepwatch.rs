@@ -44,8 +44,12 @@ impl StepWatch {
         // SAFETY: the reactor needs the descriptor open and unchanged for as long as the `AsyncFd`
         // holds it. An `OwnedFd` closes only on drop and always reports the same descriptor, and
         // `StepWatch` never takes it back out (`get_mut`, `into_inner`), so the two drop together.
-        let fd =
-            unsafe { AsyncFd::register(fd) }.context("registering the timerfd with the reactor")?;
+        let registered = unsafe { AsyncFd::register(fd) };
+        // Through `io::Error` first: the register error's `Display` already includes its cause and
+        // `source()` returns it again, so `context` on it directly would print the errno twice.
+        let fd = registered
+            .map_err(io::Error::from)
+            .context("registering the timerfd with the reactor")?;
         Ok(Self { fd })
     }
 

@@ -21,12 +21,13 @@ flate2 = "1.1.10"
 http-body-util = "0.1.5"
 hyper = { version = "1.12.0", features = ["client", "http1"] }
 hyper-util = { version = "0.1.21", features = ["tokio"] }
-libc = { workspace = true }
 mp-host = { path = "../mp-host" }
 opentelemetry-proto = { workspace = true }
 prost = { workspace = true }
 # `time` for the timerfd behind step detection, `param` for the `/proc/PID/stat` tick rate.
-rustix = { workspace = true, features = ["time", "param"] }
+# `use-libc-auxv` makes that tick rate libc's `sysconf(_SC_CLK_TCK)` rather than rustix's own auxv
+# parser, which panics when it cannot read the vector (see `peer::ticks_per_second`).
+rustix = { workspace = true, features = ["time", "param", "use-libc-auxv"] }
 sd-notify = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
@@ -35,6 +36,8 @@ tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 
 [dev-dependencies]
+# Only for the `STA_*` constants the sync tests build readings from.
+libc = { workspace = true }
 tempfile = { workspace = true }
 # `io-util` is only wanted by the hand-rolled HTTP peers in the tests; the collector itself never
 # touches a stream directly, so it stays out of the production feature set.

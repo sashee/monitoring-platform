@@ -11,7 +11,7 @@
 //! Nanoseconds and `i64` throughout, matching `measurements.event_time`. i64 nanoseconds since
 //! the epoch runs out in 2262; boottime values are a few years at most.
 
-use rustix::time::{ClockId, Timespec, clock_gettime};
+use rustix::time::{ClockId, DynamicClockId, Timespec, clock_gettime_dynamic};
 use std::fs;
 use std::io;
 
@@ -94,12 +94,12 @@ impl Sample {
 /// The two reads are not atomic, so the offset carries the interleave — tens of nanoseconds from
 /// a vDSO `clock_gettime`. Irrelevant at this design's target accuracy, which is bounded by the
 /// application-to-collector delay, several orders of magnitude larger.
-pub fn sample() -> Sample {
-    Sample { realtime: now(ClockId::Realtime), boottime: now(ClockId::Boottime) }
+pub fn sample() -> io::Result<Sample> {
+    Ok(Sample { realtime: now(ClockId::Realtime)?, boottime: now(ClockId::Boottime)? })
 }
 
 /// Nanoseconds since boot, suspend included.
-pub fn now_boottime() -> i64 {
+pub fn now_boottime() -> io::Result<i64> {
     now(ClockId::Boottime)
 }
 
@@ -114,15 +114,16 @@ pub fn now_boottime() -> i64 {
 /// side, so the result is `suspend + ε` and cannot come out negative — which it otherwise does on
 /// a host that has never suspended, where the true answer is exactly zero. Clamping the wrong
 /// order at zero would hide the same error rather than bound its sign.
-pub fn suspended_nanos() -> i64 {
-    let monotonic = now(ClockId::Monotonic);
-    now(ClockId::Boottime) - monotonic
+pub fn suspended_nanos() -> io::Result<i64> {
+    let monotonic = now(ClockId::Monotonic)?;
+    Ok(now(ClockId::Boottime)? - monotonic)
 }
 
-/// Infallible: rustix's `ClockId` holds only clocks the kernel always provides, so there is no
-/// error to report — it asserts instead.
-fn now(clock: ClockId) -> i64 {
-    nanos(clock_gettime(clock))
+/// The `_dynamic` variant for its `Result`, not for dynamic clocks. Plain `clock_gettime` asserts
+/// success, and rustix's own docs allow that even these clocks can fail on an uncommon kernel; a
+/// failed read has to reach the callers that degrade on it rather than panic a task.
+fn now(clock: ClockId) -> io::Result<i64> {
+    Ok(nanos(clock_gettime_dynamic(DynamicClockId::Known(clock))?))
 }
 
 /// `timespec` → nanoseconds. Pure, and split out so the arithmetic is testable.
@@ -166,7 +167,7 @@ mod tests {
     /// epoch on any machine that can build this, and boottime is small and positive.
     #[test]
     fn samples_both_clocks() {
-        let s = sample();
+        let s = sample().expect("clock_gettime should work");
         assert!(s.realtime > 1_600_000_000_000_000_000, "realtime looks wrong: {s:?}");
         assert!(s.boottime > 0, "boottime should be positive: {s:?}");
         assert!(s.boottime < s.realtime, "boottime should be far smaller than realtime: {s:?}");
@@ -180,7 +181,7 @@ mod tests {
     #[test]
     fn suspend_time_is_never_negative() {
         for _ in 0..1000 {
-            let d = suspended_nanos();
+            let d = suspended_nanos().expect("clock_gettime should work");
             assert!(d >= 0, "boottime is behind monotonic, which cannot happen: {d}");
         }
     }

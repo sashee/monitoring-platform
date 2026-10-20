@@ -35,8 +35,11 @@ pub fn ticks_to_nanos(ticks: u64, ticks_per_second: u64) -> Option<i64> {
 
 /// `sysconf(_SC_CLK_TCK)`: the unit `/proc/PID/stat` counts in. Practically always 100.
 ///
-/// rustix reads it from the `AT_CLKTCK` auxiliary-vector entry, the same source glibc's `sysconf`
-/// uses; a kernel that omitted the entry would leave it 0 here.
+/// With rustix's `use-libc-auxv` this *is* `sysconf`, so it inherits the C library's fallback to
+/// 100 when the auxiliary vector lacks `AT_CLKTCK` (qemu-user, for one). rustix's own auxv reader
+/// would return 0 there instead, and panic outright where neither `PR_GET_AUXV` nor
+/// `/proc/self/auxv` is available — on the accept path, where it runs per connection. The zero check
+/// stays for a C library that reports one anyway.
 pub fn ticks_per_second() -> Result<u64> {
     let n = rustix::param::clock_ticks_per_second();
     if n == 0 {
@@ -130,7 +133,7 @@ mod tests {
         assert_eq!(hz, 100, "unexpected tick rate on this host; not fatal, but worth knowing");
 
         let started = started_at(std::process::id(), hz).expect("own /proc/self/stat");
-        let now = mp_host::clock::now_boottime();
+        let now = mp_host::clock::now_boottime().unwrap();
         assert!(started > 0, "start time should be positive: {started}");
         assert!(started <= now, "a process cannot start after now: {started} > {now}");
     }

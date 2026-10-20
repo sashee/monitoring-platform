@@ -11,6 +11,7 @@
 use anyhow::{Context, Result};
 use opentelemetry_proto::tonic::collector::logs::v1::ExportLogsServiceRequest;
 use std::collections::VecDeque;
+use std::convert::Infallible;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{mpsc, watch};
@@ -134,6 +135,9 @@ impl Handle {
 pub fn build(config: Arc<Config>, boot_id: String) -> Result<(Handle, Tasks)> {
     let table = initial_table(&config, &boot_id)?;
     tracing::info!(epochs = table.len(), offset = table.current().offset, "offset history ready");
+    // Here rather than in the task, so a sandbox that refuses the timerfd fails startup before
+    // readiness rather than leaving a collector that never sees a step.
+    let step_watch = StepWatch::new().context("setting up live step detection")?;
 
     let (clock_tx, clock_rx) = watch::channel(ClockState {
         table,
@@ -151,7 +155,12 @@ pub fn build(config: Arc<Config>, boot_id: String) -> Result<(Handle, Tasks)> {
 
     let handle = Handle { clock: clock_rx.clone(), stats: stats_rx, inbox: inbox_tx };
     let tasks = Tasks {
-        clock: ClockTask { config: Arc::clone(&config), boot_id: boot_id.clone(), tx: clock_tx },
+        clock: ClockTask {
+            config: Arc::clone(&config),
+            boot_id: boot_id.clone(),
+            tx: clock_tx,
+            step_watch: Some(step_watch),
+        },
         flush: FlushTask { config, boot_id, rx: inbox_rx, clock: clock_rx, stats: stats_tx },
     };
     Ok((handle, tasks))
@@ -283,12 +292,20 @@ pub struct ClockTask {
     config: Arc<Config>,
     boot_id: String,
     tx: watch::Sender<ClockState>,
+    /// `None` once it has failed, which keeps the poll at 1 Hz for good.
+    step_watch: Option<StepWatch>,
 }
 
 impl ClockTask {
-    pub async fn run(self) -> Result<()> {
-        let watch_fd = StepWatch::new().context("setting up live step detection")?;
+    /// Runs until aborted, and the return type says so.
+    ///
+    /// Nothing that goes wrong in here may end the task. Ending it drops the `watch` sender, which
+    /// ends the flush task too and leaves a collector that still answers `/healthz` but refuses
+    /// every batch. So a failed reading counts as a bad one and is retried on the next tick, and a
+    /// step watch that fails is dropped in favour of the poll's offset check.
+    pub async fn run(mut self) -> Infallible {
         let mut streak = 0u32;
+        let mut failing = false;
         let mut ticks = 0u64;
 
         // ONE interval, ticking at 1 Hz for the life of the task. Backing off by replacing it
@@ -302,21 +319,39 @@ impl ClockTask {
 
         loop {
             tokio::select! {
-                stepped = watch_fd.stepped() => {
-                    stepped?;
-                    self.on_step()?;
+                stepped = next_step(self.step_watch.as_ref()) => {
+                    match stepped {
+                        Ok(()) => {
+                            if let Err(e) = self.on_step() {
+                                // Not lost: the poll below runs the offset check, which records
+                                // the boundary as a resync as soon as the clocks read again.
+                                tracing::warn!(
+                                    error = %format!("{e:#}"),
+                                    "could not record a clock step"
+                                );
+                            }
+                        }
+                        Err(e) => {
+                            tracing::error!(
+                                error = %format!("{e:#}"),
+                                "step detection failed; checking the offset every second instead"
+                            );
+                            self.step_watch = None;
+                        }
+                    }
                     // The first correction on a clockless Pi usually exceeds chrony's `makestep`
                     // threshold and arrives as a step, so checking here is what resolves the
                     // common case without waiting for the next poll.
-                    streak = self.on_poll(streak)?;
+                    (streak, failing) = self.poll(streak, failing);
                 }
                 _ = poll.tick() => {
                     ticks += 1;
                     // 1 Hz until the clock is good, then once a minute. It never stops entirely:
                     // the offset consistency check rides on this tick, and it is what catches a
-                    // boundary the step watch missed.
-                    if !self.tx.borrow().ever_synchronized || ticks.is_multiple_of(SETTLED_POLL_TICKS) {
-                        streak = self.on_poll(streak)?;
+                    // boundary the step watch missed — so with no step watch it stays at 1 Hz.
+                    let settled = self.tx.borrow().ever_synchronized && self.step_watch.is_some();
+                    if !settled || ticks.is_multiple_of(SETTLED_POLL_TICKS) {
+                        (streak, failing) = self.poll(streak, failing);
                     }
                 }
             }
@@ -402,12 +437,48 @@ impl ClockTask {
         Ok(poll.streak)
     }
 
+    /// [`Self::on_poll`], made non-fatal. A failed read is no evidence the clock is good, so it
+    /// counts as a bad reading and resets the streak.
+    ///
+    /// Logged on the transitions only: before sync this runs every second, and a failure that
+    /// persists would otherwise write a warning a second to an SD card for as long as it lasts.
+    fn poll(&self, streak: u32, failing: bool) -> (u32, bool) {
+        match self.on_poll(streak) {
+            Ok(streak) => {
+                if failing {
+                    tracing::info!("clock readings recovered");
+                }
+                (streak, false)
+            }
+            Err(e) if failing => {
+                tracing::debug!(error = %format!("{e:#}"), "clock readings still failing");
+                (0, true)
+            }
+            Err(e) => {
+                tracing::warn!(
+                    error = %format!("{e:#}"),
+                    "could not read the clock; counting it as a bad reading"
+                );
+                (0, true)
+            }
+        }
+    }
+
     /// Best-effort. Losing the persisted copy costs history across a restart, which is worth a
     /// warning; failing the task over it would cost the running collector, which is worse.
     fn persist(&self, table: &EpochTable) {
         if let Err(e) = state::save(&self.config.epochs_path(), &self.boot_id, table) {
             tracing::warn!(error = %e, "could not persist the epoch table");
         }
+    }
+}
+
+/// The next step, or never once the watch is gone — which parks the `select!` arm rather than
+/// spinning on a watch that fails every time it is asked.
+async fn next_step(watch: Option<&StepWatch>) -> Result<()> {
+    match watch {
+        Some(watch) => watch.stepped().await,
+        None => std::future::pending().await,
     }
 }
 
@@ -778,5 +849,41 @@ mod tests {
 
         let (table, _) = choose_initial_table(Some(persisted), Vec::new(), now());
         assert_eq!(table.len(), 1);
+    }
+
+    /// Where the task lands when its step watch fails: no watch, and the poll's offset check as
+    /// the only thing catching a step. That is only adequate at 1 Hz, so the once-a-minute cadence
+    /// a synchronized clock normally earns must not apply. Paused time runs the ticks instantly,
+    /// and at the settled cadence these five seconds would hold no poll at all.
+    #[tokio::test(start_paused = true)]
+    async fn without_a_step_watch_a_synchronized_clock_is_still_polled_every_second() {
+        let dir = tempfile::tempdir().unwrap();
+        let cli = crate::config::Cli {
+            state_dir: Some(dir.path().to_owned()),
+            ..crate::config::Cli::default()
+        };
+        let config = Arc::new(Config::resolve(&cli, &Default::default()).unwrap());
+        let live = mp_host::clock::sample().unwrap();
+        let (tx, mut rx) = watch::channel(ClockState {
+            table: EpochTable::new(epoch(0, live.offset(), Source::Startup)),
+            sync_source: None,
+            ever_synchronized: true,
+            steps: 0,
+            last_step: None,
+            max_error_micros: 0,
+            disciplined: false,
+        });
+        let task = ClockTask { config, boot_id: "test".to_owned(), tx, step_watch: None };
+        let running = tokio::spawn(task.run());
+
+        let three_polls = async {
+            for _ in 0..3 {
+                rx.changed().await.expect("the clock task stopped");
+            }
+        };
+        tokio::time::timeout(Duration::from_secs(5), three_polls)
+            .await
+            .expect("fewer than three polls in five seconds");
+        running.abort();
     }
 }

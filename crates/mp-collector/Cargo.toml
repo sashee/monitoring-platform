@@ -40,5 +40,6 @@ tracing-subscriber = { workspace = true }
 libc = { workspace = true }
 tempfile = { workspace = true }
 # `io-util` is only wanted by the hand-rolled HTTP peers in the tests; the collector itself never
-# touches a stream directly, so it stays out of the production feature set.
-tokio = { workspace = true, features = ["io-util"] }
+# touches a stream directly, so it stays out of the production feature set. `test-util` is for
+# paused time, which runs the clock task's 1 Hz poll without waiting it out.
+tokio = { workspace = true, features = ["io-util", "test-util"] }

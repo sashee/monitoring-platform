@@ -55,7 +55,7 @@ async fn serve(cli: Cli, inherited: Vec<std::os::fd::RawFd>) -> Result<()> {
     let (listener, owns_socket) = bind(&config, &inherited)?;
     let (handle, tasks) = runtime::build(Arc::clone(&config), boot_id)?;
 
-    let clock = tokio::spawn(tasks.clock.run());
+    let mut clock = tokio::spawn(tasks.clock.run());
     let flush = tokio::spawn(tasks.flush.run());
 
     let app = receive::app(receive::AppState { config: Arc::clone(&config), handle })
@@ -69,10 +69,14 @@ async fn serve(cli: Cli, inherited: Vec<std::os::fd::RawFd>) -> Result<()> {
     }
     tracing::info!("ready");
 
-    let result = axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown_signal())
-        .await
-        .context("serving");
+    // The clock task runs until aborted, so finishing means it panicked — and the flush task stops
+    // with it, leaving a collector that answers `/healthz` but refuses every batch. Exiting hands
+    // that to `Restart=on-failure` instead.
+    let serving = axum::serve(listener, app).with_graceful_shutdown(shutdown_signal());
+    let result = tokio::select! {
+        served = serving => served.context("serving"),
+        Err(e) = &mut clock => Err(anyhow::Error::new(e).context("the clock task stopped")),
+    };
 
     // Ordering matters. Aborting the clock task first would be harmless; aborting the flush task
     // first would strand whatever is in the buffer, so it is given the chance to drain: its

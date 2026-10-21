@@ -1432,9 +1432,9 @@ The conversion and query-building layers are pure functions over owned data; all
 
 | Crate                | Version | Notes                                                      |
 |----------------------|---------|------------------------------------------------------------|
-| `tokio`              | 1.53    | `rt-multi-thread`, `net`, `signal`, `sync`, `macros`, `time` |
+| `tokio`              | 1.54    | `rt-multi-thread`, `net`, `signal`, `sync`, `macros`, `time` |
 | `axum`               | 0.8     | implements `Listener` for `tokio::net::UnixListener`       |
-| `opentelemetry-proto`| 0.32    | `default-features = false`, features `gen-tonic-messages,logs` — pre-generated prost types, **no `protoc` at build time** |
+| `opentelemetry-proto`| 0.33    | `default-features = false`, features `gen-tonic-messages,logs` — pre-generated prost types, **no `protoc` at build time** |
 | `prost`              | 0.14    | decode/encode of the OTLP messages, and the local `Status` |
 | `rusqlite`           | 0.40    | feature `bundled` — vendored SQLite, no system lib         |
 | `serde` / `serde_json`| 1      | JSON mapping and read-API responses                       |
@@ -1448,7 +1448,7 @@ The conversion and query-building layers are pure functions over owned data; all
 | dev: `tower`         | 0.5     | `ServiceExt::oneshot` for router-level tests                |
 | dev: `http-body-util`| 0.1     | collecting response bodies in tests                        |
 | dev: `tempfile`      | 3       | throwaway databases and sockets                            |
-| dev: `libc`          | 0.2     | sending `SIGTERM` in the end-to-end test                    |
+| dev: `rustix`        | 1.1     | sending `SIGTERM` in the end-to-end test, without `unsafe` |
 
 Deliberately *not* used: `tower-http` (see §4.2 — the limits are enforced in the handler — and §8.3,
 where the compression policy is three predicates over `flate2`) and `tonic-types` (see §4.1.1 — the one

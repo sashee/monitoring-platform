@@ -182,24 +182,20 @@ mod tests {
     /// out an `accept()` — proves the same thing far more slowly and flakily.
     #[tokio::test]
     async fn adoption_clears_blocking_mode() {
-        use std::os::fd::AsRawFd;
+        use rustix::fs::{OFlags, fcntl_getfl};
 
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("s.sock");
 
-        let raw = std::os::unix::net::UnixListener::bind(&path).unwrap().into_raw_fd();
-        // SAFETY: reading the descriptor's flags; `raw` is open and owned by this process.
-        assert_eq!(
-            unsafe { libc::fcntl(raw, libc::F_GETFL) } & libc::O_NONBLOCK,
-            0,
+        let bound = std::os::unix::net::UnixListener::bind(&path).unwrap();
+        assert!(
+            !fcntl_getfl(&bound).unwrap().contains(OFlags::NONBLOCK),
             "precondition: a plainly bound listener is blocking, as systemd's is"
         );
 
-        let listener = adopt(raw).unwrap();
-        // SAFETY: same, through the adopted listener, which still owns the descriptor.
-        assert_ne!(
-            unsafe { libc::fcntl(listener.as_raw_fd(), libc::F_GETFL) } & libc::O_NONBLOCK,
-            0,
+        let listener = adopt(bound.into_raw_fd()).unwrap();
+        assert!(
+            fcntl_getfl(&listener).unwrap().contains(OFlags::NONBLOCK),
             "adopt must clear blocking mode"
         );
     }

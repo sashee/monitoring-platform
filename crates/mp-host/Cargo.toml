@@ -7,9 +7,13 @@ description = "Host primitives shared by the monitoring platform receiver and th
 
 [dependencies]
 anyhow = { workspace = true }
+# Still needed for `adjtimex(2)`, which rustix does not wrap.
 libc = { workspace = true }
+rustix = { workspace = true, features = ["time"] }
 tokio = { workspace = true }
 tracing = { workspace = true }
 
 [dev-dependencies]
+# `fs` only for reading a descriptor's flags in the socket-adoption test.
+rustix = { workspace = true, features = ["fs"] }
 tempfile = { workspace = true }

@@ -14,17 +14,20 @@ anyhow = { workspace = true }
 axum = { workspace = true }
 clap = { workspace = true }
 # Same gzip support the receiver offers, so an SDK configured for it works against either.
-flate2 = "1.1.9"
+flate2 = "1.1.10"
 # The forwarder speaks HTTP/1.1 directly over an already-connected stream (unix or tcp) rather
 # than through a connector stack: one connection per flush, no pool, no connector Service to
 # write. `TokioIo` from hyper-util is the only glue that needs.
-http-body-util = "0.1.4"
-hyper = { version = "1.8.1", features = ["client", "http1"] }
-hyper-util = { version = "0.1.19", features = ["tokio"] }
-libc = { workspace = true }
+http-body-util = "0.1.5"
+hyper = { version = "1.12.0", features = ["client", "http1"] }
+hyper-util = { version = "0.1.21", features = ["tokio"] }
 mp-host = { path = "../mp-host" }
 opentelemetry-proto = { workspace = true }
 prost = { workspace = true }
+# `time` for the timerfd behind step detection, `param` for the `/proc/PID/stat` tick rate.
+# `use-libc-auxv` makes that tick rate libc's `sysconf(_SC_CLK_TCK)` rather than rustix's own auxv
+# parser, which panics when it cannot read the vector (see `peer::ticks_per_second`).
+rustix = { workspace = true, features = ["time", "param", "use-libc-auxv"] }
 sd-notify = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
@@ -33,7 +36,10 @@ tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 
 [dev-dependencies]
+# Only for the `STA_*` constants the sync tests build readings from.
+libc = { workspace = true }
 tempfile = { workspace = true }
 # `io-util` is only wanted by the hand-rolled HTTP peers in the tests; the collector itself never
-# touches a stream directly, so it stays out of the production feature set.
-tokio = { workspace = true, features = ["io-util"] }
+# touches a stream directly, so it stays out of the production feature set. `test-util` is for
+# paused time, which runs the clock task's 1 Hz poll without waiting it out.
+tokio = { workspace = true, features = ["io-util", "test-util"] }

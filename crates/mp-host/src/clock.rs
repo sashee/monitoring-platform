@@ -11,6 +11,7 @@
 //! Nanoseconds and `i64` throughout, matching `measurements.event_time`. i64 nanoseconds since
 //! the epoch runs out in 2262; boottime values are a few years at most.
 
+use rustix::time::{ClockId, DynamicClockId, Timespec, clock_gettime_dynamic};
 use std::fs;
 use std::io;
 
@@ -94,12 +95,12 @@ impl Sample {
 /// a vDSO `clock_gettime`. Irrelevant at this design's target accuracy, which is bounded by the
 /// application-to-collector delay, several orders of magnitude larger.
 pub fn sample() -> io::Result<Sample> {
-    Ok(Sample { realtime: now(libc::CLOCK_REALTIME)?, boottime: now(libc::CLOCK_BOOTTIME)? })
+    Ok(Sample { realtime: now(ClockId::Realtime)?, boottime: now(ClockId::Boottime)? })
 }
 
 /// Nanoseconds since boot, suspend included.
 pub fn now_boottime() -> io::Result<i64> {
-    now(libc::CLOCK_BOOTTIME)
+    now(ClockId::Boottime)
 }
 
 /// `boottime − monotonic`: total time this host has spent suspended.
@@ -114,30 +115,24 @@ pub fn now_boottime() -> io::Result<i64> {
 /// a host that has never suspended, where the true answer is exactly zero. Clamping the wrong
 /// order at zero would hide the same error rather than bound its sign.
 pub fn suspended_nanos() -> io::Result<i64> {
-    let monotonic = now(libc::CLOCK_MONOTONIC)?;
-    Ok(now(libc::CLOCK_BOOTTIME)? - monotonic)
+    let monotonic = now(ClockId::Monotonic)?;
+    Ok(now(ClockId::Boottime)? - monotonic)
 }
 
-fn now(clock: libc::clockid_t) -> io::Result<i64> {
-    // SAFETY: `timespec` is two integers; an all-zero value is valid. `clock_gettime` writes
-    // through the pointer, which is valid and exclusive for the call.
-    let (rc, ts) = unsafe {
-        let mut ts: libc::timespec = std::mem::zeroed();
-        (libc::clock_gettime(clock, &mut ts), ts)
-    };
-    if rc < 0 {
-        return Err(io::Error::last_os_error());
-    }
-    Ok(nanos(ts))
+/// The `_dynamic` variant for its `Result`, not for dynamic clocks. Plain `clock_gettime` asserts
+/// success, and rustix's own docs allow that even these clocks can fail on an uncommon kernel; a
+/// failed read has to reach the callers that degrade on it rather than panic a task.
+fn now(clock: ClockId) -> io::Result<i64> {
+    Ok(nanos(clock_gettime_dynamic(DynamicClockId::Known(clock))?))
 }
 
 /// `timespec` → nanoseconds. Pure, and split out so the arithmetic is testable.
 ///
-/// `tv_sec` is `time_t` and `tv_nsec` is `c_long`: both i64 on the 64-bit targets this ships to,
-/// i32 on a 32-bit one. `i64::from` covers both, so the conversion is not useless everywhere.
+/// rustix makes `tv_sec` i64 everywhere, but `tv_nsec` is i64 only on its raw-syscall backend and
+/// `c_long` on the libc one. `i64::from` covers both, so the conversion is not useless everywhere.
 #[allow(clippy::useless_conversion)]
-fn nanos(ts: libc::timespec) -> i64 {
-    i64::from(ts.tv_sec) * 1_000_000_000 + i64::from(ts.tv_nsec)
+fn nanos(ts: Timespec) -> i64 {
+    ts.tv_sec * 1_000_000_000 + i64::from(ts.tv_nsec)
 }
 
 /// The kernel's identifier for this boot.
@@ -193,9 +188,9 @@ mod tests {
 
     #[test]
     fn converts_a_timespec_to_nanoseconds() {
-        assert_eq!(nanos(libc::timespec { tv_sec: 0, tv_nsec: 0 }), 0);
-        assert_eq!(nanos(libc::timespec { tv_sec: 1, tv_nsec: 0 }), 1_000_000_000);
-        assert_eq!(nanos(libc::timespec { tv_sec: 2, tv_nsec: 500_000_000 }), 2_500_000_000);
+        assert_eq!(nanos(Timespec { tv_sec: 0, tv_nsec: 0 }), 0);
+        assert_eq!(nanos(Timespec { tv_sec: 1, tv_nsec: 0 }), 1_000_000_000);
+        assert_eq!(nanos(Timespec { tv_sec: 2, tv_nsec: 500_000_000 }), 2_500_000_000);
     }
 
     /// A UUID with dashes, and stable within one boot — the two properties anything keyed by it

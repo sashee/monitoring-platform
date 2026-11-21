@@ -1436,11 +1436,11 @@ The conversion and query-building layers are pure functions over owned data; all
 | `axum`               | 0.8     | implements `Listener` for `tokio::net::UnixListener`       |
 | `opentelemetry-proto`| 0.33    | `default-features = false`, features `gen-tonic-messages,logs` — pre-generated prost types, **no `protoc` at build time** |
 | `prost`              | 0.14    | decode/encode of the OTLP messages, and the local `Status` |
-| `rusqlite`           | 0.40    | feature `bundled` — vendored SQLite, no system lib         |
+| `rusqlite`           | 0.43    | feature `bundled` — vendored SQLite, no system lib         |
 | `serde` / `serde_json`| 1      | JSON mapping and read-API responses                       |
 | `flate2`             | 1.1     | gzip: decompression on ingest, called directly so both size limits stay explicit (§4.2), and response compression (§8.3) |
 | `base64`             | 0.23    | `bytes_value` encoding, pagination cursor                  |
-| `jiff`               | 0.2     | RFC 3339 ⇄ i64 nanos: `Timestamp::from_nanosecond` / `as_nanosecond` |
+| `jiff`               | 1.0     | RFC 3339 ⇄ i64 nanos: `Timestamp::from_nanosecond` / `as_nanosecond` |
 | `clap`               | 4.6     | `derive`, `env`                                            |
 | `sd-notify`          | 0.5     | `Type=notify` readiness (§9.2); only dep is `libc`, and it is a no-op when `NOTIFY_SOCKET` is unset |
 | `anyhow`             | 1       | error context on startup and storage paths                 |
@@ -2947,7 +2947,9 @@ challenge is taken out of the set before it is verified, so it answers one respo
 `webauthn_rp` does the verification — pure Rust on RustCrypto (`p256`, `ed25519-dalek`, `rsa`), chosen over
 `webauthn-rs` because that one brings OpenSSL and the package otherwise needs nothing but a C compiler. Its
 `rsa` 0.9 carries RUSTSEC-2023-0071, a timing attack on private-key operations; nothing here holds an RSA
-private key — only public keys are used, to verify — so it does not apply, though an audit will list it.
+private key — only public keys are used, to verify — so it does not apply. Likewise `crypto-bigint` 0.5 (under
+`p256`/`p384`) carries RUSTSEC-2026-0387, timing variability on secret integers; ECDSA verification has no secret
+operand. Both are ignored, with these reasons, in `.cargo/audit.toml`.
 
 ```sql
 -- 4.1

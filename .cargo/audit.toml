@@ -1,0 +1,17 @@
+# cargo-audit configuration. Not part of the build: nix/package.nix only keeps the Rust
+# sources and manifests.
+#
+# Every ignore below has to say why it does not apply here; drop it as soon as an upgrade
+# makes it unnecessary.
+[advisories]
+ignore = [
+    # rsa 0.9 (Marvin): timing leak in RSA *private-key* operations. Pulled in by
+    # webauthn_rp, which only verifies RS256 assertions with the stored public key.
+    # Nothing here holds an RSA private key. See SPEC.md §14.10.
+    "RUSTSEC-2023-0071",
+    # crypto-bigint 0.5 timing variability on secret integers. Pulled in by webauthn_rp
+    # through p256/p384 (elliptic-curve 0.13), where it only runs ECDSA verification:
+    # signature, public key and message are all public, so there is no secret to leak.
+    # The fix needs elliptic-curve 0.14, i.e. a webauthn_rp release after 0.3.0.
+    "RUSTSEC-2026-0387",
+]

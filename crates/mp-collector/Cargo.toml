@@ -14,7 +14,7 @@ anyhow = { workspace = true }
 axum = { workspace = true }
 clap = { workspace = true }
 # Same gzip support the receiver offers, so an SDK configured for it works against either.
-flate2 = "1.1.10"
+flate2 = "1.1.11"
 # The forwarder speaks HTTP/1.1 directly over an already-connected stream (unix or tcp) rather
 # than through a connector stack: one connection per flush, no pool, no connector Service to
 # write. `TokioIo` from hyper-util is the only glue that needs.
